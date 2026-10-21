@@ -1097,6 +1097,10 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
             return Ok(fs.add(Fd::Dev(d), 0, cloexec));
         }
         let (guest, mut host) = fs.at(dirfd, path, flags & O_NOFOLLOW == 0)?;
+        if proc_dir(&guest).is_some() {
+            if flags & 3 != 0 { return Err(EISDIR) }
+            return Ok(fs.add(Fd::Dir { guest, pos: 0 }, 0, cloexec));
+        }
         let meta = fs::metadata(&host);
         let acc = flags & 3;
         let changes = acc != 0 || flags & (O_CREAT | O_TRUNC) != 0;
@@ -1681,6 +1685,7 @@ pub fn fstat(fd: u64, buf: u64) -> R {
         }
         Fd::Dir { guest, .. } => {
             let guest = guest.clone();
+            let guest = if proc_dir(&guest).is_some() { "/".into() } else { guest }; // synthetic: like the root
             stat_of(&fs.resolve("/", &guest, true)?.1)
         }
         Fd::Handle(h) => {
@@ -1718,6 +1723,17 @@ pub fn fstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> R {
     if let Some(d) = Dev::of(&guest) {
         return put_stat(buf, d.stat());
     }
+    if proc_dir(&guest).is_some() {
+        return put_stat(buf, stat_of(&with(|fs| fs.resolve("/", "/", true))?.1)?); // a directory like the root
+    }
+    if flags & AT_SYMLINK_NOFOLLOW == 0 && let Some(n) = fd_alias(&guest) {
+        return fstat(n, buf);
+    }
+    if flags & AT_SYMLINK_NOFOLLOW != 0 && let Some(t) = proc_link(&guest) {
+        let mut s = [0u64; 18];
+        (s[1], s[2], s[3], s[6], s[7]) = (ino(&host), 1, 0o120777, t.len() as u64, 4096); // a symlink
+        return put_stat(buf, s);
+    }
     put_stat(buf, stat_of(&host)?)
 }
 
@@ -1752,7 +1768,7 @@ pub fn statx(dirfd: u64, path: u64, flags: u64, buf: u64) -> R {
 
 pub fn faccessat(dirfd: u64, path: u64) -> R {
     let (guest, host) = with(|fs| fs.at(dirfd, path, true))?;
-    if Dev::of(&guest).is_some() || fd_alias(&guest).is_some() {
+    if Dev::of(&guest).is_some() || fd_alias(&guest).is_some() || proc_dir(&guest).is_some() {
         return Ok(0);
     }
     fs::symlink_metadata(host).map(|_| 0).map_err(errno)
@@ -1763,6 +1779,31 @@ static EXE: Mutex<String> = Mutex::new(String::new());
 
 pub fn set_exe(guest: &str) {
     *EXE.lock().unwrap() = guest.to_string();
+}
+
+/// `/proc/self` and `/proc/self/fd` (or our pid) as synthetic directories: Some(true) for the fd one.
+/// httpd stats `/proc/self/fd/` for `ErrorLog /proc/self/fd/2`; fd-closing loops list it.
+fn proc_dir(guest: &str) -> Option<bool> {
+    let r = guest.strip_prefix("/proc/")?;
+    let (pid, rest) = r.split_once('/').unwrap_or((r, ""));
+    if pid != "self" && pid.parse::<u32>().ok()? != unsafe { crate::win::GetCurrentProcessId() } {
+        return None;
+    }
+    match rest {
+        "" => Some(false),
+        "fd" => Some(true),
+        _ => None,
+    }
+}
+
+/// What getdents lists in a `proc_dir`: (name, d_type).
+fn proc_entries(fd_dir: bool, fds: &[Option<Slot>]) -> Vec<(String, u8)> {
+    const DT_DIR: u8 = 4;
+    const DT_LNK: u8 = 10;
+    if !fd_dir {
+        return vec![("fd".into(), DT_DIR), ("exe".into(), DT_LNK), ("cwd".into(), DT_LNK), ("root".into(), DT_LNK)];
+    }
+    fds.iter().enumerate().filter(|(_, s)| s.is_some()).map(|(i, _)| (i.to_string(), DT_LNK)).collect()
 }
 
 /// The few /proc links programs actually read. ponytail: no /proc filesystem otherwise (DESIGN.md §5).
@@ -1940,8 +1981,12 @@ pub fn getdents64(fd: u64, buf: u64, count: u64) -> R {
         let (guest, start) = (guest.clone(), *pos);
         let (guest, host) = fs.resolve("/", &guest, true)?;
         let mut names: Vec<(String, u8)> = vec![(".".into(), 4), ("..".into(), 4)];
-        for (name, dir) in fs.list(&comps_of(&guest))? {
-            names.push((name, if dir { 4 } else { 0 })); // DT_DIR / DT_UNKNOWN
+        if let Some(fd_dir) = proc_dir(&guest) {
+            names.extend(proc_entries(fd_dir, &fs.fds));
+        } else {
+            for (name, dir) in fs.list(&comps_of(&guest))? {
+                names.push((name, if dir { 4 } else { 0 })); // DT_DIR / DT_UNKNOWN
+            }
         }
         let out = unsafe { guest_mut(buf, count as usize) };
         let (mut n, mut i) = (0, start);

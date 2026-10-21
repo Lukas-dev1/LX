@@ -644,16 +644,19 @@ unsafe extern "C" {
 /// Resume, entering a signal handler first if `deliver` prepared a frame.
 fn resume_with_signals(c: &mut Context) -> i32 {
     match signal::deliver(c) {
-        Some(frame) => {
-            let t = ts();
-            t.frame[..frame.len()].copy_from_slice(&frame);
-            t.frame_len = frame.len() as u64;
-            t.resume = c.rip;
-            c.rip = lx_sig_tramp as *const () as u64;
-            EXCEPTION_CONTINUE_EXECUTION
-        }
+        Some(frame) => enter_handler(c, frame),
         None => resume(c, c.rip),
     }
+}
+
+/// Continue in the signal handler `c` now points at; the trampoline puts `frame` at its rsp.
+fn enter_handler(c: &mut Context, frame: Vec<u8>) -> i32 {
+    let t = ts();
+    t.frame[..frame.len()].copy_from_slice(&frame);
+    t.frame_len = frame.len() as u64;
+    t.resume = c.rip;
+    c.rip = lx_sig_tramp as *const () as u64;
+    EXCEPTION_CONTINUE_EXECUTION
 }
 
 // Call f(arg) with rsp switched to `top` (Win64 ABI: rcx = top, rdx = f, r8 = arg).
@@ -719,7 +722,15 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
         let r = code.regions.iter().find(|(lo, hi)| (*lo..*hi).contains(&c.rip)).copied();
         (r, code.sites.binary_search(&c.rip).is_ok())
     };
-    let Some((_, end)) = region else {
+    // Guest code is a loaded ELF region, or memory outside every Windows module: JIT code (HotSpot,
+    // V8) lives in plain mmap'd pages and faults on purpose.
+    let jit = region.is_none() && {
+        const FROM_ADDRESS: u32 = 4;
+        const UNCHANGED_REFCOUNT: u32 = 2;
+        let mut m = 0isize;
+        (unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, c.rip as *const _, &mut m) }) == 0
+    };
+    let Some((_, end)) = region.or(jit.then_some((c.rip, c.rip + 15))) else {
         if debug() && rec.code == STATUS_ACCESS_VIOLATION {
             let base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
             let msg = format!("[lx] host fault at rip {:#x} (lx.exe+{:#x}) addr {:#x} tid {}
@@ -754,7 +765,30 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
             if patchlog() { dlog(format_args!("FS-base fault at rip {:#x} rsp {:#x}", c.rip, c.rsp)); }
             resume(c, c.rip)
         }
-        _ => guest_crash(rec, c),
+        _ => match fault_signal(rec, c).and_then(|(sig, code, addr)| signal::fault(c, sig, code, addr)) {
+            Some(frame) => enter_handler(c, frame),
+            None => guest_crash(rec, c),
+        },
+    }
+}
+
+/// The Linux signal for a guest fault: (signal, si_code, si_addr).
+fn fault_signal(rec: &ExceptionRecord, c: &Context) -> Option<(u64, u64, u64)> {
+    const STATUS_GUARD_PAGE: u32 = 0x8000_0001;
+    const STATUS_INT_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
+    const STATUS_INT_OVERFLOW: u32 = 0xC000_0095;
+    match rec.code {
+        STATUS_ACCESS_VIOLATION | STATUS_GUARD_PAGE => {
+            let addr = rec.info[1] as u64;
+            let mut m = MemoryBasicInformation::default();
+            unsafe { VirtualQuery(addr as *const _, &mut m, size_of::<MemoryBasicInformation>()) };
+            const MEM_COMMIT: u32 = 0x1000;
+            Some((11, if m.state == MEM_COMMIT { 2 } else { 1 }, addr)) // SIGSEGV: SEGV_ACCERR / SEGV_MAPERR
+        }
+        STATUS_INT_DIVIDE_BY_ZERO => Some((8, 1, c.rip)), // SIGFPE, FPE_INTDIV
+        STATUS_INT_OVERFLOW => Some((8, 2, c.rip)),       // FPE_INTOVF
+        STATUS_ILLEGAL_INSTRUCTION => Some((4, 1, c.rip)), // SIGILL, ILL_ILLOPC
+        _ => None,
     }
 }
 
@@ -855,6 +889,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         302 => rlimit(a[1], a[2], a[3]), // prlimit64 (self only)
         98 => { unsafe { std::ptr::write_bytes(a[1] as *mut u8, 0, 144) }; Ok(0) } // getrusage: zeros
         99 => sysinfo(a[0]),
+        100 => times(a[0]),
+        309 => getcpu(a[0], a[1]),
         204 => sched_getaffinity(a[1], a[2]),
         41 => net::sys_socket(a[0], a[1], a[2]),
         42 => net::sys_connect(a[0], a[1], a[2]),
@@ -1509,5 +1545,24 @@ fn sysinfo(info: u64) -> R {
     (s[8], s[9]) = (m[3].saturating_sub(m[1]), m[4].saturating_sub(m[2]));
     s[13] = 1; // mem_unit: bytes
     unsafe { *(info as *mut [u64; 14]) = s };
+    Ok(0)
+}
+
+/// times: clock ticks (USER_HZ 100) since boot. ponytail: the process CPU times are 0.
+fn times(buf: u64) -> R {
+    if buf != 0 {
+        unsafe { *(buf as *mut [u64; 4]) = [0; 4] };
+    }
+    Ok((unsafe { crate::win::GetTickCount64() } / 10) as i64)
+}
+
+/// getcpu: the CPU this thread runs on now, NUMA node 0.
+fn getcpu(cpu: u64, node: u64) -> R {
+    if cpu != 0 {
+        unsafe { *(cpu as *mut u32) = crate::win::GetCurrentProcessorNumber() };
+    }
+    if node != 0 {
+        unsafe { *(node as *mut u32) = 0 };
+    }
     Ok(0)
 }
