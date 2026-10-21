@@ -325,9 +325,13 @@ pub fn gc_layers() {
         let pid = name.split('-').next().and_then(|p| p.parse::<u32>().ok());
         if pid.is_some_and(|p| send(p, 0).is_err()) {
             let _ = std::fs::remove_dir_all(e.path());
+            let _ = std::fs::remove_dir_all(std::path::Path::new(SOCKETS).join(&name));
         }
     }
 }
+
+/// Where AF_UNIX socket files live, one folder per container (see net.rs).
+const SOCKETS: &str = "rootfs/s";
 
 pub fn ps() -> Vec<(u32, String)> {
     let mut v = Vec::new();
@@ -360,6 +364,9 @@ pub fn exit(code: u64) -> ! {
     }
     if let Ok(g) = LAYER.try_lock() && let Some(dir) = g.as_ref() {
         let _ = std::fs::remove_dir_all(dir); // the container's changes go with it (docker run --rm)
+        if let Some(name) = dir.file_name() {
+            let _ = std::fs::remove_dir_all(std::path::Path::new(SOCKETS).join(name)); // its AF_UNIX socket files
+        }
     }
     if debug() {
         eprintln!("[lx] pid {} exit {}", unsafe { GetCurrentProcessId() }, code as u8);

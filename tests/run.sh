@@ -70,14 +70,14 @@ ALPINE_IMG=$STORE/library_alpine/latest/rootfs
 PY_IMG=$STORE/library_python/3.12-alpine/rootfs
 DEB_IMG=$STORE/library_python/3.12/rootfs # Debian (glibc)
 cleanup() {
-  rm -f "$ALPINE_IMG/sigtest.sh" "$PY_IMG/nettest.py" "$DEB_IMG/nettest.py" "$DEB_IMG/hello.py"
+  rm -f "$ALPINE_IMG/sigtest.sh" "$PY_IMG/nettest.py" "$DEB_IMG/nettest.py" "$DEB_IMG/hello.py" "$DEB_IMG/unixtest.py"
   rm -rf "$OUT"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 cp guest/sigtest.sh "$ALPINE_IMG/"
 cp guest/nettest.py "$PY_IMG/"
-cp guest/nettest.py guest/hello.py "$DEB_IMG/"
+cp guest/nettest.py guest/hello.py guest/unixtest.py "$DEB_IMG/"
 
 # ---- single runs ----
 expect() { # expect <name> <exit code> <text in output> -- <lx args...>
@@ -96,6 +96,7 @@ expect "dlopen while threads run" 0 " OK"                -- rootfs/alpine /dltes
 # Debian (glibc) image: the three usual ways a Python image starts.
 expect "debian: python3 -c"         0 "hi"               -- run python:3.12 python3 -c "print('hi')"
 expect "debian: python3 /script.py" 0 "script ran: 3.12" -- run python:3.12 python3 /hello.py
+expect "debian: AF_UNIX echo (path + abstract)" 0 "OK" -- run python:3.12 python3 /unixtest.py
 
 # ---- repeated runs: every run must print OK; the trap fallback and FS faults must stay unused ----
 repeat() { # repeat <name> <n> <lx args...>

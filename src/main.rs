@@ -184,7 +184,9 @@ fn enter_job() -> Result<(), String> {
 }
 
 const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull nginx:alpine
-       lx run <image> [command args...]      runs the image's entrypoint/cmd, or the given command
+       lx run [-p [ip:]hostport:port[/udp]]... <image> [command args...]
+                                             runs the image's entrypoint/cmd, or the given command;
+                                             -p publishes a container port (others stay on localhost)
        lx ps                                 running containers
        lx stop <pid>                         SIGTERM, then SIGKILL after 10s
        lx kill <pid> [SIGNAL]                default TERM
@@ -231,7 +233,16 @@ fn run() -> Result<(), String> {
         let sig = rest.first().map_or(Some(15), |s| signal::parse(s)).ok_or("unknown signal")?;
         return proc::send(pid, sig).map(|_| ()).map_err(|_| format!("{pid}: no such lx process"));
     }
-    if let [cmd, image, rest @ ..] = args.as_slice() && cmd == "run" {
+    if let [cmd, rest @ ..] = args.as_slice() && cmd == "run" {
+        // Flags before the image: -p/--publish [hostip:]hostport:containerport[/udp], repeatable.
+        let (mut rest, mut ports) = (rest, Vec::new());
+        while let [flag, value, more @ ..] = rest && (flag == "-p" || flag == "--publish") {
+            ports.push(net::parse_publish(value)?);
+            rest = more;
+        }
+        let [image, rest @ ..] = rest else { return Err(USAGE.into()) };
+        // Every lx process of this container inherits it (fork and exec start new lx processes).
+        unsafe { env::set_var("LX_PORTS", ports.join(",")) };
         let r = image::Ref::parse(image);
         let dir = if r.dir().join("config.json").exists() { r.dir() } else { image::pull(&r)? };
         let c = image::run_config(&dir, rest)?;
