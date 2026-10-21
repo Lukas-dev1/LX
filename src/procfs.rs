@@ -20,7 +20,7 @@ pub fn file(guest: &str) -> Option<String> {
             let s = unsafe { crate::win::GetTickCount64() } as f64 / 1000.0;
             format!("{s:.2} {s:.2}\n")
         }
-        "/proc/loadavg" => format!("0.00 0.00 0.00 1/1 {}\n", unsafe { crate::win::GetCurrentProcessId() }),
+        "/proc/loadavg" => format!("0.00 0.00 0.00 1/1 {}\n", crate::proc::pid()),
         "/proc/version" => "Linux version 6.6.0-lx (lx) #1 SMP lx\n".into(),
         "/proc/sys/kernel/hostname" => "lx\n".into(),
         "/proc/sys/kernel/osrelease" => "6.6.0-lx\n".into(),
@@ -39,7 +39,7 @@ pub fn file(guest: &str) -> Option<String> {
 fn self_rest(guest: &str) -> Option<&str> {
     let r = guest.strip_prefix("/proc/")?;
     let (pid, rest) = r.split_once('/')?;
-    (pid == "self" || pid.parse::<u32>().ok()? == unsafe { crate::win::GetCurrentProcessId() }).then_some(rest)
+    (pid == "self" || pid.parse::<u32>().ok()? == crate::proc::pid()).then_some(rest)
 }
 
 fn mounts() -> String {
