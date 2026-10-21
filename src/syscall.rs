@@ -942,6 +942,11 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         60 => thread::exit(a[0]),      // exit: this thread (the process when it's the last one)
         231 => proc::exit(a[0]),       // exit_group
         61 => proc::wait4(a[0] as i32 as i64, a[1], a[2]),
+        125 => capget(a[0], a[1]),
+        126 => Ok(0), // capset: accepted. ponytail: capabilities aren't enforced
+        // Callers fall back from these, so no "unimplemented" noise: io_uring (out of scope, DESIGN §5),
+        // pidfd_open (Go, libuv), copy_file_range (Go's io.Copy), waitid (Go waits with wait4 then).
+        425..=427 | 434 | 326 | 247 => Err(ENOSYS),
         62 => proc::kill(a[0] as i32 as i64, a[1]),
         63 => uname(a[0]),
         72 => fs::fcntl(a[0], a[1], a[2]),
@@ -1372,6 +1377,25 @@ fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
     protect(new, new_len.next_multiple_of(PAGE), m.protect);
     munmap(old, old_len, 0)?;
     Ok(new as i64)
+}
+
+/// capget(header, data): Docker's default capability set for root, none for other users (node asks at
+/// startup). A null `data` just reports the version (v3, two 32-bit words per set).
+fn capget(header: u64, data: u64) -> R {
+    const V3: u32 = 0x2008_0522;
+    // CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID SETPCAP NET_BIND_SERVICE NET_RAW SYS_CHROOT MKNOD
+    // AUDIT_WRITE SETFCAP: what `docker run` grants by default.
+    const DOCKER: u32 = 1 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 8 | 1 << 10 | 1 << 13
+        | 1 << 18 | 1 << 27 | 1 << 29 | 1 << 31;
+    if header == 0 {
+        return Err(EFAULT);
+    }
+    unsafe { *(header as *mut u32) = V3 };
+    if data != 0 {
+        let caps = if crate::proc::UID.load(Relaxed) == 0 { DOCKER } else { 0 };
+        unsafe { *(data as *mut [u32; 6]) = [caps, caps, 0, 0, 0, 0] }; // effective, permitted, inheritable x2
+    }
+    Ok(0)
 }
 
 // ---- System V shared memory ----
