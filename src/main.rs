@@ -101,6 +101,8 @@ pub mod win {
         pub fn SetHandleInformation(h: isize, mask: u32, flags: u32) -> i32;
         pub fn CreatePipe(r: *mut isize, w: *mut isize, attr: *mut c_void, size: u32) -> i32;
         pub fn GetFileType(h: isize) -> u32;
+        pub fn LockFileEx(h: isize, flags: u32, reserved: u32, len_lo: u32, len_hi: u32, ov: *mut c_void) -> i32;
+        pub fn UnlockFileEx(h: isize, reserved: u32, len_lo: u32, len_hi: u32, ov: *mut c_void) -> i32;
         pub fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
         pub fn CreateFileMappingW(file: isize, attr: *mut c_void, prot: u32, hi: u32, lo: u32, name: *const u16) -> isize;
         pub fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> isize;

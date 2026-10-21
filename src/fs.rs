@@ -1033,8 +1033,208 @@ pub fn mkdir_guest(guest: &str) -> Result<(), i64> {
 pub fn close(fd: u64) -> R {
     with(|fs| {
         let slot = fs.fds.get_mut(fd as usize).ok_or(EBADF)?;
-        slot.take().map(|_| 0).ok_or(EBADF)
+        let s = slot.take().ok_or(EBADF)?;
+        if let Fd::File { f, .. } = &s.fd {
+            let h = f.as_raw_handle() as isize;
+            LOCKS.lock().unwrap().retain(|l| l.0 != h); // NT drops the handle's locks with it
+        }
+        Ok(0)
     })
+}
+
+// ---- POSIX advisory locks (fcntl, flock) on NT byte-range locks ----
+//
+// NT locks are mandatory: a locked range can't be read or written through other handles. POSIX locks
+// are advisory. So a POSIX range [start, start+len) is locked at SHADOW + start, far beyond any real
+// file data: lockers conflict exactly as on Linux, while plain reads and writes never notice. flock()
+// uses a byte of its own, independent of fcntl locks as on Linux. NT can't split or convert a lock, so
+// held ranges are tracked: unlocking part of one re-locks the remainder, and changing a lock's type is
+// unlock + lock (restoring the old lock if the new one can't be had).
+// ponytail: locks belong to the fd's handle, not the whole process (Linux: per process / per open file
+// description); dup'd fds don't share them. SQLite and most lock users hold them on one fd.
+
+const SHADOW: u64 = 1 << 62;
+const FLOCK_AT: u64 = 1 << 63;
+
+/// Locks this process holds: (handle, start, len, exclusive), in shadow coordinates.
+static LOCKS: Mutex<Vec<(isize, u64, u64, bool)>> = Mutex::new(Vec::new());
+
+#[repr(C)]
+struct Overlapped {
+    internal: [usize; 2],
+    offset: u32,
+    offset_high: u32,
+    event: isize,
+}
+
+fn ov(at: u64) -> Overlapped {
+    Overlapped { internal: [0; 2], offset: at as u32, offset_high: (at >> 32) as u32, event: 0 }
+}
+
+fn nt_try_lock(h: isize, start: u64, len: u64, excl: bool) -> bool {
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
+    let flags = LOCKFILE_FAIL_IMMEDIATELY | if excl { LOCKFILE_EXCLUSIVE_LOCK } else { 0 };
+    let mut o = ov(start);
+    unsafe { crate::win::LockFileEx(h, flags, 0, len as u32, (len >> 32) as u32, (&mut o as *mut Overlapped).cast()) != 0 }
+}
+
+fn nt_unlock(h: isize, start: u64, len: u64) {
+    let mut o = ov(start);
+    unsafe { crate::win::UnlockFileEx(h, 0, len as u32, (len >> 32) as u32, (&mut o as *mut Overlapped).cast()) };
+}
+
+/// Take a lock; with `wait`, retry until it's free or a signal arrives (F_SETLKW / flock without LOCK_NB).
+fn take_lock(h: isize, start: u64, len: u64, excl: bool, wait: bool) -> Result<(), i64> {
+    loop {
+        if nt_try_lock(h, start, len, excl) {
+            LOCKS.lock().unwrap().push((h, start, len, excl));
+            return Ok(());
+        }
+        if !wait {
+            return Err(crate::syscall::EAGAIN);
+        }
+        if crate::signal::deliverable() {
+            return Err(crate::syscall::EINTR);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Drop [start, start+len) from our locks on `h`, keeping (re-locking) the parts outside it.
+/// Returns the pieces that were inside, so a failed type change can put them back.
+fn release(h: isize, start: u64, len: u64) -> Vec<(u64, u64, bool)> {
+    let end = start + len;
+    let mut locks = LOCKS.lock().unwrap();
+    let (mut keep, mut removed) = (Vec::new(), Vec::new());
+    for (lh, s, l, x) in locks.drain(..) {
+        if lh != h || s + l <= start || end <= s {
+            keep.push((lh, s, l, x));
+            continue;
+        }
+        nt_unlock(h, s, l);
+        removed.push((s.max(start), (s + l).min(end) - s.max(start), x));
+        if s < start && nt_try_lock(h, s, start - s, x) {
+            keep.push((h, s, start - s, x));
+        }
+        if s + l > end && nt_try_lock(h, end, s + l - end, x) {
+            keep.push((h, end, s + l - end, x));
+        }
+    }
+    *locks = keep;
+    removed
+}
+
+fn holds(h: isize, start: u64, len: u64) -> bool {
+    LOCKS.lock().unwrap().iter().any(|&(lh, s, l, _)| lh == h && s < start + len && start < s + l)
+}
+
+/// struct flock { short l_type, l_whence; off_t l_start, l_len; pid_t l_pid; }
+fn posix_lock(fd: u64, cmd: u64, arg: u64) -> R {
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
+    let (h, pos, size) = with(|fs| match fs.fd(fd)? {
+        Fd::File { f, .. } => {
+            let pos = f.stream_position().unwrap_or(0);
+            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            Ok((f.as_raw_handle() as isize, pos, size))
+        }
+        _ => Err(EBADF),
+    })?;
+    let p = arg as *mut u8;
+    let (ty, whence) = unsafe { (*(p as *const i16), *(p.add(2) as *const i16)) };
+    let (l_start, l_len) = unsafe { (*(p.add(8) as *const i64), *(p.add(16) as *const i64)) };
+    let base = match whence { 0 => 0, 1 => pos as i64, 2 => size as i64, _ => return Err(EINVAL) };
+    let (mut start, mut len) = (base + l_start, l_len);
+    if len < 0 {
+        start += len;
+        len = -len;
+    }
+    if start < 0 || start as u64 >= SHADOW || !(F_RDLCK..=F_UNLCK).contains(&ty) {
+        return Err(EINVAL);
+    }
+    let start = start as u64;
+    let len = if len == 0 { SHADOW - start } else { (len as u64).min(SHADOW - start) }; // 0 = to the end
+    let s = SHADOW + start;
+    match cmd {
+        5 | 36 => {
+            // F_GETLK: our own locks never conflict; otherwise probe the range.
+            if ty == F_UNLCK {
+                return Err(EINVAL);
+            }
+            let free = holds(h, s, len) || {
+                let ok = nt_try_lock(h, s, len, ty == F_WRLCK);
+                if ok {
+                    nt_unlock(h, s, len);
+                }
+                ok
+            };
+            unsafe {
+                if free {
+                    *(p as *mut i16) = F_UNLCK;
+                } else {
+                    *(p as *mut i16) = F_WRLCK; // ponytail: the holder's type and pid aren't known
+                    *(p.add(2) as *mut i16) = 0;
+                    *(p.add(8) as *mut i64) = start as i64;
+                    *(p.add(16) as *mut i64) = len as i64;
+                    *(p.add(24) as *mut i32) = -1;
+                }
+            }
+            Ok(0)
+        }
+        _ => {
+            let old = release(h, s, len);
+            if ty == F_UNLCK {
+                return Ok(0);
+            }
+            let r = take_lock(h, s, len, ty == F_WRLCK, cmd == 7 || cmd == 38);
+            if r.is_err() {
+                for (os, ol, ox) in old {
+                    let _ = take_lock(h, os, ol, ox, false); // keep what we had, as POSIX does
+                }
+            }
+            r.map(|_| 0)
+        }
+    }
+}
+
+/// fsync / fdatasync: flush the file to disk (databases rely on it for durability).
+pub fn fsync(fd: u64) -> R {
+    with(|fs| match fs.fd(fd)? {
+        Fd::File { f, .. } => f.sync_all().map(|_| 0).map_err(errno),
+        _ => Ok(0), // pipes, sockets, devices, directories: nothing to flush
+    })
+}
+
+/// flock(fd, LOCK_SH | LOCK_EX | LOCK_UN [| LOCK_NB]).
+pub fn flock(fd: u64, op: u64) -> R {
+    const LOCK_SH: u64 = 1;
+    const LOCK_EX: u64 = 2;
+    const LOCK_NB: u64 = 4;
+    const LOCK_UN: u64 = 8;
+    let h = with(|fs| match fs.fd(fd)? {
+        Fd::File { f, .. } => Ok(f.as_raw_handle() as isize),
+        Fd::Dir { .. } => Ok(-1), // directories: nothing to lock on NT here; succeed like an uncontended lock
+        _ => Err(EINVAL),
+    })?;
+    if h == -1 {
+        return Ok(0);
+    }
+    let old = release(h, FLOCK_AT, 1);
+    if op & LOCK_UN != 0 {
+        return Ok(0);
+    }
+    if op & (LOCK_SH | LOCK_EX) == 0 {
+        return Err(EINVAL);
+    }
+    let r = take_lock(h, FLOCK_AT, 1, op & LOCK_EX != 0, op & LOCK_NB == 0);
+    if r.is_err() {
+        for (os, ol, ox) in old {
+            let _ = take_lock(h, os, ol, ox, false);
+        }
+    }
+    r.map(|_| 0)
 }
 
 fn dup_fd(fd: &Fd) -> Result<Fd, i64> {
@@ -1073,6 +1273,7 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
 
 pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
     match cmd {
+        5 | 6 | 7 | 36 | 37 | 38 => posix_lock(fd, cmd, arg), // F_GETLK/SETLK/SETLKW and the OFD variants
         0 => dup(fd, arg, false),    // F_DUPFD
         1030 => dup(fd, arg, true),  // F_DUPFD_CLOEXEC
         1 | 2 => with(|fs| {
