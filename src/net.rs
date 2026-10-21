@@ -394,6 +394,41 @@ pub fn sys_recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, lenp: u6
     Ok(n)
 }
 
+/// sendmmsg: struct mmsghdr { msghdr (56 bytes), unsigned msg_len } is 64 bytes. glibc's resolver sends
+/// its A and AAAA queries with one call. Returns how many went out; an error only if none did.
+pub fn sys_sendmmsg(fd: u64, vec: u64, vlen: u64, flags: u64) -> R {
+    let mut sent = 0;
+    for i in 0..vlen.min(1024) {
+        let h = vec + i * 64;
+        match sys_sendmsg(fd, h, flags) {
+            Ok(n) => {
+                unsafe { *((h + 56) as *mut u32) = n as u32 };
+                sent += 1;
+            }
+            Err(e) => return if sent > 0 { Ok(sent) } else { Err(e) },
+        }
+    }
+    Ok(sent)
+}
+
+/// recvmmsg: the first message is received as `flags` say, the rest only if already there.
+/// ponytail: the timeout argument is ignored.
+pub fn sys_recvmmsg(fd: u64, vec: u64, vlen: u64, flags: u64) -> R {
+    const MSG_DONTWAIT: u64 = 0x40;
+    let mut got = 0;
+    for i in 0..vlen.min(1024) {
+        let h = vec + i * 64;
+        match sys_recvmsg(fd, h, if got == 0 { flags } else { flags | MSG_DONTWAIT }) {
+            Ok(n) => {
+                unsafe { *((h + 56) as *mut u32) = n as u32 };
+                got += 1;
+            }
+            Err(e) => return if got > 0 { Ok(got) } else { Err(e) },
+        }
+    }
+    Ok(got)
+}
+
 /// struct msghdr { name, namelen, iov, iovlen, control, controllen, flags }.
 /// ponytail: data only; control messages (SCM_RIGHTS, credentials) aren't supported.
 pub fn sys_sendmsg(fd: u64, msg: u64, flags: u64) -> R {

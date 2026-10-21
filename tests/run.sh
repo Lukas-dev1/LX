@@ -2,6 +2,7 @@
 # lx test suite. From the repo root, in Git Bash:   sh tests/run.sh
 #   REPEAT=n   repetitions of the multithreaded tests (default 20)
 #   QUICK=1    skip the network tests (nginx, wget, python)
+#   TOOLS=dir  where the toolchains live (default tools/; a git worktree can point at the main checkout's)
 #
 # Builds lx and the guest programs, prepares rootfs/ (an Alpine test rootfs plus pulled images), and runs
 # everything. Guest scripts live in guest/ and are copied into the images only for the duration of the
@@ -10,10 +11,11 @@ set -u
 cd "$(dirname "$0")/.."
 export MSYS_NO_PATHCONV=1
 ROOT=$(pwd -W)
-export RUSTUP_HOME="$ROOT/tools/rust/rustup" CARGO_HOME="$ROOT/tools/rust/cargo"
-CARGO=tools/rust/cargo/bin/cargo.exe
-ZIG=tools/zig-x86_64-windows-0.15.2/zig.exe
-GO=tools/go/bin/go.exe
+TOOLS=${TOOLS:-$ROOT/tools}
+export RUSTUP_HOME="$TOOLS/rust/rustup" CARGO_HOME="$TOOLS/rust/cargo"
+CARGO=$TOOLS/rust/cargo/bin/cargo.exe
+ZIG=$TOOLS/zig-x86_64-windows-0.15.2/zig.exe
+GO=$TOOLS/go/bin/go.exe
 LX=./target/release/lx.exe
 REPEAT=${REPEAT:-20}
 STORE=rootfs/images/registry-1.docker.io
@@ -55,25 +57,27 @@ cp guest/regress.sh guest/entrypoint.sh rootfs/alpine/
 HAVE_GO=0
 if [ -x $GO ]; then
   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOTOOLCHAIN=local GOTELEMETRY=off GO111MODULE=off \
-    GOCACHE="$ROOT/tools/gocache" GOPATH="$ROOT/tools/gopath" $GO build -o rootfs/gotest ./guest/gotest || die "go build"
+    GOCACHE="$TOOLS/gocache" GOPATH="$TOOLS/gopath" $GO build -o rootfs/gotest ./guest/gotest || die "go build"
   HAVE_GO=1
 fi
 
 # ---- images: pull what's missing; guest scripts go in for this run only ----
-for img in alpine:latest python:3.12-alpine nginx:alpine; do
+for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine; do
   dir=$STORE/library_${img%%:*}/${img#*:}/rootfs
   [ -d "$dir" ] || $LX pull "$img" > /dev/null 2>&1 || die "pull $img"
 done
 ALPINE_IMG=$STORE/library_alpine/latest/rootfs
 PY_IMG=$STORE/library_python/3.12-alpine/rootfs
+DEB_IMG=$STORE/library_python/3.12/rootfs # Debian (glibc)
 cleanup() {
-  rm -f "$ALPINE_IMG/sigtest.sh" "$PY_IMG/nettest.py"
+  rm -f "$ALPINE_IMG/sigtest.sh" "$PY_IMG/nettest.py" "$DEB_IMG/nettest.py" "$DEB_IMG/hello.py"
   rm -rf "$OUT"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 cp guest/sigtest.sh "$ALPINE_IMG/"
 cp guest/nettest.py "$PY_IMG/"
+cp guest/nettest.py guest/hello.py "$DEB_IMG/"
 
 # ---- single runs ----
 expect() { # expect <name> <exit code> <text in output> -- <lx args...>
@@ -89,6 +93,9 @@ expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regre
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
 expect "deep stack + fork" 0  "child exit 3"             -- rootfs/alpine /deepstack
 expect "dlopen while threads run" 0 " OK"                -- rootfs/alpine /dltest
+# Debian (glibc) image: the three usual ways a Python image starts.
+expect "debian: python3 -c"         0 "hi"               -- run python:3.12 python3 -c "print('hi')"
+expect "debian: python3 /script.py" 0 "script ran: 3.12" -- run python:3.12 python3 /hello.py
 
 # ---- repeated runs: every run must print OK; the trap fallback and FS faults must stay unused ----
 repeat() { # repeat <name> <n> <lx args...>
@@ -152,6 +159,10 @@ else
   }
   online "wget (DNS + HTTP out)" "<title>Example Domain</title>" run alpine wget -qO- http://example.com
   online "python3 /script.py: sockets + threaded server" "20/20 responses" run python:3.12-alpine python3 /nettest.py
+  online "debian: sockets + threaded server" "20/20 responses" run python:3.12 python3 /nettest.py
+  # glibc should stay off the trap path too: no fallback traps, no FS faults in a full threaded run.
+  LX_PATCHLOG=1 timeout 120 $LX run python:3.12 python3 /nettest.py < /dev/null > "$OUT/deb" 2>&1
+  if grep -q " 0 fallback traps;.* 0 FS-base faults" "$OUT/deb"; then ok "debian: no trap fallbacks"; else bad "debian: trap fallbacks taken"; grep "exit:" "$OUT/deb"; fi
 fi
 
 stop_test() { # stop_test <mode> <expected exit> [text]

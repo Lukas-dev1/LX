@@ -151,6 +151,18 @@ pub fn clone(c: &mut Context, flags: u64, stack: u64, ptid: u64, ctid: u64, tls:
     fork(c, stack)
 }
 
+/// clone3(struct clone_args *, size): { flags, pidfd, child_tid, parent_tid, exit_signal, stack,
+/// stack_size, tls, ... }. The new stack is given as base + size; the rest maps onto clone.
+pub fn clone3(c: &mut Context, args: u64, size: u64) -> R {
+    if size < 64 {
+        return Err(crate::syscall::EINVAL);
+    }
+    let a = unsafe { *(args as *const [u64; 8]) };
+    let [flags, _pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls] = a;
+    let sp = if stack != 0 { stack + stack_size } else { 0 };
+    clone(c, flags | (exit_signal & 0xff), sp, parent_tid, child_tid, tls)
+}
+
 pub fn wait4(pid: i64, status: u64, options: u64) -> R {
     const WNOHANG: u64 = 1;
     let blocking = options & WNOHANG == 0;
@@ -335,8 +347,8 @@ pub fn exit(code: u64) -> ! {
     if crate::syscall::patchlog() {
         use std::sync::atomic::Ordering::Relaxed;
         crate::syscall::dlog(format_args!(
-            "pid {} exit: syscall sites {} rewritten / {} fallback, {} fallback traps; fs sites {} rewritten / {} left, {} FS-base faults",
-            unsafe { GetCurrentProcessId() }, crate::jump::REWRITTEN.load(Relaxed), crate::jump::FALLBACK_SITES.load(Relaxed),
+            "pid {} exit: syscall sites {} rewritten ({} forward) / {} fallback, {} fallback traps; fs sites {} rewritten / {} left, {} FS-base faults",
+            unsafe { GetCurrentProcessId() }, crate::jump::REWRITTEN.load(Relaxed), crate::jump::FORWARD.load(Relaxed), crate::jump::FALLBACK_SITES.load(Relaxed),
             crate::syscall::FALLBACK_TRAPS.load(Relaxed), crate::jump::FS_REWRITTEN.load(Relaxed), crate::jump::FS_LEFT.load(Relaxed),
             crate::syscall::FS_FAULTS.load(Relaxed)));
     }
