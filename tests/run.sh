@@ -59,21 +59,15 @@ if [ -x $GO ]; then
   HAVE_GO=1
 fi
 
-# ---- images: pull what's missing; guest scripts go in for this run only ----
+# ---- images: pull what's missing; guest scripts reach containers through a read-only volume ----
 for img in alpine:latest python:3.12-alpine nginx:alpine; do
   dir=$STORE/library_${img%%:*}/${img#*:}/rootfs
   [ -d "$dir" ] || $LX pull "$img" > /dev/null 2>&1 || die "pull $img"
 done
-ALPINE_IMG=$STORE/library_alpine/latest/rootfs
-PY_IMG=$STORE/library_python/3.12-alpine/rootfs
-cleanup() {
-  rm -f "$ALPINE_IMG/sigtest.sh" "$PY_IMG/nettest.py"
-  rm -rf "$OUT"
-}
+GUEST="$ROOT/guest:/t:ro" # nothing is copied into an image: containers never modify the image store
+cleanup() { rm -rf "$OUT" rootfs/voltest-suite; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-cp guest/sigtest.sh "$ALPINE_IMG/"
-cp guest/nettest.py "$PY_IMG/"
 
 # ---- single runs ----
 expect() { # expect <name> <exit code> <text in output> -- <lx args...>
@@ -89,6 +83,20 @@ expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regre
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
 expect "deep stack + fork" 0  "child exit 3"             -- rootfs/alpine /deepstack
 expect "dlopen while threads run" 0 " OK"                -- rootfs/alpine /dltest
+
+# ---- volumes: data written in one container run is there in the next; the image stays untouched ----
+VOL="$ROOT/rootfs/voltest-suite"
+rm -rf rootfs/voltest-suite
+img_sum() { (cd $STORE/library_alpine/latest/rootfs && find . -type f -print0 | sort -z | xargs -0 sha1sum | sha1sum); }
+before=$(img_sum)
+expect "volume: run 1 writes"   0 "wrote"       -- run -v "$VOL:/data" alpine sh -c 'echo run1 > /data/log && mkdir -p /data/d && echo n > /data/d/f && echo wrote'
+expect "volume: run 2 reads + appends" 0 "run1" -- run -v "$VOL:/data" alpine sh -c 'cat /data/log /data/d/f && echo run2 >> /data/log'
+expect "volume: run 3 sees both runs" 0 "run1 run2" -- run -v "$VOL:/data" alpine sh -c 'tr "\n" " " < /data/log'
+[ "$(cat rootfs/voltest-suite/log 2>/dev/null | tr '\n' ' ')" = "run1 run2 " ] && ok "volume: host sees the data" || bad "volume: host sees the data"
+expect "volume: read-only"      0 "Read-only file system" -- run -v "$VOL:/data:ro" alpine sh -c 'echo x > /data/new; cat /data/log >/dev/null'
+expect "container layer: changes stay in the run" 0 "done" -- run alpine sh -c 'rm -f /etc/motd; echo x > /etc/new; echo done'
+expect "container layer: next run starts pristine" 0 "pristine" -- run alpine sh -c '[ -f /etc/motd ] && [ ! -e /etc/new ] && echo pristine'
+[ "$before" = "$(img_sum)" ] && ok "image store unchanged by containers" || bad "image store unchanged by containers"
 
 # ---- repeated runs: every run must print OK; the trap fallback and FS faults must stay unused ----
 repeat() { # repeat <name> <n> <lx args...>
@@ -151,13 +159,16 @@ else
     bad "$name"; tail -3 "$OUT/net"
   }
   online "wget (DNS + HTTP out)" "<title>Example Domain</title>" run alpine wget -qO- http://example.com
-  online "python3 /script.py: sockets + threaded server" "20/20 responses" run python:3.12-alpine python3 /nettest.py
+  online "python3 /script.py: sockets + threaded server" "20/20 responses" run -v "$GUEST" python:3.12-alpine python3 /t/nettest.py
 fi
 
 stop_test() { # stop_test <mode> <expected exit> [text]
-  $LX run alpine sh /sigtest.sh "$1" < /dev/null > "$OUT/stop" 2>&1 &
+  $LX run -v "$GUEST" alpine sh /t/sigtest.sh "$1" < /dev/null > "$OUT/stop" 2>&1 &
   job=$!
-  sleep 1.5
+  # Wait until the container is registered (a busy machine can take longer than any fixed sleep), then
+  # give the script a moment to install its trap.
+  for _ in $(seq 100); do [ -n "$($LX ps | awk 'NR==2 {print $1}')" ] && break; sleep 0.1; done
+  sleep 1
   $LX stop "$($LX ps | awk 'NR==2 {print $1}')" > /dev/null
   wait $job
   code=$?
