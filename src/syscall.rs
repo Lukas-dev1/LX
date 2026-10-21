@@ -854,6 +854,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         160 => Ok(0),                  // setrlimit: accepted, not enforced
         302 => rlimit(a[1], a[2], a[3]), // prlimit64 (self only)
         98 => { unsafe { std::ptr::write_bytes(a[1] as *mut u8, 0, 144) }; Ok(0) } // getrusage: zeros
+        99 => sysinfo(a[0]),
         204 => sched_getaffinity(a[1], a[2]),
         41 => net::sys_socket(a[0], a[1], a[2]),
         42 => net::sys_connect(a[0], a[1], a[2]),
@@ -1490,3 +1491,22 @@ pub fn getrandom(buf: u64, len: u64) -> R {
     Ok(len as i64)
 }
 
+
+/// sysinfo: uptime, RAM and page file from Windows (dpkg sizes its buffers by free RAM).
+/// ponytail: load averages, shared/buffer RAM and the process count are 0.
+fn sysinfo(info: u64) -> R {
+    let mut m = [0u64; 8]; // MEMORYSTATUSEX: dwLength + dwMemoryLoad, then ullTotalPhys, ullAvailPhys, ...
+    m[0] = 64;
+    if unsafe { crate::win::GlobalMemoryStatusEx(&mut m) } == 0 {
+        return Err(EFAULT);
+    }
+    // struct sysinfo: uptime, loads[3], totalram, freeram, sharedram, bufferram, totalswap, freeswap,
+    // procs (u16) + pad, totalhigh, freehigh, mem_unit (u32) + pad: 14 words on x86-64.
+    let mut s = [0u64; 14];
+    s[0] = unsafe { crate::win::GetTickCount64() } / 1000;
+    (s[4], s[5]) = (m[1], m[2]);
+    (s[8], s[9]) = (m[3].saturating_sub(m[1]), m[4].saturating_sub(m[2]));
+    s[13] = 1; // mem_unit: bytes
+    unsafe { *(info as *mut [u64; 14]) = s };
+    Ok(0)
+}
