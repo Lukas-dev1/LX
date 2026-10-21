@@ -374,7 +374,12 @@ fn errno(e: io::Error) -> i64 {
         Some(267) => ENOTDIR,
         Some(17) => 18, // ERROR_NOT_SAME_DEVICE -> EXDEV: rename across a volume boundary
         Some(123 | 87) => EINVAL,
-        _ => EIO,
+        _ => {
+            if crate::syscall::debug() {
+                crate::syscall::dlog(format_args!("Windows error {e} -> EIO"));
+            }
+            EIO
+        }
     }
 }
 
@@ -1158,13 +1163,19 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
             if flags & O_DIRECTORY != 0 {
                 return Err(if meta.is_ok() { ENOTDIR } else { ENOENT });
             }
+            let excl = flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL;
+            if acc == 0 && flags & O_CREAT != 0 {
+                // O_RDONLY|O_CREAT is fine on Linux (Go's telemetry token); std only creates with write
+                // access, so create it first, then open it read-only below.
+                OpenOptions::new().write(true).create(true).create_new(excl).open(&host).map_err(errno)?;
+            }
             let f = OpenOptions::new()
                 .read(acc != 1)
                 .write(acc != 0)
                 .append(flags & O_APPEND != 0)
                 .truncate(flags & O_TRUNC != 0 && acc != 0)
-                .create(flags & O_CREAT != 0)
-                .create_new(flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL)
+                .create(flags & O_CREAT != 0 && acc != 0)
+                .create_new(excl && acc != 0)
                 .open(&host)
                 .map_err(errno)?;
             if flags & O_CREAT != 0 && meta.is_err() && fs.mount_of(&comps_of(&guest)).is_none() {
