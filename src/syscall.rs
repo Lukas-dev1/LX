@@ -1109,7 +1109,17 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
         fs::read_at(fd, unsafe { guest_mut(p, len as usize) }, off)?;
     }
     if prot & 4 != 0 {
-        patch_code(p, len as usize);
+        // A file mapping: patch only its executable sections (see elf::exec_ranges); anonymous: all of it.
+        let ranges = (flags & MAP_ANONYMOUS == 0)
+            .then(|| {
+                let mut read = |o: u64, buf: &mut [u8]| fs::read_at(fd, buf, o).is_ok_and(|n| n as usize == buf.len());
+                crate::elf::exec_ranges(&mut read, off, len)
+            })
+            .flatten()
+            .unwrap_or(vec![(off, len)]);
+        for (o, n) in ranges {
+            patch_code(p + (o - off), n as usize);
+        }
     }
     protect(p, len, page_prot(prot));
     Ok(p as i64)
