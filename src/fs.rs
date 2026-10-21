@@ -634,9 +634,15 @@ fn handle_any(fd: &Fd) -> Result<isize, i64> {
 pub fn proc_state(fork: bool) -> Vec<String> {
     with(|fs| {
         // Only handles the new process keeps may reach it; a leaked pipe end would block EOF forever.
+        // Pipes and sockets share one handle between dup'd fds, so a handle is inherited if ANY fd that
+        // survives keeps it (dup2(p, 1) plus the original p left CLOEXEC: fd 1 must still get it).
+        let keep: std::collections::HashSet<isize> = fs.fds.iter().flatten()
+            .filter(|s| fork || !s.cloexec)
+            .filter_map(|s| handle_any(&s.fd).ok())
+            .collect();
         for s in fs.fds.iter().flatten() {
             if let Ok(h) = handle_any(&s.fd) {
-                unsafe { crate::win::SetHandleInformation(h, 1, (fork || !s.cloexec) as u32) };
+                unsafe { crate::win::SetHandleInformation(h, 1, keep.contains(&h) as u32) };
             }
         }
         let upper = fs.upper.as_ref().map(|u| u.to_string_lossy().into_owned()).unwrap_or_default();
