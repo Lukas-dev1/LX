@@ -855,6 +855,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         302 => rlimit(a[1], a[2], a[3]), // prlimit64 (self only)
         98 => { unsafe { std::ptr::write_bytes(a[1] as *mut u8, 0, 144) }; Ok(0) } // getrusage: zeros
         99 => sysinfo(a[0]),
+        100 => times(a[0]),
+        309 => getcpu(a[0], a[1]),
         204 => sched_getaffinity(a[1], a[2]),
         41 => net::sys_socket(a[0], a[1], a[2]),
         42 => net::sys_connect(a[0], a[1], a[2]),
@@ -1509,5 +1511,24 @@ fn sysinfo(info: u64) -> R {
     (s[8], s[9]) = (m[3].saturating_sub(m[1]), m[4].saturating_sub(m[2]));
     s[13] = 1; // mem_unit: bytes
     unsafe { *(info as *mut [u64; 14]) = s };
+    Ok(0)
+}
+
+/// times: clock ticks (USER_HZ 100) since boot. ponytail: the process CPU times are 0.
+fn times(buf: u64) -> R {
+    if buf != 0 {
+        unsafe { *(buf as *mut [u64; 4]) = [0; 4] };
+    }
+    Ok((unsafe { crate::win::GetTickCount64() } / 10) as i64)
+}
+
+/// getcpu: the CPU this thread runs on now, NUMA node 0.
+fn getcpu(cpu: u64, node: u64) -> R {
+    if cpu != 0 {
+        unsafe { *(cpu as *mut u32) = crate::win::GetCurrentProcessorNumber() };
+    }
+    if node != 0 {
+        unsafe { *(node as *mut u32) = 0 };
+    }
     Ok(0)
 }
