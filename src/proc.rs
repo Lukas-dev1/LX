@@ -58,8 +58,20 @@ pub fn get_res(id: &AtomicU32, out: [u64; 3]) -> R {
     Ok(0)
 }
 
+/// The pid the guest sees. Linux keeps it across execve; here an exec'd program runs in a new lx process,
+/// so that one takes its predecessor's pid (which stays behind as a proxy passing signals on, so a kill
+/// of the pid still arrives). pg_ctl waits for the pid it forked to show up in postmaster.pid.
+static PID: AtomicU32 = AtomicU32::new(0);
+
+pub fn pid() -> u32 {
+    match PID.load(Relaxed) {
+        0 => unsafe { GetCurrentProcessId() },
+        p => p,
+    }
+}
+
 pub fn getpid() -> R {
-    Ok(unsafe { GetCurrentProcessId() } as i64)
+    Ok(pid() as i64)
 }
 
 pub fn getppid() -> R {
@@ -131,7 +143,7 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     state.extend(signal::snapshot());
     state.extend(crate::jump::snapshot());
     state.extend(regs.iter().map(|r| r.to_string()));
-    state.push(unsafe { GetCurrentProcessId() }.to_string());
+    state.push(pid().to_string()); // the child's parent pid
 
     // The child copies our memory, so it gets a read-only handle to us; it reports back on `ready`.
     let mut me = 0isize;
@@ -283,7 +295,7 @@ pub fn wait_for_child_exit() {
 }
 
 pub fn kill(pid: i64, sig: u64) -> R {
-    let me = unsafe { GetCurrentProcessId() } as i64;
+    let me = self::pid() as i64;
     if pid == me {
         return if sig == 0 { Ok(0) } else { signal::raise(sig) }; // delivered when this syscall returns
     }
@@ -453,6 +465,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
     }
     let mut state = fs::proc_state(false);
     state.push(PARENT.load(Relaxed).to_string()); // exec keeps the pid relationship
+    state.push(pid().to_string()); // and the pid itself
     state.push(exe);
     state.push(argv.len().to_string());
     state.extend(argv);
@@ -473,8 +486,9 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
 pub fn receive_exec(state: &str) -> Result<(String, Vec<String>, Vec<String>), String> {
     let fields = read_state(state)?;
     let rest = fs::init_from(&fields)?;
-    let [ppid, exe, argc, rest @ ..] = rest else { return Err("malformed exec state".into()) };
+    let [ppid, pid, exe, argc, rest @ ..] = rest else { return Err("malformed exec state".into()) };
     PARENT.store(ppid.parse().map_err(|_| "malformed exec state")?, Relaxed);
+    PID.store(pid.parse().map_err(|_| "malformed exec state")?, Relaxed);
     let argc: usize = argc.parse().map_err(|_| "malformed exec state")?;
     if rest.len() < argc {
         return Err("malformed exec state".into());
