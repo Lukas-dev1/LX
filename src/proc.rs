@@ -94,6 +94,7 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     let mut state = fs::proc_state(true);
     state.extend(syscall::snapshot());
     state.extend(signal::snapshot());
+    state.extend(crate::jump::snapshot());
     state.extend(regs.iter().map(|r| r.to_string()));
     state.push(unsafe { GetCurrentProcessId() }.to_string());
 
@@ -128,6 +129,7 @@ pub fn receive_fork(state: &str, parent: &str, ready: &str) -> Result<([u64; 18]
     let parent = unsafe { OwnedHandle::from_raw_handle(parent as _) };
     let (stack, rest) = syscall::restore(rest, parent.as_raw_handle() as isize)?;
     let rest = signal::restore(rest)?;
+    let rest = crate::jump::restore(rest)?;
     let nums: Vec<u64> = rest.iter().map(|s| s.parse().map_err(|_| "malformed fork state")).collect::<Result<_, _>>()?;
     let [regs @ .., ppid] = nums.as_slice() else { return Err("malformed fork state".into()) };
     let regs: [u64; 18] = regs.try_into().map_err(|_| "malformed fork state")?;
@@ -303,6 +305,14 @@ pub fn ps() -> Vec<(u32, String)> {
 
 /// Exit immediately, without DLL teardown: the guest owns the process; nothing of ours needs flushing.
 pub fn exit(code: u64) -> ! {
+    if crate::syscall::patchlog() {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::syscall::dlog(format_args!(
+            "pid {} exit: syscall sites {} rewritten / {} fallback, {} fallback traps; fs sites {} rewritten / {} left, {} FS-base faults",
+            unsafe { GetCurrentProcessId() }, crate::jump::REWRITTEN.load(Relaxed), crate::jump::FALLBACK_SITES.load(Relaxed),
+            crate::syscall::FALLBACK_TRAPS.load(Relaxed), crate::jump::FS_REWRITTEN.load(Relaxed), crate::jump::FS_LEFT.load(Relaxed),
+            crate::syscall::FS_FAULTS.load(Relaxed)));
+    }
     if crate::syscall::siglog() {
         crate::syscall::dlog(format_args!("pid {} exit {}", unsafe { GetCurrentProcessId() }, code as u8));
     }

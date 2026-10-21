@@ -50,8 +50,12 @@ pub struct ThreadState {
     pub fs: u64,
     /// Where lx_fs_tramp jumps. Offset 8.
     resume: u64,
-    /// Pending signal frame for lx_sig_tramp: length at 16, bytes from 24.
+    /// Pending signal frame for lx_sig_tramp (exception path only): length here, bytes in `frame`.
     frame_len: u64,
+    /// lx_sys_entry: the guest's rsp while we run on `host_stack`.
+    guest_rsp: u64,
+    /// Top of this thread's lx stack: traps and direct syscalls run here, never on the guest's.
+    host_stack: u64,
     frame: [u8; signal::FRAME_MAX],
     /// Guest stack bounds, published in the TEB because our handler code runs on the guest stack
     /// (big frames, e.g. __chkstk inside CreateProcess, probe against them). Forked children reuse them.
@@ -60,22 +64,31 @@ pub struct ThreadState {
     pub clear_tid: u64,
     /// sigaltstack: (base, size), or None when disabled.
     pub altstack: Option<(u64, u64)>,
-    /// Our own stack for handling this thread's traps (top), and whether we're on it right now.
-    host_stack: u64,
+    /// Whether we're running on host_stack right now.
     on_host: bool,
     /// The TEB's own stack fields (StackBase, StackLimit, DeallocationStack) before the guest took over.
     /// ExitThread frees whatever DeallocationStack names, so they go back before a thread exits.
     pub host_teb: Option<[u64; 3]>,
 }
 
-const _: () = assert!(std::mem::offset_of!(ThreadState, resume) == 8);
-const _: () = assert!(std::mem::offset_of!(ThreadState, frame_len) == 16);
-const _: () = assert!(std::mem::offset_of!(ThreadState, frame) == 24);
+const TS_RESUME: usize = std::mem::offset_of!(ThreadState, resume);
+const TS_FRAME_LEN: usize = std::mem::offset_of!(ThreadState, frame_len);
+const TS_FRAME: usize = std::mem::offset_of!(ThreadState, frame);
+const TS_GUEST_RSP: usize = std::mem::offset_of!(ThreadState, guest_rsp);
+const TS_HOST_STACK: usize = std::mem::offset_of!(ThreadState, host_stack);
+const _: () = assert!(std::mem::offset_of!(ThreadState, fs) == 0);
 
 /// TEB offset of our TLS slot (gs:[0x1480 + 8*index]); the trampolines load the ThreadState pointer from it.
 #[unsafe(no_mangle)]
 static LX_TLS_OFF: AtomicU64 = AtomicU64::new(0);
 static TLS_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
+/// TEB offset of a per-thread scratch slot (its value, not a pointer): FS-site stubs park rax there.
+static SCRATCH_OFF: AtomicU64 = AtomicU64::new(0);
+
+/// (ThreadState pointer slot, scratch slot) as TEB offsets; FS-site stubs embed both.
+pub fn tls_slot_offsets() -> (u32, u32) {
+    (LX_TLS_OFF.load(Relaxed) as u32, SCRATCH_OFF.load(Relaxed) as u32)
+}
 
 /// This thread's state, created on first use.
 pub fn ts() -> &'static mut ThreadState {
@@ -84,9 +97,11 @@ pub fn ts() -> &'static mut ThreadState {
     if !p.is_null() {
         return unsafe { &mut *p };
     }
+    let host = unsafe { VirtualAlloc(std::ptr::null_mut(), HOST_STACK, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
+    assert!(host != 0, "no memory for a thread's lx stack");
     let st = Box::leak(Box::new(ThreadState {
-        fs: 0, resume: 0, frame_len: 0, frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None,
-        host_stack: 0, on_host: false, host_teb: None,
+        fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host + HOST_STACK as u64,
+        frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, on_host: false, host_teb: None,
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
     st
@@ -110,29 +125,34 @@ std::arch::global_asm!(
     "push rax",
     "mov rax, qword ptr [rip + LX_TLS_OFF]",
     "mov rax, qword ptr gs:[rax]",        // ThreadState*
-    "push qword ptr [rax + 8]",           // resume
+    "push qword ptr [rax + {resume}]",
     "mov rax, qword ptr [rax]",           // fs
     ".byte 0xf3, 0x48, 0x0f, 0xae, 0xd0", // wrfsbase rax
     "mov rax, qword ptr [rsp + 8]",
     "lea rsp, [rsp + 144]",
     "jmp qword ptr [rsp - 144]",
+    resume = const TS_RESUME,
 );
 // Enter or resume the guest with a full register set: [rax rcx rdx rbx rsp rbp rsi rdi r8..r15 rip rflags].
-// Flags are restored first (on our stack), then plain movs (which leave flags alone), and the jump goes
-// through lx_fs_tramp so FS base is set on the way in.
+// FS base first, then an iretq frame on the stack we're on (never the guest's): iretq loads rip, rsp and
+// rflags together, so no guest memory is written and no register is needed for the jump.
 std::arch::global_asm!(
     ".globl lx_resume",
     "lx_resume:",
-    "push qword ptr [rcx + 17*8]",
-    "popfq",
     "mov rax, qword ptr [rip + LX_TLS_OFF]",
     "mov rax, qword ptr gs:[rax]",        // ThreadState*
-    "mov rdx, qword ptr [rcx + 16*8]",
-    "mov qword ptr [rax + 8], rdx",       // resume = rip
+    "mov rax, qword ptr [rax]",           // fs
+    ".byte 0xf3, 0x48, 0x0f, 0xae, 0xd0", // wrfsbase rax
+    "mov eax, ss",
+    "push rax",
+    "push qword ptr [rcx + 4*8]",         // rsp
+    "push qword ptr [rcx + 17*8]",        // rflags
+    "mov eax, cs",
+    "push rax",
+    "push qword ptr [rcx + 16*8]",        // rip
     "mov rax, qword ptr [rcx + 0*8]",
     "mov rdx, qword ptr [rcx + 2*8]",
     "mov rbx, qword ptr [rcx + 3*8]",
-    "mov rsp, qword ptr [rcx + 4*8]",
     "mov rbp, qword ptr [rcx + 5*8]",
     "mov rsi, qword ptr [rcx + 6*8]",
     "mov rdi, qword ptr [rcx + 7*8]",
@@ -145,11 +165,131 @@ std::arch::global_asm!(
     "mov r14, qword ptr [rcx + 14*8]",
     "mov r15, qword ptr [rcx + 15*8]",
     "mov rcx, qword ptr [rcx + 1*8]",
-    "jmp lx_fs_tramp",
+    "iretq",
+);
+
+// The direct syscall path. A rewritten site arrives here from its stub with r11 = return address and
+// every other register as the guest left it (rcx is free: a Linux syscall clobbers it). Before
+// anything is written, rsp moves to this thread's lx stack (only movs, which touch neither memory nor
+// flags); the first write is pushfq onto the lx stack. A Context-shaped frame is built there for
+// lx_direct, and the way back is an iretq frame on the lx stack too.
+std::arch::global_asm!(
+    ".globl lx_sys_entry",
+    "lx_sys_entry:",
+    "mov rcx, qword ptr [rip + LX_TLS_OFF]",
+    "mov rcx, qword ptr gs:[rcx]",        // ThreadState*
+    "mov qword ptr [rcx + {guest_rsp}], rsp",
+    "mov rsp, qword ptr [rcx + {host_stack}]",
+    "pushfq",                             // DirectFrame.flags (offset 0x108)
+    "lea rsp, [rsp - 0x108]",             // DirectFrame.ctx (Context layout)
+    "mov qword ptr [rsp + 0x78], rax",
+    "mov qword ptr [rsp + 0x88], rdx",
+    "mov qword ptr [rsp + 0x90], rbx",
+    "mov qword ptr [rsp + 0xa0], rbp",
+    "mov qword ptr [rsp + 0xa8], rsi",
+    "mov qword ptr [rsp + 0xb0], rdi",
+    "mov qword ptr [rsp + 0xb8], r8",
+    "mov qword ptr [rsp + 0xc0], r9",
+    "mov qword ptr [rsp + 0xc8], r10",
+    "mov qword ptr [rsp + 0xd8], r12",
+    "mov qword ptr [rsp + 0xe0], r13",
+    "mov qword ptr [rsp + 0xe8], r14",
+    "mov qword ptr [rsp + 0xf0], r15",
+    "mov qword ptr [rsp + 0xf8], r11",    // rip: where the syscall returns to
+    "mov qword ptr [rsp + 0x80], r11",    // rcx, as the kernel leaves it
+    "mov rax, qword ptr [rcx + {guest_rsp}]",
+    "mov qword ptr [rsp + 0x98], rax",
+    "mov rax, qword ptr [rsp + 0x108]",
+    "mov qword ptr [rsp + 0xd0], rax",    // r11 = rflags, as the kernel leaves it
+    "mov dword ptr [rsp + 0x44], eax",    // Context.EFlags
+    "mov rcx, rsp",
+    "sub rsp, 32",
+    "call lx_direct",
+    "add rsp, 32",
+    "mov rax, qword ptr [rip + LX_TLS_OFF]",
+    "mov rax, qword ptr gs:[rax]",
+    "mov rax, qword ptr [rax]",           // fs
+    ".byte 0xf3, 0x48, 0x0f, 0xae, 0xd0", // wrfsbase rax
+    "mov rax, rsp",                       // the frame
+    "mov ecx, ss",
+    "push rcx",
+    "push qword ptr [rax + 0x98]",        // rsp
+    "push qword ptr [rax + 0x108]",       // rflags
+    "mov ecx, cs",
+    "push rcx",
+    "push qword ptr [rax + 0xf8]",        // rip
+    "mov rcx, qword ptr [rax + 0x80]",
+    "mov rdx, qword ptr [rax + 0x88]",
+    "mov rbx, qword ptr [rax + 0x90]",
+    "mov rbp, qword ptr [rax + 0xa0]",
+    "mov rsi, qword ptr [rax + 0xa8]",
+    "mov rdi, qword ptr [rax + 0xb0]",
+    "mov r8, qword ptr [rax + 0xb8]",
+    "mov r9, qword ptr [rax + 0xc0]",
+    "mov r10, qword ptr [rax + 0xc8]",
+    "mov r11, qword ptr [rax + 0xd0]",
+    "mov r12, qword ptr [rax + 0xd8]",
+    "mov r13, qword ptr [rax + 0xe0]",
+    "mov r14, qword ptr [rax + 0xe8]",
+    "mov r15, qword ptr [rax + 0xf0]",
+    "mov rax, qword ptr [rax + 0x78]",
+    "iretq",
+    guest_rsp = const TS_GUEST_RSP,
+    host_stack = const TS_HOST_STACK,
 );
 unsafe extern "C" {
     fn lx_fs_tramp();
     fn lx_resume(regs: *const [u64; 18]) -> !;
+    fn lx_sys_entry();
+}
+
+/// lx_sys_entry's frame: a Context (so dispatch and signals work unchanged) plus the 64-bit rflags.
+#[repr(C)]
+struct DirectFrame {
+    ctx: Context,
+    _pad: u64,
+    flags: u64,
+}
+const _: () = assert!(std::mem::offset_of!(DirectFrame, flags) == 0x108);
+const _: () = assert!(size_of::<DirectFrame>() == 0x110);
+
+pub fn sys_entry_addr() -> u64 {
+    lx_sys_entry as *const () as u64
+}
+
+pub static FALLBACK_TRAPS: AtomicU64 = AtomicU64::new(0);
+/// FS-base reload faults (NT dropped FS base on a context switch; the next %fs: access faulted).
+pub static FS_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Rust half of the direct path, on the thread's lx stack. Same semantics as the exception path.
+#[unsafe(no_mangle)]
+unsafe extern "system" fn lx_direct(f: *mut DirectFrame) {
+    let f = unsafe { &mut *f };
+    let c = &mut f.ctx;
+    let t = ts();
+    t.on_host = true;
+    let (base, limit): (u64, u64);
+    let top = t.host_stack;
+    unsafe {
+        // TEB bounds describe the stack we're on (for __chkstk); the guest's go back on the way out.
+        std::arch::asm!("mov {b}, qword ptr gs:[0x08]", "mov {l}, qword ptr gs:[0x10]", b = out(reg) base, l = out(reg) limit);
+        std::arch::asm!("mov qword ptr gs:[0x08], {b}", "mov qword ptr gs:[0x10], {l}", b = in(reg) top, l = in(reg) top - HOST_STACK as u64);
+    }
+    if c.rax == 15 {
+        signal::sigreturn(c); // rt_sigreturn: everything comes from the ucontext
+    } else {
+        let next = c.rip;
+        c.rip = next - 2; // what the trap path sees: the address of the syscall instruction
+        let ret = dispatch(c);
+        (c.rax, c.rcx, c.r11, c.rip) = (ret as u64, next, c.eflags as u64, next);
+    }
+    if let Some(frame) = signal::deliver(c) {
+        // Unlike the trap path, nothing of ours lives on the guest stack: the frame goes straight there.
+        unsafe { std::ptr::copy_nonoverlapping(frame.as_ptr(), c.rsp as *mut u8, frame.len()) };
+    }
+    f.flags = c.eflags as u64;
+    unsafe { std::arch::asm!("mov qword ptr gs:[0x08], {b}", "mov qword ptr gs:[0x10], {l}", b = in(reg) base, l = in(reg) limit) };
+    ts().on_host = false;
 }
 
 /// Jump into guest code on this thread. Never returns: the guest ends it with exit or exit_group.
@@ -266,6 +406,7 @@ pub fn release_guest_memory() {
         false
     });
     CODE.lock().unwrap().regions.clear(); // nothing of the old program runs any more
+    crate::jump::clear();
 }
 
 /// Serialize everything a forked child needs to rebuild the guest's address space and runtime state.
@@ -349,6 +490,7 @@ const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+const STATUS_BREAKPOINT: u32 = 0x8000_0003;
 
 /// One debug line, written in one piece and tagged with the thread id (threads interleave otherwise).
 pub fn dlog(msg: std::fmt::Arguments) {
@@ -375,6 +517,9 @@ pub fn install() {
     assert!(idx < 64, "TLS index {idx} is past the TEB's inline slots"); // inline slots: gs:[0x1480 + 8*i]
     TLS_INDEX.store(idx as u64, Relaxed);
     LX_TLS_OFF.store(0x1480 + 8 * idx as u64, Relaxed);
+    let scratch = unsafe { TlsAlloc() };
+    assert!(scratch < 64, "TLS index {scratch} is past the TEB's inline slots");
+    SCRATCH_OFF.store(0x1480 + 8 * scratch as u64, Relaxed);
     crate::thread::set_main();
     unsafe { AddVectoredExceptionHandler(1, veh) };
     signal::listen();
@@ -383,10 +528,25 @@ pub fn install() {
 /// Rewrite every `syscall` in writable guest code at [addr, addr+len) to `ud2` and register the range.
 pub fn patch_code(addr: u64, len: usize) -> usize {
     let code = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len) };
-    let found = find_syscalls(code, addr);
+    let all = find_syscalls(code, addr).len();
     let raw = code.windows(2).filter(|w| w == b"\x0f\x05").count();
-    if raw != found.len() && debug() {
-        eprintln!("[lx] {addr:#x}: {} of {raw} 0F05 byte pairs are not instructions, left alone", raw - found.len());
+    if raw != all && debug() {
+        eprintln!("[lx] {addr:#x}: {} of {raw} 0F05 byte pairs are not instructions, left alone", raw - all);
+    }
+    // What's left needs the trap fallback. LX_NOJUMP=1 keeps every site on it (comparison, escape hatch).
+    static NOJUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let (fs0, left0) = (crate::jump::FS_REWRITTEN.load(Relaxed), crate::jump::FS_LEFT.load(Relaxed));
+    let found = if *NOJUMP.get_or_init(|| std::env::var_os("LX_NOJUMP").is_some()) {
+        find_syscalls(code, addr)
+    } else {
+        crate::jump::rewrite(code, addr)
+    };
+    if patchlog() {
+        dlog(format_args!("code {addr:#x}+{len:#x}: syscall sites {} rewritten / {} fallback; fs sites {} rewritten / {} left",
+            all - found.len(), found.len(), crate::jump::FS_REWRITTEN.load(Relaxed) - fs0, crate::jump::FS_LEFT.load(Relaxed) - left0));
+        for &a in &found {
+            dlog(format_args!("  fallback site {a:#x}: {}", crate::jump::describe(code, addr, a)));
+        }
     }
     for &a in &found {
         code[(a - addr) as usize + 1] = 0x0b; // syscall (0F 05) -> ud2 (0F 0B)
@@ -396,7 +556,32 @@ pub fn patch_code(addr: u64, len: usize) -> usize {
     c.sites.extend(&found);
     c.sites.sort_unstable();
     c.sites.dedup();
-    found.len()
+    all
+}
+
+/// Register [lo, hi) as guest code (stub areas): faults there are the guest's, not ours.
+pub fn register_code(lo: u64, hi: u64) {
+    CODE.lock().unwrap().regions.push((lo, hi));
+}
+
+/// Fallback statistics on stderr (LX_PATCHLOG): which sites were rewritten, which traps were taken.
+pub fn patchlog() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LX_PATCHLOG").is_some())
+}
+
+/// RWX guest memory at exactly `a` (stub areas, which must be within rel32 reach of their code).
+pub fn alloc_rwx_at(a: u64, len: u64) -> Option<u64> {
+    let p = unsafe { VirtualAlloc(a as *mut _, len as usize, MEM_COMMIT_RESERVE, 0x40) } as u64; // PAGE_EXECUTE_READWRITE
+    if p == 0 {
+        return None;
+    }
+    if p != a {
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        return None;
+    }
+    ALLOCS.lock().unwrap().push((p, len));
+    Some(p)
 }
 
 /// Addresses of real `syscall` instructions, by linear-sweep decoding.
@@ -435,8 +620,8 @@ std::arch::global_asm!(
     "push rcx",
     "mov rsi, qword ptr [rip + LX_TLS_OFF]",
     "mov rsi, qword ptr gs:[rsi]",        // ThreadState*
-    "mov rcx, qword ptr [rsi + 16]",      // frame_len
-    "lea rsi, [rsi + 24]",                // frame
+    "mov rcx, qword ptr [rsi + {frame_len}]",
+    "lea rsi, [rsi + {frame}]",
     "lea rdi, [rsp + 24]",
     "cld",
     "rep movsb",
@@ -444,6 +629,8 @@ std::arch::global_asm!(
     "pop rdi",
     "pop rsi",
     "jmp lx_fs_tramp",
+    frame_len = const TS_FRAME_LEN,
+    frame = const TS_FRAME,
 );
 unsafe extern "C" {
     fn lx_sig_tramp();
@@ -542,13 +729,24 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
             signal::sigreturn(c); // rt_sigreturn: back to where the signal interrupted
             resume_with_signals(c)
         }
+        STATUS_BREAKPOINT if crate::jump::redirect(c.rip).is_some() => {
+            // A jump we couldn't see landed inside a rewritten site: continue at that instruction's copy.
+            let to = crate::jump::redirect(c.rip).unwrap();
+            if patchlog() {
+                dlog(format_args!("entered rewritten site mid-way at {:#x}, continuing in its stub", c.rip));
+            }
+            resume(c, to)
+        }
         STATUS_ILLEGAL_INSTRUCTION if is_site => {
+            FALLBACK_TRAPS.fetch_add(1, Relaxed);
             let ret = dispatch(c);
             let next = c.rip + 2;
             (c.rax, c.rcx, c.r11, c.rip) = (ret as u64, next, c.eflags as u64, next); // kernel ABI: rcx=rip, r11=rflags
             resume_with_signals(c)
         }
         STATUS_ACCESS_VIOLATION if ts().fs != 0 && lost_fs_base(c, rec.info[1] as u64, end) => {
+            FS_FAULTS.fetch_add(1, Relaxed);
+            if patchlog() { dlog(format_args!("FS-base fault at rip {:#x} rsp {:#x}", c.rip, c.rsp)); }
             resume(c, c.rip)
         }
         _ => guest_crash(rec, c),
@@ -652,7 +850,7 @@ fn dispatch(c: &mut Context) -> i64 {
         20 => fs::writev(a[0], a[1], a[2]),
         22 => fs::pipe2(a[0], 0),
         21 => fs::faccessat(CWD, a[0]),
-        28 => Ok(0),                   // madvise: advice only
+        28 => madvise(a[0], a[1], a[2]),
         32 => fs::dup(a[0], 0, false),
         33 => fs::dup3(a[0], a[1], 0),
         35 => nanosleep(a[0]),
@@ -698,6 +896,8 @@ fn dispatch(c: &mut Context) -> i64 {
         217 => fs::getdents64(a[0], a[1], a[2]),
         202 => thread::futex(a[0], a[1], a[2], a[3], a[5]),
         324 => thread::membarrier(a[0]),
+        284 => fs::eventfd(a[0], 0),
+        290 => fs::eventfd(a[0], a[1]),
         218 => { ts().clear_tid = a[0]; thread::gettid() } // set_tid_address
         230 => clock_nanosleep(a[0], a[1], a[2]),
         228 => clock_gettime(a[0], a[1]),
@@ -872,7 +1072,8 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> R {
     let len = len.next_multiple_of(PAGE);
     if prot & 4 != 0 {
         // Newly executable memory (JITs, ld.so): scan before it can run. Already-patched code rescans clean.
-        protect(addr, len, PAGE_READWRITE as u32);
+        // RWX while patching, not RW: another thread may already be running code in this range.
+        protect(addr, len, 0x40);
         patch_code(addr, len as usize);
     }
     if protect(addr, len, page_prot(prot)) { Ok(0) } else { Err(ENOMEM) }
@@ -905,6 +1106,29 @@ fn munmap(addr: u64, len: u64, rsp: u64) -> R {
     // ponytail: decommit only; the address space stays reserved (and leaks) until exit.
     decommit(addr, len);
     Ok(0)
+}
+
+/// madvise: MADV_DONTNEED / MADV_REMOVE must make private anonymous pages read back as zeros (Go's
+/// scavenger counts on it); everything else is advice. Decommit + recommit gives fresh zero pages
+/// without touching them. ponytail: a private file mapping should re-read the file instead.
+fn madvise(addr: u64, len: u64, advice: u64) -> R {
+    const MADV_DONTNEED: u64 = 4;
+    const MADV_REMOVE: u64 = 9;
+    if advice != MADV_DONTNEED && advice != MADV_REMOVE {
+        return Ok(0);
+    }
+    let ok = each_region(addr, len.next_multiple_of(PAGE), |p, n, state| {
+        if state != MEM_COMMIT {
+            return true;
+        }
+        let mut m = MemoryBasicInformation::default();
+        unsafe {
+            VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>());
+            VirtualFree(p as *mut _, n as usize, MEM_DECOMMIT) != 0
+                && !VirtualAlloc(p as *mut _, n as usize, MEM_COMMIT, m.protect).is_null()
+        }
+    });
+    if ok { Ok(0) } else { Err(ENOMEM) }
 }
 
 /// The registered guest allocation containing `addr`, as (low, high).

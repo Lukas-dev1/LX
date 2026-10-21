@@ -1,6 +1,7 @@
 //! lx: run a static x86-64 Linux ELF natively on NT. See DESIGN.md.
 mod elf;
 mod fs;
+mod jump;
 mod image;
 mod net;
 mod proc;

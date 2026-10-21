@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info"] }
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info", "encoder", "block_encoder", "intel"] }
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 serde_json = "1"

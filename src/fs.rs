@@ -41,6 +41,72 @@ pub enum Fd {
     /// Shared like a Linux open file description: dup and fork share the socket and its O_NONBLOCK.
     Socket(Arc<Sock>),
     Epoll(Arc<Mutex<Epoll>>),
+    /// eventfd: a counter (Go's netpoller and nginx use it to wake their epoll waits).
+    Event(Arc<EventFd>),
+}
+
+pub struct EventFd {
+    count: Mutex<u64>,
+    changed: std::sync::Condvar,
+    semaphore: bool,
+    nonblock: std::sync::atomic::AtomicBool,
+}
+
+impl EventFd {
+    pub fn new(init: u64, flags: u64) -> Self {
+        const EFD_SEMAPHORE: u64 = 1;
+        EventFd {
+            count: Mutex::new(init),
+            changed: std::sync::Condvar::new(),
+            semaphore: flags & EFD_SEMAPHORE != 0,
+            nonblock: std::sync::atomic::AtomicBool::new(flags & O_NONBLOCK != 0),
+        }
+    }
+
+    fn read(&self, buf: u64, len: u64) -> R {
+        if len < 8 {
+            return Err(EINVAL);
+        }
+        let mut c = self.count.lock().unwrap();
+        while *c == 0 {
+            if self.nonblock.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(crate::syscall::EAGAIN);
+            }
+            if crate::signal::deliverable() {
+                return Err(crate::syscall::EINTR);
+            }
+            // Short timed waits so a signal still interrupts the read.
+            c = self.changed.wait_timeout(c, std::time::Duration::from_millis(20)).unwrap().0;
+        }
+        let v = if self.semaphore { 1 } else { *c };
+        *c -= v;
+        unsafe { *(buf as *mut u64) = v };
+        Ok(8)
+    }
+
+    fn write(&self, buf: u64, len: u64) -> R {
+        if len < 8 {
+            return Err(EINVAL);
+        }
+        let v = unsafe { *(buf as *const u64) };
+        let mut c = self.count.lock().unwrap();
+        if v == u64::MAX || *c > u64::MAX - 1 - v {
+            return Err(crate::syscall::EAGAIN); // ponytail: a blocking writer would wait; nobody fills it that far
+        }
+        *c += v;
+        self.changed.notify_all();
+        Ok(8)
+    }
+
+    fn ready(&self, events: i16) -> i16 {
+        let readable = *self.count.lock().unwrap() > 0;
+        (if readable { events & POLLIN } else { 0 }) | (events & POLLOUT)
+    }
+}
+
+pub fn eventfd(init: u64, flags: u64) -> R {
+    const EFD_CLOEXEC: u64 = 0o2000000;
+    Ok(add_fd(Fd::Event(Arc::new(EventFd::new(init, flags))), flags & EFD_CLOEXEC != 0))
 }
 
 #[derive(Clone, Copy)]
@@ -241,7 +307,7 @@ pub fn find_exe(cmd: &str, path_var: &str) -> Result<(String, Vec<u8>), i64> {
 
 fn handle_any(fd: &Fd) -> Result<isize, i64> {
     match fd {
-        Fd::Dir { .. } | Fd::Epoll(_) => Err(EISDIR),
+        Fd::Dir { .. } | Fd::Epoll(_) | Fd::Event(_) => Err(EISDIR),
         Fd::Socket(s) => Ok(s.s as isize), // Winsock sockets are kernel handles and inherit like them
         _ => handle(fd),
     }
@@ -269,6 +335,8 @@ pub fn proc_state(fork: bool) -> Vec<String> {
                 Fd::Socket(k) => ("s", k.s, (k.nonblocking() as u8).to_string()),
                 // ponytail: epoll instances aren't carried across fork/exec (servers make one per worker).
                 Fd::Epoll(_) => continue,
+                // ponytail: an eventfd shared across fork isn't carried either; each process starts without it.
+                Fd::Event(_) => continue,
             };
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
             n += 1;
@@ -336,7 +404,7 @@ fn handle(fd: &Fd) -> Result<isize, i64> {
         Fd::Handle(h) => Ok(h.as_raw_handle() as isize),
         Fd::File { f, .. } => Ok(f.as_raw_handle() as isize),
         Fd::Dir { .. } => Err(EISDIR),
-        Fd::Dev(_) | Fd::Socket(_) | Fd::Epoll(_) => Err(EINVAL),
+        Fd::Dev(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) => Err(EINVAL),
     }
 }
 
@@ -345,12 +413,14 @@ enum Io {
     Handle(isize),
     Dev(Dev),
     Sock(Arc<Sock>),
+    Event(Arc<EventFd>),
 }
 
 fn io_target(fd: u64) -> Result<Io, i64> {
     with(|fs| match fs.fd(fd)? {
         Fd::Dev(d) => Ok(Io::Dev(*d)),
         Fd::Socket(s) => Ok(Io::Sock(s.clone())),
+        Fd::Event(e) => Ok(Io::Event(e.clone())),
         other => handle(other).map(Io::Handle),
     })
 }
@@ -359,6 +429,7 @@ pub fn read(fd: u64, buf: u64, len: u64) -> R {
     match io_target(fd)? {
         Io::Handle(h) => read_handle(h, buf, len),
         Io::Sock(s) => s.recv(buf, len, 0),
+        Io::Event(e) => e.read(buf, len),
         Io::Dev(Dev::Null) => Ok(0),
         Io::Dev(Dev::Zero) => {
             unsafe { guest_mut(buf, len as usize) }.fill(0);
@@ -373,6 +444,7 @@ pub fn write(fd: u64, buf: u64, len: u64) -> R {
         Io::Handle(h) => write_handle(h, buf, len),
         Io::Sock(s) => s.send(buf, len, 0),
         Io::Dev(_) => Ok(len as i64), // devices swallow writes
+        Io::Event(e) => e.write(buf, len),
     }
 }
 
@@ -416,6 +488,7 @@ pub fn readiness(fd: i32, events: i16) -> i16 {
         Err(_) => POLLNVAL,
         Ok(Io::Dev(_)) => events & (POLLIN | POLLOUT),
         Ok(Io::Sock(s)) => s.ready(events),
+        Ok(Io::Event(e)) => e.ready(events),
         Ok(Io::Handle(h)) => match unsafe { crate::win::GetFileType(h) } {
             3 => {
                 // FILE_TYPE_PIPE. ponytail: write ends always report POLLOUT.
@@ -631,6 +704,7 @@ fn dup_fd(fd: &Fd) -> Result<Fd, i64> {
         Fd::Dev(d) => Fd::Dev(*d),
         Fd::Socket(s) => Fd::Socket(s.clone()),
         Fd::Epoll(e) => Fd::Epoll(e.clone()),
+        Fd::Event(e) => Fd::Event(e.clone()),
     })
 }
 
@@ -670,6 +744,7 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         8 => with(|fs| fs.fd(fd).map(|_| 0)), // F_SETOWN: only matters for SIGIO, which we don't send
         4 => with(|fs| match fs.fd(fd)? {
             Fd::Socket(s) => { s.set_nonblocking(arg & O_NONBLOCK != 0); Ok(0) }
+            Fd::Event(e) => { e.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
             _ => Ok(0),
         }),
         3 => with(|fs| match fs.fd(fd)? {
@@ -693,7 +768,7 @@ pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
         }
         Fd::Dir { pos, .. } if off == 0 && whence == 0 => { *pos = 0; Ok(0) }
         Fd::Dir { .. } => Err(EINVAL),
-        Fd::Handle(_) | Fd::Socket(_) | Fd::Epoll(_) => Err(ESPIPE),
+        Fd::Handle(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) => Err(ESPIPE),
         Fd::Dev(_) => Ok(0),
     })
 }
@@ -748,7 +823,7 @@ pub fn fstat(fd: u64, buf: u64) -> R {
             (s[1], s[2], s[3], s[7]) = (k.s as u64, 1, 0o140777, 4096); // S_IFSOCK
             Ok(s)
         }
-        Fd::Epoll(_) => {
+        Fd::Epoll(_) | Fd::Event(_) => {
             let mut s = [0u64; 18];
             (s[2], s[3], s[7]) = (1, 0o600, 4096); // anon inode
             Ok(s)
@@ -811,6 +886,7 @@ fn proc_link(guest: &str) -> Option<String> {
                 Fd::Handle(_) => Some("pipe:[0]".into()),
                 Fd::Socket(k) => Some(format!("socket:[{}]", k.s)),
                 Fd::Epoll(_) => Some("anon_inode:[eventpoll]".into()),
+                Fd::Event(_) => Some("anon_inode:[eventfd]".into()),
             })
         }
     }
