@@ -49,6 +49,7 @@ cc_static 2 rootfs/hello guest/hello.c
 cc_static 1 rootfs/stress guest/stress.c
 cc_static 2 rootfs/threads guest/threads.c
 cc_static 2 rootfs/stacktest guest/stacktest.c
+cc_static 2 rootfs/sigfdtest guest/sigfdtest.c
 cc_static 2 rootfs/sysbench guest/sysbench.c
 cc_static 1 rootfs/alpine/deepstack guest/deepstack.c
 cc_dynamic rootfs/alpine/threads-dyn guest/threads.c
@@ -85,6 +86,7 @@ expect() { # expect <name> <exit code> <text in output> -- <lx args...>
 expect "hello"            7   "tls=42"                   -- rootfs /hello
 expect "stress (TLS under preemption)" 0 "sum=79999999800000000" -- rootfs /stress
 expect "crash -> SIGSEGV" 139 "guest fault"              -- rootfs /stress crash
+expect "signalfd in epoll, woken by a child's signal" 0 "OK" -- rootfs /sigfdtest
 expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regress.sh
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
 expect "deep stack + fork" 0  "child exit 3"             -- rootfs/alpine /deepstack

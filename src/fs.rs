@@ -49,6 +49,7 @@ pub enum Fd {
     Epoll(Arc<Mutex<Epoll>>),
     /// eventfd: a counter (Go's netpoller and nginx use it to wake their epoll waits).
     Event(Arc<EventFd>),
+    Signal(Arc<crate::signal::SignalFd>),
 }
 
 pub struct EventFd {
@@ -113,6 +114,20 @@ impl EventFd {
 pub fn eventfd(init: u64, flags: u64) -> R {
     const EFD_CLOEXEC: u64 = 0o2000000;
     Ok(add_fd(Fd::Event(Arc::new(EventFd::new(init, flags))), flags & EFD_CLOEXEC != 0))
+}
+
+/// signalfd4(fd, mask, sizemask, flags): fd -1 makes a new one, else changes that one's mask.
+pub fn signalfd(fd: u64, mask: u64, _size: u64, flags: u64) -> R {
+    const SFD_CLOEXEC: u64 = 0o2000000;
+    let mask = unsafe { *(mask as *const u64) } & !((1 << 8) | (1 << 18)); // never SIGKILL, SIGSTOP
+    if fd as i64 != -1 {
+        return with(|fs| match fs.fd(fd)? {
+            Fd::Signal(s) => { s.mask.store(mask, std::sync::atomic::Ordering::Relaxed); Ok(fd as i64) }
+            _ => Err(EINVAL),
+        });
+    }
+    let s = crate::signal::SignalFd { mask: mask.into(), nonblock: (flags & O_NONBLOCK != 0).into() };
+    Ok(add_fd(Fd::Signal(Arc::new(s)), flags & SFD_CLOEXEC != 0))
 }
 
 #[derive(Clone, Copy)]
@@ -653,7 +668,7 @@ pub fn find_exe(cmd: &str, path_var: &str) -> Result<(String, Vec<u8>), i64> {
 
 fn handle_any(fd: &Fd) -> Result<isize, i64> {
     match fd {
-        Fd::Dir { .. } | Fd::Epoll(_) | Fd::Event(_) => Err(EISDIR),
+        Fd::Dir { .. } | Fd::Epoll(_) | Fd::Event(_) | Fd::Signal(_) => Err(EISDIR),
         Fd::Socket(s) => Ok(s.s as isize), // Winsock sockets are kernel handles and inherit like them
         _ => handle(fd),
     }
@@ -692,7 +707,7 @@ pub fn proc_state(fork: bool) -> Vec<String> {
                 // ponytail: epoll instances aren't carried across fork/exec (servers make one per worker).
                 Fd::Epoll(_) => continue,
                 // ponytail: an eventfd shared across fork isn't carried either; each process starts without it.
-                Fd::Event(_) => continue,
+                Fd::Event(_) | Fd::Signal(_) => continue,
             };
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
             n += 1;
@@ -789,7 +804,7 @@ fn handle(fd: &Fd) -> Result<isize, i64> {
         Fd::Pipe(p) => Ok(p.raw()),
         Fd::File { f, .. } => Ok(f.as_raw_handle() as isize),
         Fd::Dir { .. } => Err(EISDIR),
-        Fd::Dev(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) => Err(EINVAL),
+        Fd::Dev(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) | Fd::Signal(_) => Err(EINVAL),
     }
 }
 
@@ -800,6 +815,7 @@ enum Io {
     Dev(Dev),
     Sock(Arc<Sock>),
     Event(Arc<EventFd>),
+    Signal(Arc<crate::signal::SignalFd>),
 }
 
 fn io_target(fd: u64) -> Result<Io, i64> {
@@ -807,6 +823,7 @@ fn io_target(fd: u64) -> Result<Io, i64> {
         Fd::Dev(d) => Ok(Io::Dev(*d)),
         Fd::Socket(s) => Ok(Io::Sock(s.clone())),
         Fd::Event(e) => Ok(Io::Event(e.clone())),
+        Fd::Signal(s) => Ok(Io::Signal(s.clone())),
         Fd::Pipe(p) => Ok(Io::Pipe(p.clone())),
         other => handle(other).map(Io::Handle),
     })
@@ -818,6 +835,7 @@ pub fn read(fd: u64, buf: u64, len: u64) -> R {
         Io::Pipe(p) => p.io(buf, len, false),
         Io::Sock(s) => s.recv(buf, len, 0),
         Io::Event(e) => e.read(buf, len),
+        Io::Signal(s) => s.read(buf, len),
         Io::Dev(Dev::Null) => Ok(0),
         Io::Dev(Dev::Zero) => {
             unsafe { guest_mut(buf, len as usize) }.fill(0);
@@ -834,6 +852,7 @@ pub fn write(fd: u64, buf: u64, len: u64) -> R {
         Io::Sock(s) => s.send(buf, len, 0),
         Io::Dev(_) => Ok(len as i64), // devices swallow writes
         Io::Event(e) => e.write(buf, len),
+        Io::Signal(_) => Err(EINVAL),
     }
 }
 
@@ -878,6 +897,7 @@ pub fn readiness(fd: i32, events: i16) -> i16 {
         Ok(Io::Dev(_)) => events & (POLLIN | POLLOUT),
         Ok(Io::Sock(s)) => s.ready(events),
         Ok(Io::Event(e)) => e.ready(events),
+        Ok(Io::Signal(s)) => s.ready(events),
         Ok(Io::Pipe(p)) => p.ready(events),
         Ok(Io::Handle(h)) => match unsafe { crate::win::GetFileType(h) } {
             3 => {
@@ -1463,6 +1483,7 @@ fn dup_fd(fd: &Fd) -> Result<Fd, i64> {
         Fd::Socket(s) => Fd::Socket(s.clone()),
         Fd::Epoll(e) => Fd::Epoll(e.clone()),
         Fd::Event(e) => Fd::Event(e.clone()),
+        Fd::Signal(s) => Fd::Signal(s.clone()),
     })
 }
 
@@ -1507,6 +1528,7 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         4 => with(|fs| match fs.fd(fd)? {
             Fd::Socket(s) => { s.set_nonblocking(arg & O_NONBLOCK != 0); Ok(0) }
             Fd::Event(e) => { e.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
+            Fd::Signal(s) => { s.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
             Fd::Pipe(p) => { p.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
             _ => Ok(0),
         }),
@@ -1532,7 +1554,7 @@ pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
         }
         Fd::Dir { pos, .. } if off == 0 && whence == 0 => { *pos = 0; Ok(0) }
         Fd::Dir { .. } => Err(EINVAL),
-        Fd::Handle(_) | Fd::Pipe(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) => Err(ESPIPE),
+        Fd::Handle(_) | Fd::Pipe(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) | Fd::Signal(_) => Err(ESPIPE),
         Fd::Dev(_) => Ok(0),
     })
 }
@@ -1708,7 +1730,7 @@ pub fn fstat(fd: u64, buf: u64) -> R {
             (s[1], s[2], s[3], s[7]) = (k.s as u64, 1, 0o140777, 4096); // S_IFSOCK
             Ok(s)
         }
-        Fd::Epoll(_) | Fd::Event(_) => {
+        Fd::Epoll(_) | Fd::Event(_) | Fd::Signal(_) => {
             let mut s = [0u64; 18];
             (s[2], s[3], s[7]) = (1, 0o600, 4096); // anon inode
             Ok(s)
@@ -1833,6 +1855,7 @@ fn proc_link(guest: &str) -> Option<String> {
                 Fd::Socket(k) => Some(format!("socket:[{}]", k.s)),
                 Fd::Epoll(_) => Some("anon_inode:[eventpoll]".into()),
                 Fd::Event(_) => Some("anon_inode:[eventfd]".into()),
+                Fd::Signal(_) => Some("anon_inode:[signalfd]".into()),
             })
         }
     }

@@ -975,6 +975,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         324 => thread::membarrier(a[0]),
         284 => fs::eventfd(a[0], 0),
         290 => fs::eventfd(a[0], a[1]),
+        282 => fs::signalfd(a[0], a[1], a[2], 0),
+        289 => fs::signalfd(a[0], a[1], a[2], a[3]),
         218 => { ts().clear_tid = a[0]; thread::gettid() } // set_tid_address
         230 => clock_nanosleep(a[0], a[1], a[2]),
         228 => clock_gettime(a[0], a[1]),
