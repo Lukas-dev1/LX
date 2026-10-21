@@ -1485,7 +1485,18 @@ fn put_stat(buf: u64, s: [u64; 18]) -> R {
 
 pub fn fstat(fd: u64, buf: u64) -> R {
     let s = with(|fs| match fs.fd(fd)? {
-        Fd::File { host, .. } => stat_of(host),
+        // From the open handle, not the path: the file may have been renamed or deleted since (apt does
+        // both to its temp files), and Linux's fstat still answers.
+        Fd::File { f, host } => {
+            let m = f.metadata().map_err(errno)?;
+            let t = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).unwrap_or_default();
+            let mut s = [0u64; 18];
+            (s[0], s[1], s[2], s[3], s[6], s[7], s[8]) = (0x803, ino(host), 1, 0o100755, m.len(), 4096, m.len().div_ceil(512));
+            for i in [9, 11, 13] {
+                (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
+            }
+            Ok(s)
+        }
         Fd::Dir { guest, .. } => {
             let guest = guest.clone();
             stat_of(&fs.resolve("/", &guest, true)?.1)
