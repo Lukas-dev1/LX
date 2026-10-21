@@ -213,7 +213,12 @@ impl Pipe {
             0 | 995 => Ok(done as i64),
             ERROR_BROKEN_PIPE if !write => Ok(0), // EOF
             ERROR_BROKEN_PIPE | ERROR_NO_DATA => Err(crate::syscall::EPIPE),
-            _ => Err(EIO),
+            e => {
+                if crate::syscall::debug() {
+                    crate::syscall::dlog(format_args!("pipe {} on handle {:#x} failed: Windows error {e}", if write { "write" } else { "read" }, self.raw()));
+                }
+                Err(EIO)
+            }
         }
     }
 
