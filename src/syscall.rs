@@ -816,6 +816,8 @@ fn dispatch(c: &mut Context) -> i64 {
         14 => signal::sigprocmask(a[0], a[1], a[2]),
         131 => signal::sigaltstack(a[0], a[1], c.rsp),
         7 => fs::poll(a[0], a[1], a[2] as i32 as i64),
+        23 => fs::select(a[0], a[1], a[2], a[3], timeval_ms(a[4])),   // ponytail: the timeout isn't updated
+        270 => fs::select(a[0], a[1], a[2], a[3], timespec_ms(a[4])), // pselect6: signal mask ignored
         271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
         34 => signal::sigsuspend(0),   // pause
         130 => signal::sigsuspend(a[0]),
@@ -1439,6 +1441,15 @@ fn clock_nanosleep(clock: u64, flags: u64, req: u64) -> R {
     };
     std::thread::sleep(wait);
     Ok(0)
+}
+
+/// A `struct timeval *` timeout in ms; NULL means wait forever (-1).
+fn timeval_ms(tv: u64) -> i64 {
+    if tv == 0 {
+        return -1;
+    }
+    let [s, us] = unsafe { *(tv as *const [i64; 2]) };
+    s.saturating_mul(1000).saturating_add(us / 1000)
 }
 
 /// A `struct timespec *` timeout in ms; NULL means wait forever (-1).
