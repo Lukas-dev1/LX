@@ -99,10 +99,10 @@ The translation layer is **not** a security boundary. Guest code runs natively i
 ## 8. Milestones
 
 1. ✅ Static musl hello world: ELF load, TLS, stdio, exit code. Thread-local storage holds up under preemption.
-2. `mmap`/`brk`/`openat`/`stat`/`getdents`: `busybox` (static) runs `ls`, `cat`, and `sh -c`.
-3. Lazy translation and `PT_INTERP`: dynamically linked Alpine binaries.
+2. ✅ Unmodified **official Alpine image** binaries: `PT_INTERP` (ld-musl), file-backed `mmap` with syscall patching of libraries loaded at runtime, ~50 syscalls (files, dirs, symlinks, stat, cwd). `ls -la`, `cat`, `grep`, `awk`, `sed`, `find`, `uname`, `sh` builtins, and `apk --version` (libcrypto, libz) all work.
+3. Lazy translation (replaces linear sweep and the exception round trip).
 4. Threads and `futex`: static Go binaries (`hello`, then `net/http` once epoll exists).
-5. `vfork`/`execve`/`wait4`/`pipe2`: `/bin/sh` scripts, i.e. most `ENTRYPOINT`s.
+5. **Next:** `fork`/`vfork`/`execve`/`wait4`/`pipe2`: `/bin/sh` scripts, i.e. most `ENTRYPOINT`s. This is the current wall: `sh -c 'a | b'` and `$(...)` fail with ENOSYS.
 6. AFD epoll and Winsock: an Alpine nginx or node image serves HTTP.
 7. OCI pull/unpack and a `docker run`-shaped CLI.
 
@@ -113,6 +113,8 @@ The translation layer is **not** a security boundary. Guest code runs natively i
 W=$(cygpath -m $PWD); export RUSTUP_HOME=$W/tools/rust/rustup CARGO_HOME=$W/tools/rust/cargo MSYS_NO_PATHCONV=1
 tools/rust/cargo/bin/cargo build --release
 tools/zig-x86_64-windows-0.15.2/zig.exe cc -target x86_64-linux-musl -static -O2 -o rootfs/hello guest/hello.c
+target/release/lx.exe unpack alpine-minirootfs-x86_64.tar.gz rootfs/alpine   # an image layer
+target/release/lx.exe rootfs/alpine ls -la /                               # PATH lookup inside the image
 target/release/lx.exe rootfs /hello        # → "hello from linux ... tls=42", exit 7
 target/release/lx.exe rootfs /stress       # TLS under preemption; with "crash" arg → exit 139
 ```

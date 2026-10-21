@@ -12,11 +12,11 @@ pub struct Image {
     pub entry: u64,
     pub phdr: u64,
     pub phnum: u64,
-    /// Guest address range, used to tell guest faults from our own.
-    pub lo: u64,
-    pub hi: u64,
-    /// Addresses of `syscall` instructions rewritten to `ud2` (sorted).
-    pub syscall_sites: Vec<u64>,
+    /// Load address of the lowest segment (AT_BASE when this is the interpreter).
+    pub base: u64,
+    /// PT_INTERP: the dynamic linker to load alongside, e.g. /lib/ld-musl-x86_64.so.1.
+    pub interp: Option<String>,
+    pub syscall_sites: usize,
 }
 
 fn rd<const N: usize>(f: &[u8], off: u64) -> Result<[u8; N], String> {
@@ -43,10 +43,15 @@ pub fn load(f: &[u8]) -> Result<Image, String> {
 
     let mut segs = Vec::new();
     let mut phdr_vaddr = None;
+    let mut interp = None;
     for i in 0..phnum {
         let p = phoff + i * 56;
         match u32_(f, p)? {
-            PT_INTERP => return Err("dynamically linked (PT_INTERP); only static binaries for now".into()),
+            PT_INTERP => {
+                let (off, len) = (u64_(f, p + 8)? as usize, u64_(f, p + 0x20)? as usize);
+                let s = f.get(off..off.saturating_add(len)).ok_or("bad PT_INTERP")?;
+                interp = Some(String::from_utf8_lossy(s).trim_end_matches('\0').to_string());
+            }
             PT_PHDR => phdr_vaddr = Some(u64_(f, p + 0x10)?),
             PT_LOAD => {
                 let s = Seg { flags: u32_(f, p + 4)?, off: u64_(f, p + 8)?, vaddr: u64_(f, p + 0x10)?,
@@ -72,22 +77,12 @@ pub fn load(f: &[u8]) -> Result<Image, String> {
     }
     let bias = base - lo;
 
-    let mut sites = Vec::new();
+    let mut sites = 0;
     for s in &segs {
         let dst = (s.vaddr + bias) as *mut u8;
         unsafe { ptr::copy_nonoverlapping(f.as_ptr().add(s.off as usize), dst, s.filesz as usize) };
         if s.flags & 1 != 0 {
-            let ip = s.vaddr + bias;
-            let code = &f[s.off as usize..(s.off + s.filesz) as usize];
-            let found = find_syscalls(code, ip);
-            let raw = code.windows(2).filter(|w| w == b"\x0f\x05").count();
-            if raw != found.len() {
-                eprintln!("[lx] {:#x}: {} of {raw} 0F05 byte pairs are not instructions, left alone", ip, raw - found.len());
-            }
-            for &a in &found {
-                unsafe { *((a + 1) as *mut u8) = 0x0b }; // syscall (0F 05) -> ud2 (0F 0B)
-            }
-            sites.extend(found);
+            sites += crate::syscall::patch_code(s.vaddr + bias, s.filesz as usize);
         }
     }
     for s in &segs {
@@ -110,31 +105,11 @@ pub fn load(f: &[u8]) -> Result<Image, String> {
     let phdr = phdr_vaddr
         .or_else(|| segs.iter().find(|s| phoff >= s.off && phoff < s.off + s.filesz).map(|s| s.vaddr + phoff - s.off))
         .ok_or("program headers not mapped")?;
-    sites.sort_unstable();
-    Ok(Image { entry: entry + bias, phdr: phdr + bias, phnum, lo: base, hi: hi + bias, syscall_sites: sites })
-}
-
-/// Addresses of real `syscall` instructions, by linear-sweep decoding.
-/// ponytail: linear sweep can desync on data embedded in .text (rare in compiler output, which is why the
-/// raw-byte count above is logged). Upgrade path: decode lazily along control flow (DESIGN.md §3).
-fn find_syscalls(code: &[u8], ip: u64) -> Vec<u64> {
-    use iced_x86::{Decoder, DecoderOptions, Mnemonic};
-    Decoder::with_ip(64, code, ip, DecoderOptions::NONE)
-        .into_iter()
-        .filter(|i| i.mnemonic() == Mnemonic::Syscall)
-        .map(|i| i.ip())
-        .collect()
-}
-
-#[test]
-fn syscall_inside_immediate_is_not_patched() {
-    // imul eax,eax,0xfd050f80 (contains 0F 05) ; syscall ; ret
-    let code = [0x69, 0xc0, 0x80, 0x0f, 0x05, 0xfd, 0x0f, 0x05, 0xc3];
-    assert_eq!(find_syscalls(&code, 0x1000), vec![0x1006]);
+    Ok(Image { entry: entry + bias, phdr: phdr + bias, phnum, base, interp, syscall_sites: sites })
 }
 
 /// Initial process stack per the SysV x86-64 ABI: argc, argv[], 0, envp[], 0, auxv[], AT_NULL.
-pub fn build_stack(img: &Image, argv: &[&str], envp: &[&str]) -> Result<u64, String> {
+pub fn build_stack(img: &Image, interp_base: u64, argv: &[&str], envp: &[&str]) -> Result<u64, String> {
     const SIZE: usize = 8 << 20;
     let base = unsafe { VirtualAlloc(ptr::null_mut(), SIZE, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
     if base == 0 { return Err("stack allocation failed".into()); }
@@ -162,7 +137,7 @@ pub fn build_stack(img: &Image, argv: &[&str], envp: &[&str]) -> Result<u64, Str
     #[rustfmt::skip]
     w.extend([
         3, img.phdr, 4, 56, 5, img.phnum, 6, PAGE,       // AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ
-        7, 0, 8, 0, 9, img.entry,                        // AT_BASE, AT_FLAGS, AT_ENTRY
+        7, interp_base, 8, 0, 9, img.entry,              // AT_BASE, AT_FLAGS, AT_ENTRY
         11, 0, 12, 0, 13, 0, 14, 0,                      // AT_UID, AT_EUID, AT_GID, AT_EGID
         15, platform, 16, 0, 17, 100, 23, 0,             // AT_PLATFORM, AT_HWCAP, AT_CLKTCK, AT_SECURE
         25, at_random, 31, execfn, 0, 0,                 // AT_RANDOM, AT_EXECFN, AT_NULL

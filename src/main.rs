@@ -1,15 +1,32 @@
 //! lx: run a static x86-64 Linux ELF natively on NT. See DESIGN.md.
 mod elf;
+mod fs;
 mod syscall;
 
 use std::ffi::c_void;
-use std::{env, fs, path::Path, process};
+use std::{env, path::Path, process};
 
 // ponytail: hand-declared Win32 surface instead of windows-sys; switch when it outgrows one screen.
 pub mod win {
     use std::ffi::c_void;
+    pub const MEM_COMMIT: u32 = 0x1000;
     pub const MEM_COMMIT_RESERVE: u32 = 0x3000;
+    pub const MEM_DECOMMIT: u32 = 0x4000;
     pub const PAGE_READWRITE: u32 = 0x04;
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct MemoryBasicInformation {
+        pub base: usize,
+        pub allocation_base: usize,
+        pub allocation_protect: u32,
+        pub partition_id: u16,
+        pub region_size: usize,
+        pub state: u32,
+        pub protect: u32,
+        pub ty: u32,
+    }
+    const _: () = assert!(size_of::<MemoryBasicInformation>() == 48);
 
     #[repr(C)]
     pub struct ExceptionRecord {
@@ -48,6 +65,8 @@ pub mod win {
     unsafe extern "system" {
         pub fn VirtualAlloc(addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void;
         pub fn VirtualProtect(addr: *mut c_void, size: usize, prot: u32, old: *mut u32) -> i32;
+        pub fn VirtualQuery(addr: *const c_void, info: *mut MemoryBasicInformation, len: usize) -> usize;
+        pub fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
         pub fn AddVectoredExceptionHandler(
             first: u32,
             h: unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
@@ -105,31 +124,43 @@ fn enter_job() -> Result<(), String> {
     }
 }
 
+const USAGE: &str = "usage: lx <rootfs-dir> <command> [args...]\n       lx unpack <layer.tar.gz> <rootfs-dir>";
+const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let [rootfs, guest, ..] = args.as_slice() else {
-        return Err("usage: lx <rootfs-dir> </path/in/rootfs> [args...]".into());
-    };
-    let root = fs::canonicalize(rootfs).map_err(|e| format!("{rootfs}: {e}"))?;
-    let host = fs::canonicalize(root.join(guest.trim_start_matches('/')))
-        .map_err(|e| format!("{guest}: {e}"))?;
-    if !host.starts_with(&root) {
-        return Err(format!("{guest} escapes the rootfs"));
+    if let [cmd, tgz, dest] = args.as_slice() && cmd == "unpack" {
+        let (n, skipped) = fs::unpack(Path::new(tgz), Path::new(dest))?;
+        eprintln!("[lx] unpacked {n} entries ({skipped} skipped) into {dest}");
+        return Ok(());
     }
-    let image = fs::read(&host).map_err(|e| format!("{}: {e}", host.display()))?;
+    let [rootfs, cmd, rest @ ..] = args.as_slice() else { return Err(USAGE.into()) };
+    let root = std::fs::canonicalize(rootfs).map_err(|e| format!("{rootfs}: {e}"))?;
+    fs::init(root);
+    let (exe, image) = fs::find_exe(cmd, PATH)?;
 
     enter_job()?;
+    syscall::install();
     let img = elf::load(&image)?;
-    syscall::install(&img);
-    let argv: Vec<&str> = std::iter::once(guest.as_str()).chain(args[2..].iter().map(|s| s.as_str())).collect();
-    let sp = elf::build_stack(&img, &argv, &["PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/"])?;
-    let name = Path::new(guest).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    eprintln!("[lx] {name}: entry {:#x}, {} syscall sites patched", img.entry, img.syscall_sites.len());
+    // Dynamically linked: the kernel's job is to map ld.so too and start there; ld.so maps the rest via mmap.
+    let (entry, interp_base) = match &img.interp {
+        Some(ld) => {
+            let ld = elf::load(&fs::find_exe(ld, "/")?.1)?;
+            (ld.entry, ld.base)
+        }
+        None => (img.entry, 0),
+    };
+    // argv[0] is what the user typed (busybox picks its applet from it); the image may live elsewhere.
+    let argv: Vec<&str> = std::iter::once(cmd.as_str()).chain(rest.iter().map(|s| s.as_str())).collect();
+    let path_env = format!("PATH={PATH}");
+    let sp = elf::build_stack(&img, interp_base, &argv, &[&path_env, "HOME=/root", "HOSTNAME=lx"])?;
+    eprintln!("[lx] {exe}: {} syscall sites patched{}", img.syscall_sites,
+        img.interp.as_deref().map(|i| format!(", interpreter {i}")).unwrap_or_default());
 
     // Linux _start ABI: rsp -> argc, rdx = atexit fn (none). Never returns: exit_group ends the process.
     unsafe {
         std::arch::asm!("mov rsp, {sp}", "jmp {entry}",
-            sp = in(reg) sp, entry = in(reg) img.entry, in("rdx") 0u64, options(noreturn))
+            sp = in(reg) sp, entry = in(reg) entry, in("rdx") 0u64, options(noreturn))
     }
 }
 

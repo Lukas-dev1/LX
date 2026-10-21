@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info"] }
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
