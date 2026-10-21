@@ -478,6 +478,9 @@ pub fn exit(code: u64) -> ! {
     if debug() {
         eprintln!("[lx] pid {} exit {}", unsafe { GetCurrentProcessId() }, code as u8);
     }
+    // Close the guest's fds first: TerminateProcess drops sockets abortively, and a peer of an AF_UNIX
+    // pair then reads ECONNRESET where Linux gives EOF (erts and its erl_child_setup).
+    fs::close_all();
     unsafe {
         TerminateProcess(GetCurrentProcess(), code as u32 & 0xff);
     }
