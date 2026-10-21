@@ -80,7 +80,13 @@ pub fn load(f: &[u8]) -> Result<Image, String> {
         let dst = (s.vaddr + bias) as *mut u8;
         unsafe { ptr::copy_nonoverlapping(f.as_ptr().add(s.off as usize), dst, s.filesz as usize) };
         if s.flags & 1 != 0 {
-            sites += crate::syscall::patch_code(s.vaddr + bias, s.filesz as usize);
+            let mut read = |off: u64, buf: &mut [u8]| {
+                let o = off as usize;
+                f.get(o..o.saturating_add(buf.len())).map(|src| buf.copy_from_slice(src)).is_some()
+            };
+            for (off, len) in exec_ranges(&mut read, s.off, s.filesz).unwrap_or(vec![(s.off, s.filesz)]) {
+                sites += crate::syscall::patch_code(s.vaddr + bias + (off - s.off), len as usize);
+            }
         }
     }
     for s in &segs {
@@ -107,6 +113,43 @@ pub fn load(f: &[u8]) -> Result<Image, String> {
 }
 
 /// Initial process stack per the SysV x86-64 ABI: argc, argv[], 0, envp[], 0, auxv[], AT_NULL.
+/// File ranges of the executable sections (SHF_EXECINSTR) inside the file range [seg, seg+n): what
+/// syscall patching may touch. An "R E" segment can also hold the ELF header, the symbol and string tables
+/// and read-only data (older linkers, e.g. manylinux wheels' libgfortran), and decoding those as code
+/// "finds" syscall and %fs: patterns whose patching corrupts the symbol data. None when the file has no
+/// section headers: then the whole segment is treated as code, as before.
+pub fn exec_ranges(read: &mut dyn FnMut(u64, &mut [u8]) -> bool, seg: u64, n: u64) -> Option<Vec<(u64, u64)>> {
+    let mut eh = [0u8; 64];
+    if !read(0, &mut eh) || &eh[..4] != b"\x7fELF" || eh[4] != 2 {
+        return None;
+    }
+    let shoff = u64::from_le_bytes(eh[0x28..0x30].try_into().unwrap());
+    let (entsize, num) = (u16::from_le_bytes([eh[0x3a], eh[0x3b]]) as usize, u16::from_le_bytes([eh[0x3c], eh[0x3d]]) as usize);
+    if shoff == 0 || num == 0 || num > 0xff00 || entsize != 64 {
+        return None;
+    }
+    let mut sh = vec![0u8; num * 64];
+    if !read(shoff, &mut sh) {
+        return None;
+    }
+    const SHT_NOBITS: u32 = 8;
+    const SHF_EXECINSTR: u64 = 4;
+    let mut out = Vec::new();
+    for h in sh.chunks(64) {
+        let ty = u32::from_le_bytes(h[4..8].try_into().unwrap());
+        let flags = u64::from_le_bytes(h[8..16].try_into().unwrap());
+        let (off, size) = (u64::from_le_bytes(h[0x18..0x20].try_into().unwrap()), u64::from_le_bytes(h[0x20..0x28].try_into().unwrap()));
+        if ty == SHT_NOBITS || flags & SHF_EXECINSTR == 0 {
+            continue;
+        }
+        let (a, b) = (off.max(seg), off.saturating_add(size).min(seg + n));
+        if a < b {
+            out.push((a, b - a));
+        }
+    }
+    Some(out)
+}
+
 /// Returns (initial rsp, stack low, stack high).
 pub fn build_stack(img: &Image, interp_base: u64, argv: &[&str], envp: &[&str]) -> Result<(u64, u64, u64), String> {
     const SIZE: usize = 8 << 20;

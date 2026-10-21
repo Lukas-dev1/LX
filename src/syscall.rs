@@ -16,6 +16,7 @@ pub const EPERM: i64 = 1;
 pub const ESRCH: i64 = 3;
 pub const EINTR: i64 = 4;
 pub const ENXIO: i64 = 6;
+pub const ENODEV: i64 = 19;
 pub const EIO: i64 = 5;
 pub const E2BIG: i64 = 7;
 pub const ENOEXEC: i64 = 8;
@@ -39,6 +40,7 @@ pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
 pub const ENOENT: i64 = 2;
+pub const EROFS: i64 = 30;
 pub const ENOTSOCK: i64 = 88;
 pub const ENOPROTOOPT: i64 = 92;
 pub const EAFNOSUPPORT: i64 = 97;
@@ -334,28 +336,13 @@ static ALLOCS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 const WINDOW: (u64, u64) = (0x2000_0000_0000, 0x6000_0000_0000);
 static NEXT: AtomicU64 = AtomicU64::new(WINDOW.0);
 
-/// The guest stack, grown on demand like a Win32 thread stack: reserve `len`, commit the top
-/// 256K, and put a guard page under it. With the TEB bounds set (`enter`), NT itself commits further
-/// pages as the stack grows, so a process doesn't pay for 8 MB it never touches.
+/// The main guest stack, committed whole. Linux grows a main stack for any access within RLIMIT_STACK,
+/// so binaries built without stack probes make frames of hundreds of KB that jump straight past a guard
+/// page (numpy's OpenBLAS does); NT only grows a stack page by page through its guard page, and a fault
+/// with no committed memory under rsp can't even be dispatched. Committing costs commit charge only:
+/// untouched pages never enter the working set, so this uses no RAM until the program touches it.
 pub fn alloc_stack(len: u64) -> Option<u64> {
-    const COMMIT: u64 = 256 << 10;
-    let len = len.next_multiple_of(0x10000);
-    let base = loop {
-        let a = NEXT.fetch_add(len, Relaxed);
-        if a + len > WINDOW.1 {
-            return None;
-        }
-        if unsafe { VirtualAlloc(a as *mut _, len as usize, MEM_RESERVE, PAGE_READWRITE) } as u64 == a {
-            break a;
-        }
-    };
-    let top = base + len - COMMIT;
-    unsafe {
-        VirtualAlloc(top as *mut _, COMMIT as usize, MEM_COMMIT, PAGE_READWRITE);
-        VirtualAlloc((top - PAGE) as *mut _, PAGE as usize, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
-    }
-    ALLOCS.lock().unwrap().push((base, len));
-    Some(base)
+    alloc(None, len)
 }
 
 /// Reserve+commit RW guest memory, at `fixed` or anywhere in the guest window.
@@ -406,6 +393,7 @@ pub fn release_guest_memory() {
         false
     });
     CODE.lock().unwrap().regions.clear(); // nothing of the old program runs any more
+    unmap_views(0, u64::MAX);
     crate::jump::clear();
 }
 
@@ -441,6 +429,7 @@ pub fn snapshot() -> Vec<String> {
     // Only the forking thread survives a fork, as on Linux: its FS base and stack come along.
     let t = ts();
     v.extend([NEXT.load(Relaxed), t.fs, t.stack.0, t.stack.1]);
+    v.extend(views_snapshot());
     v.into_iter().map(|n| n.to_string()).collect()
 }
 
@@ -482,6 +471,16 @@ pub fn restore<'a>(f: &'a [String], parent: isize) -> Result<((u64, u64), &'a [S
     NEXT.store(next()?, Relaxed);
     ts().fs = next()?;
     let stack = (next()?, next()?);
+    // Shared views: the same sections (inherited at the same handle values), at the same addresses.
+    for _ in 0..next()? {
+        let (base, len, section, off, access) = (next()?, next()?, next()? as isize, next()?, next()? as u32);
+        let got = unsafe { MapViewOfFileEx(section, access, (off >> 32) as u32, off as u32, len as usize, base as *mut _) } as u64;
+        if got != base {
+            return Err(format!("shared mapping {base:#x}+{len:#x} can't be placed in the child ({})", unsafe { GetLastError() }));
+        }
+        unsafe { SetHandleInformation(section, 1, 0) };
+        VIEWS.lock().unwrap().push(View { base, len, section, off, access });
+    }
     let used = f.len() - it.len();
     Ok((stack, &f[used..]))
 }
@@ -503,6 +502,12 @@ pub fn dlog(msg: std::fmt::Arguments) {
 pub fn siglog() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LX_SIGLOG").is_some() || debug())
+}
+
+/// LX_STRACE=1: log every syscall with its arguments and result (see dispatch).
+pub fn strace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LX_STRACE").is_some())
 }
 
 /// Verbose [lx] diagnostics, enabled by setting LX_DEBUG in the host environment.
@@ -789,9 +794,23 @@ fn guest_crash(rec: &ExceptionRecord, c: &Context) -> ! {
 }
 
 /// The dispatch table. Linux ABI: nr in rax, args rdi rsi rdx r10 r8 r9, result (or -errno) in rax.
+/// The syscall the guest is in right now (nr + 1, 0 = none) and its first three arguments, for
+/// LX_SIGLOG: when a signal arrives, it shows what the guest was doing. ponytail: the last thread to
+/// enter wins; per-thread slots if multithreaded hangs need it.
+pub static IN_SYSCALL: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
 fn dispatch(c: &mut Context) -> i64 {
-    use fs::{AT_FDCWD as CWD, AT_SYMLINK_NOFOLLOW};
     let a = [c.rdi, c.rsi, c.rdx, c.r10, c.r8, c.r9];
+    for (slot, v) in IN_SYSCALL.iter().zip([c.rax + 1, a[0], a[1], a[2]]) {
+        slot.store(v, Relaxed);
+    }
+    let r = dispatch_nr(c, a);
+    IN_SYSCALL[0].store(0, Relaxed);
+    r
+}
+
+fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
+    use fs::{AT_FDCWD as CWD, AT_SYMLINK_NOFOLLOW};
     let r = match c.rax {
         0 => fs::read(a[0], a[1], a[2]),
         1 => fs::write(a[0], a[1], a[2]),
@@ -805,11 +824,14 @@ fn dispatch(c: &mut Context) -> i64 {
         10 => mprotect(a[0], a[1], a[2]),
         11 => munmap(a[0], a[1], c.rsp),
         25 => mremap(a[0], a[1], a[2], a[3]),
+        26 => msync(a[0], a[1]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
         131 => signal::sigaltstack(a[0], a[1], c.rsp),
         7 => fs::poll(a[0], a[1], a[2] as i32 as i64),
+        23 => fs::select(a[0], a[1], a[2], a[3], timeval_ms(a[4])),   // ponytail: the timeout isn't updated
+        270 => fs::select(a[0], a[1], a[2], a[3], timespec_ms(a[4])), // pselect6: signal mask ignored
         271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
         34 => signal::sigsuspend(0),   // pause
         130 => signal::sigsuspend(a[0]),
@@ -859,6 +881,7 @@ fn dispatch(c: &mut Context) -> i64 {
         24 => thread::sched_yield(),
         40 => fs::sendfile(a[0], a[1], a[2], a[3]),
         56 => proc::clone(c, a[0], a[1], a[2], a[3], a[4]),
+        435 => proc::clone3(c, a[0], a[1]),
         57 | 58 => proc::fork(c, 0),   // fork, vfork
         59 => proc::execve(a[0], a[1], a[2]),
         60 => thread::exit(a[0]),      // exit: this thread (the process when it's the last one)
@@ -867,6 +890,9 @@ fn dispatch(c: &mut Context) -> i64 {
         62 => proc::kill(a[0] as i32 as i64, a[1]),
         63 => uname(a[0]),
         72 => fs::fcntl(a[0], a[1], a[2]),
+        73 => fs::flock(a[0], a[1]),
+        74 | 75 => fs::fsync(a[0]),    // fsync, fdatasync
+        162 | 306 => Ok(0),            // sync, syncfs: NT writes back on its own; fsync covers durability
         79 => fs::getcwd(a[0], a[1]),
         80 => fs::chdir(a[0]),
         81 => fs::fchdir(a[0]),
@@ -903,6 +929,20 @@ fn dispatch(c: &mut Context) -> i64 {
         218 => { ts().clear_tid = a[0]; thread::gettid() } // set_tid_address
         230 => clock_nanosleep(a[0], a[1], a[2]),
         228 => clock_gettime(a[0], a[1]),
+        229 => clock_getres(a[1]),
+        201 => time(a[0]),
+        221 => Ok(0),                  // fadvise64: advice only
+        237 | 238 => Ok(0),            // mbind, set_mempolicy: NUMA placement has no meaning here; accept it
+        239 => Err(ENOSYS),            // get_mempolicy: callers treat this as "no NUMA" 
+        188..=199 => Err(95),          // *xattr: EOPNOTSUPP, like a filesystem without extended attributes
+        436 => fs::close_range(a[0], a[1], a[2]),
+        86 => fs::linkat(CWD, a[0], CWD, a[1], 0),
+        265 => fs::linkat(a[0], a[1], a[2], a[3], a[4]),
+        280 => fs::utimensat(a[0], a[1], a[2], a[3]),
+        137 => fs::statfs(Some(a[0]), None, a[1]),
+        138 => fs::statfs(None, Some(a[0]), a[1]),
+        299 => net::sys_mmsg(a[0], a[1], a[2], a[3], false), // recvmmsg
+        307 => net::sys_mmsg(a[0], a[1], a[2], a[3], true),  // sendmmsg
         257 => fs::openat(a[0], a[1], a[2]),
         258 => fs::mkdirat(a[0], a[1]),
         262 => fs::fstatat(a[0], a[1], a[2], a[3]),
@@ -930,7 +970,11 @@ fn dispatch(c: &mut Context) -> i64 {
             Err(ENOSYS)
         }
     };
-    if let Err(e) = r && debug() {
+    if strace() {
+        // Every syscall, like strace: pid, number, first four arguments, result.
+        let res = match r { Ok(v) => format!("{v:#x}"), Err(e) => format!("-{e}") };
+        dlog(format_args!("pid {} syscall {} ({:#x}, {:#x}, {:#x}, {:#x}) = {res}", unsafe { GetCurrentProcessId() }, c.rax, a[0], a[1], a[2], a[3]));
+    } else if let Err(e) = r && debug() {
         eprintln!("[lx] syscall {} ({:#x}, {:#x}, {:#x}, {:#x}) -> -{e}", c.rax, a[0], a[1], a[2], a[3]);
     }
     r.unwrap_or_else(|e| -e)
@@ -1033,6 +1077,7 @@ fn decommit(addr: u64, len: u64) -> bool {
 }
 
 fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
+    const MAP_SHARED: u64 = 0x01;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
     if len == 0 || addr % PAGE != 0 || off % PAGE != 0 {
@@ -1040,6 +1085,9 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     }
     let len = len.next_multiple_of(PAGE);
     let reserve_only = prot == 0 && flags & MAP_ANONYMOUS != 0; // PROT_NONE: address space, no memory
+    if flags & MAP_SHARED != 0 && !reserve_only {
+        return mmap_shared(addr, len, prot, flags & MAP_FIXED != 0, (flags & MAP_ANONYMOUS == 0).then_some(fd), off);
+    }
     let p = if flags & MAP_FIXED != 0 {
         // Inside our reservations (ld.so carving up a library span, Go committing arena chunks): replace the
         // contents with fresh zero pages; elsewhere, a new reservation at exactly that address.
@@ -1064,10 +1112,167 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
         fs::read_at(fd, unsafe { guest_mut(p, len as usize) }, off)?;
     }
     if prot & 4 != 0 {
-        patch_code(p, len as usize);
+        // A file mapping: patch only its executable sections (see elf::exec_ranges); anonymous: all of it.
+        let ranges = (flags & MAP_ANONYMOUS == 0)
+            .then(|| {
+                let mut read = |o: u64, buf: &mut [u8]| fs::read_at(fd, buf, o).is_ok_and(|n| n as usize == buf.len());
+                crate::elf::exec_ranges(&mut read, off, len)
+            })
+            .flatten()
+            .unwrap_or(vec![(off, len)]);
+        for (o, n) in ranges {
+            patch_code(p + (o - off), n as usize);
+        }
     }
     protect(p, len, page_prot(prot));
     Ok(p as i64)
+}
+
+// ---- MAP_SHARED: views of NT sections ----
+//
+// A shared mapping is a view of a section: pagefile-backed for anonymous memory, the file's own for a
+// file. Every process mapping it (forked children included) sees the same pages, and writes reach the
+// file. Views aren't in ALLOCS, so fork doesn't copy them: the child maps the same section at the same
+// address instead (`snapshot` / `restore`). Views must start on NT's 64K granularity, so an offset that
+// isn't 64K-aligned maps from the aligned offset below it and returns a pointer into the view.
+// ponytail: munmap of part of a view unmaps all of it; mremap of a view makes a private copy.
+
+struct View {
+    base: u64,
+    len: u64,
+    section: isize,
+    off: u64,
+    access: u32,
+}
+static VIEWS: Mutex<Vec<View>> = Mutex::new(Vec::new());
+
+const FILE_MAP_WRITE: u32 = 0x2;
+const FILE_MAP_READ: u32 = 0x4;
+const FILE_MAP_EXECUTE: u32 = 0x20;
+
+fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, off: u64) -> R {
+    let write = prot & 2 != 0;
+    let delta = off % 0x10000;
+    let aoff = off - delta;
+    let mut vlen = delta + len;
+    let section = match file {
+        None => unsafe { CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null()) },
+        Some(fd) => {
+            let (h, size) = fs::file_handle(fd)?;
+            if size <= aoff {
+                return Err(ENXIO); // ponytail: mapping wholly past the end of the file (Linux: SIGBUS on touch)
+            }
+            // NT views can't reach past the file's end (it maps the last partial page whole anyway).
+            vlen = vlen.min(size - aoff);
+            let exec = prot & 4 != 0;
+            let rw = if exec { 0x40 } else { PAGE_READWRITE }; // PAGE_EXECUTE_READWRITE
+            let mut s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), rw, 0, 0, std::ptr::null()) };
+            if s == 0 && !write {
+                // A file opened read-only can still be mapped for reading.
+                s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), if exec { 0x20 } else { 0x02 }, 0, 0, std::ptr::null()) };
+            }
+            if s == 0 {
+                return Err(EACCES);
+            }
+            s
+        }
+    };
+    if section == 0 {
+        return Err(ENOMEM);
+    }
+    let access = if write { FILE_MAP_WRITE } else { FILE_MAP_READ } | if prot & 4 != 0 { FILE_MAP_EXECUTE } else { 0 };
+    let view_at = |base: u64| unsafe { MapViewOfFileEx(section, access, (aoff >> 32) as u32, aoff as u32, vlen as usize, base as *mut _) } as u64;
+    let base = if fixed {
+        if delta != 0 {
+            unsafe { CloseHandle(section) };
+            return Err(EINVAL);
+        }
+        unmap_views(addr, len); // replacing an earlier shared mapping there
+        let whole = ALLOCS.lock().unwrap().iter().position(|&(b, l)| b == addr && l == len);
+        if let Some(i) = whole {
+            // Replacing one whole private mapping of ours: give its address space back first.
+            unsafe { VirtualFree(addr as *mut _, 0, MEM_RELEASE) };
+            ALLOCS.lock().unwrap().remove(i);
+        }
+        match view_at(addr) {
+            got if got == addr => addr,
+            _ => {
+                unsafe { CloseHandle(section) };
+                return Err(ENOMEM); // ponytail: a fixed shared mapping over part of a private one
+            }
+        }
+    } else {
+        loop {
+            let a = NEXT.fetch_add(vlen.next_multiple_of(0x10000), Relaxed);
+            if a + vlen > WINDOW.1 {
+                unsafe { CloseHandle(section) };
+                return Err(ENOMEM);
+            }
+            if view_at(a) == a {
+                break a;
+            }
+            // Only "that address is taken" is worth trying elsewhere; any other refusal is final.
+            const ERROR_INVALID_ADDRESS: u32 = 487;
+            let e = unsafe { GetLastError() };
+            if e != ERROR_INVALID_ADDRESS {
+                unsafe { CloseHandle(section) };
+                return Err(if e == 5 { EACCES } else { ENOMEM });
+            }
+        }
+    };
+    if prot == 0 {
+        let mut old = 0;
+        unsafe { VirtualProtect(base as *mut _, vlen as usize, 0x01, &mut old) }; // PROT_NONE
+    }
+    VIEWS.lock().unwrap().push(View { base, len: vlen, section, off: aoff, access });
+    Ok((base + delta) as i64)
+}
+
+/// Unmap every shared view overlapping [addr, addr+len). Returns whether there was one.
+fn unmap_views(addr: u64, len: u64) -> bool {
+    let mut views = VIEWS.lock().unwrap();
+    let before = views.len();
+    views.retain(|v| {
+        if v.base < addr + len && addr < v.base + v.len {
+            unsafe {
+                UnmapViewOfFile(v.base as *mut _);
+                CloseHandle(v.section);
+            }
+            false
+        } else {
+            true
+        }
+    });
+    views.len() != before
+}
+
+/// Is `addr` inside a MAP_SHARED view (memory other processes may also see)?
+pub fn in_shared_view(addr: u64) -> bool {
+    VIEWS.lock().unwrap().iter().any(|v| (v.base..v.base + v.len).contains(&addr))
+}
+
+fn msync(addr: u64, len: u64) -> R {
+    unsafe { FlushViewOfFile(addr as *const _, len as usize) };
+    Ok(0)
+}
+
+/// Shared views for a forked child: (base, len, section, offset, access) with the sections made
+/// inheritable for the duration of the fork (`views_inheritable(false)` afterwards).
+fn views_snapshot() -> Vec<u64> {
+    let views = VIEWS.lock().unwrap();
+    let mut v = vec![views.len() as u64];
+    for w in views.iter() {
+        unsafe { SetHandleInformation(w.section, 1, 1) };
+        v.extend([w.base, w.len, w.section as u64, w.off, w.access as u64]);
+    }
+    v
+}
+
+/// Back to non-inheritable once the fork child has its copies (an exec'd successor mustn't keep them).
+pub fn views_inheritable(on: bool) {
+    for w in VIEWS.lock().unwrap().iter() {
+        unsafe { SetHandleInformation(w.section, 1, on as u32) };
+    }
 }
 
 fn mprotect(addr: u64, len: u64, prot: u64) -> R {
@@ -1103,6 +1308,9 @@ fn munmap(addr: u64, len: u64, rsp: u64) -> R {
     // A thread unmapping its own stack is about to exit (musl's detached-thread exit does this); NT
     // still needs that stack to dispatch the final exit syscall, so leave it mapped.
     if (addr..addr + len).contains(&rsp) {
+        return Ok(0);
+    }
+    if unmap_views(addr, len) {
         return Ok(0);
     }
     // ponytail: decommit only; the address space stays reserved (and leaks) until exit.
@@ -1156,6 +1364,23 @@ pub fn now(clock: u64) -> (u64, u64) {
         START.lock().unwrap().unwrap().elapsed() // every other clock: monotonic since start
     };
     (d.as_secs(), d.subsec_nanos() as u64)
+}
+
+/// time(): seconds since the epoch, also stored at `out` if given.
+fn time(out: u64) -> R {
+    let (s, _) = now(0);
+    if out != 0 {
+        unsafe { *(out as *mut u64) = s };
+    }
+    Ok(s as i64)
+}
+
+/// All our clocks tick in nanoseconds (QueryPerformanceCounter is finer than that on modern hardware).
+fn clock_getres(ts: u64) -> R {
+    if ts != 0 {
+        unsafe { *(ts as *mut [u64; 2]) = [0, 1] };
+    }
+    Ok(0)
 }
 
 fn clock_gettime(clock: u64, ts: u64) -> R {
@@ -1230,6 +1455,15 @@ fn clock_nanosleep(clock: u64, flags: u64, req: u64) -> R {
     };
     std::thread::sleep(wait);
     Ok(0)
+}
+
+/// A `struct timeval *` timeout in ms; NULL means wait forever (-1).
+fn timeval_ms(tv: u64) -> i64 {
+    if tv == 0 {
+        return -1;
+    }
+    let [s, us] = unsafe { *(tv as *const [i64; 2]) };
+    s.saturating_mul(1000).saturating_add(us / 1000)
 }
 
 /// A `struct timespec *` timeout in ms; NULL means wait forever (-1).

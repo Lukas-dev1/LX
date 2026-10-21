@@ -2,6 +2,7 @@
 # lx test suite. From the repo root, in Git Bash:   sh tests/run.sh
 #   REPEAT=n   repetitions of the multithreaded tests (default 20)
 #   QUICK=1    skip the network tests (nginx, wget, python)
+#   TOOLS=dir  where the toolchains live (default tools/; a git worktree can point at the main checkout's)
 #
 # Builds lx and the guest programs, prepares rootfs/ (an Alpine test rootfs plus pulled images), and runs
 # everything. Guest scripts live in guest/ and are copied into the images only for the duration of the
@@ -10,10 +11,11 @@ set -u
 cd "$(dirname "$0")/.."
 export MSYS_NO_PATHCONV=1
 ROOT=$(pwd -W)
-export RUSTUP_HOME="$ROOT/tools/rust/rustup" CARGO_HOME="$ROOT/tools/rust/cargo"
-CARGO=tools/rust/cargo/bin/cargo.exe
-ZIG=tools/zig-x86_64-windows-0.15.2/zig.exe
-GO=tools/go/bin/go.exe
+TOOLS=${TOOLS:-$ROOT/tools}
+export RUSTUP_HOME="$TOOLS/rust/rustup" CARGO_HOME="$TOOLS/rust/cargo"
+CARGO=$TOOLS/rust/cargo/bin/cargo.exe
+ZIG=$TOOLS/zig-x86_64-windows-0.15.2/zig.exe
+GO=$TOOLS/go/bin/go.exe
 LX=./target/release/lx.exe
 REPEAT=${REPEAT:-20}
 STORE=rootfs/images/registry-1.docker.io
@@ -55,25 +57,19 @@ cp guest/regress.sh guest/entrypoint.sh rootfs/alpine/
 HAVE_GO=0
 if [ -x $GO ]; then
   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOTOOLCHAIN=local GOTELEMETRY=off GO111MODULE=off \
-    GOCACHE="$ROOT/tools/gocache" GOPATH="$ROOT/tools/gopath" $GO build -o rootfs/gotest ./guest/gotest || die "go build"
+    GOCACHE="$TOOLS/gocache" GOPATH="$TOOLS/gopath" $GO build -o rootfs/gotest ./guest/gotest || die "go build"
   HAVE_GO=1
 fi
 
-# ---- images: pull what's missing; guest scripts go in for this run only ----
-for img in alpine:latest python:3.12-alpine nginx:alpine; do
+# ---- images: pull what's missing; guest scripts reach containers through a read-only volume ----
+for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine; do
   dir=$STORE/library_${img%%:*}/${img#*:}/rootfs
   [ -d "$dir" ] || $LX pull "$img" > /dev/null 2>&1 || die "pull $img"
 done
-ALPINE_IMG=$STORE/library_alpine/latest/rootfs
-PY_IMG=$STORE/library_python/3.12-alpine/rootfs
-cleanup() {
-  rm -f "$ALPINE_IMG/sigtest.sh" "$PY_IMG/nettest.py"
-  rm -rf "$OUT"
-}
+GUEST="$ROOT/guest:/t:ro" # nothing is copied into an image: containers never modify the image store
+cleanup() { rm -rf "$OUT" rootfs/voltest-suite; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-cp guest/sigtest.sh "$ALPINE_IMG/"
-cp guest/nettest.py "$PY_IMG/"
 
 # ---- single runs ----
 expect() { # expect <name> <exit code> <text in output> -- <lx args...>
@@ -89,6 +85,24 @@ expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regre
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
 expect "deep stack + fork" 0  "child exit 3"             -- rootfs/alpine /deepstack
 expect "dlopen while threads run" 0 " OK"                -- rootfs/alpine /dltest
+# Debian (glibc) image: the three usual ways a Python image starts.
+expect "debian: python3 -c"         0 "hi"               -- run python:3.12 python3 -c "print('hi')"
+expect "debian: python3 /script.py" 0 "script ran: 3.12" -- run -v "$GUEST" python:3.12 python3 /t/hello.py
+expect "debian: AF_UNIX echo (path + abstract)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/unixtest.py
+
+# ---- volumes: data written in one container run is there in the next; the image stays untouched ----
+VOL="$ROOT/rootfs/voltest-suite"
+rm -rf rootfs/voltest-suite
+img_sum() { (cd $STORE/library_alpine/latest/rootfs && find . -type f -print0 | sort -z | xargs -0 sha1sum | sha1sum); }
+before=$(img_sum)
+expect "volume: run 1 writes"   0 "wrote"       -- run -v "$VOL:/data" alpine sh -c 'echo run1 > /data/log && mkdir -p /data/d && echo n > /data/d/f && echo wrote'
+expect "volume: run 2 reads + appends" 0 "run1" -- run -v "$VOL:/data" alpine sh -c 'cat /data/log /data/d/f && echo run2 >> /data/log'
+expect "volume: run 3 sees both runs" 0 "run1 run2" -- run -v "$VOL:/data" alpine sh -c 'tr "\n" " " < /data/log'
+[ "$(cat rootfs/voltest-suite/log 2>/dev/null | tr '\n' ' ')" = "run1 run2 " ] && ok "volume: host sees the data" || bad "volume: host sees the data"
+expect "volume: read-only"      0 "Read-only file system" -- run -v "$VOL:/data:ro" alpine sh -c 'echo x > /data/new; cat /data/log >/dev/null'
+expect "container layer: changes stay in the run" 0 "done" -- run alpine sh -c 'rm -f /etc/motd; echo x > /etc/new; echo done'
+expect "container layer: next run starts pristine" 0 "pristine" -- run alpine sh -c '[ -f /etc/motd ] && [ ! -e /etc/new ] && echo pristine'
+[ "$before" = "$(img_sum)" ] && ok "image store unchanged by containers" || bad "image store unchanged by containers"
 
 # ---- repeated runs: every run must print OK; the trap fallback and FS faults must stay unused ----
 repeat() { # repeat <name> <n> <lx args...>
@@ -134,8 +148,8 @@ else
       grep -q "exited with code 137" "$OUT/nginx" && stuck=$((stuck + 1))
     done
     if [ $served = $((runs * 40)) ]; then ok "nginx: $served/$((runs * 40)) requests"; else bad "nginx: $served/$((runs * 40)) requests"; fi
-    # Known open bug: a worker sometimes misses its shutdown message and is SIGKILLed after ~3 s.
-    [ $stuck = 0 ] || note "nginx: $stuck/$runs stops had a worker killed after ~3 s (known bug)"
+    # A worker SIGKILLed at stop means it missed the shutdown (was: blocked in a shared accept(), fixed).
+    if [ $stuck = 0 ]; then ok "nginx: $runs/$runs stops clean"; else bad "nginx: $stuck/$runs stops had a worker killed after ~3 s"; fi
   fi
   # These need the internet (DNS + example.com): one retry, so a host/VPN DNS hiccup shows as a warning.
   online() { # online <name> <text> <lx args...>
@@ -151,13 +165,20 @@ else
     bad "$name"; tail -3 "$OUT/net"
   }
   online "wget (DNS + HTTP out)" "<title>Example Domain</title>" run alpine wget -qO- http://example.com
-  online "python3 /script.py: sockets + threaded server" "20/20 responses" run python:3.12-alpine python3 /nettest.py
+  online "python3 /script.py: sockets + threaded server" "20/20 responses" run -v "$GUEST" python:3.12-alpine python3 /t/nettest.py
+  online "debian: sockets + threaded server" "20/20 responses" run -v "$GUEST" python:3.12 python3 /t/nettest.py
+  # glibc should stay off the trap path too: no fallback traps, no FS faults in a full threaded run.
+  LX_PATCHLOG=1 timeout 120 $LX run -v "$GUEST" python:3.12 python3 /t/nettest.py < /dev/null > "$OUT/deb" 2>&1
+  if grep -q " 0 fallback traps;.* 0 FS-base faults" "$OUT/deb"; then ok "debian: no trap fallbacks"; else bad "debian: trap fallbacks taken"; grep "exit:" "$OUT/deb"; fi
 fi
 
 stop_test() { # stop_test <mode> <expected exit> [text]
-  $LX run alpine sh /sigtest.sh "$1" < /dev/null > "$OUT/stop" 2>&1 &
+  $LX run -v "$GUEST" alpine sh /t/sigtest.sh "$1" < /dev/null > "$OUT/stop" 2>&1 &
   job=$!
-  sleep 1.5
+  # Wait until the container is registered (a busy machine can take longer than any fixed sleep), then
+  # give the script a moment to install its trap.
+  for _ in $(seq 100); do [ -n "$($LX ps | awk 'NR==2 {print $1}')" ] && break; sleep 0.1; done
+  sleep 1
   $LX stop "$($LX ps | awk 'NR==2 {print $1}')" > /dev/null
   wait $job
   code=$?

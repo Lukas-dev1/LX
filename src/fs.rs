@@ -5,11 +5,12 @@
 //! Windows: creating NTFS symlinks needs admin/Developer Mode, and resolving ourselves means `..` and
 //! absolute targets can't leave the rootfs.
 use crate::syscall::{R, cstr, guest_mut, read_handle, write_handle};
-use crate::syscall::{EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ERANGE, ESPIPE, ENOTEMPTY, EACCES, EBUSY, EIO};
+use crate::syscall::{EROFS, EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ERANGE, ESPIPE, ENOTEMPTY, EACCES, EBUSY, EIO};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,8 @@ pub enum Fd {
     Dir { guest: String, pos: usize },
     /// Emulated character devices; image /dev directories are empty.
     Dev(Dev),
+    /// A guest pipe end (pipe2): an overlapped NT named pipe, see `Pipe`.
+    Pipe(Arc<Pipe>),
     /// Shared like a Linux open file description: dup and fork share the socket and its O_NONBLOCK.
     Socket(Arc<Sock>),
     Epoll(Arc<Mutex<Epoll>>),
@@ -138,6 +141,97 @@ impl Dev {
     }
 }
 
+/// A guest pipe end. NT serializes every operation on a synchronous pipe handle, so with CreatePipe a
+/// read pending in one process (a forked worker waiting for work) made even PeekNamedPipe/GetFileType
+/// from another process wait behind it: poll() hung. Overlapped pipes aren't serialized, so readiness
+/// checks never block; reads and writes wait on their own event plus the signal event (EINTR), and
+/// O_NONBLOCK works. Shared by dup and fork like an open file description.
+pub struct Pipe {
+    h: OwnedHandle,
+    nonblock: std::sync::atomic::AtomicBool,
+}
+
+impl Pipe {
+    fn raw(&self) -> isize {
+        self.h.as_raw_handle() as isize
+    }
+
+    fn nonblocking(&self) -> bool {
+        self.nonblock.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn available(&self) -> Option<u32> {
+        let mut avail = 0u32;
+        let ok = unsafe { crate::win::PeekNamedPipe(self.raw(), std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) };
+        (ok != 0).then_some(avail) // None: the other end is gone
+    }
+
+    /// One overlapped ReadFile/WriteFile, waited for (or EAGAIN when non-blocking and it would wait).
+    fn io(&self, buf: u64, len: u64, write: bool) -> R {
+        use crate::win::*;
+        const ERROR_IO_PENDING: u32 = 997;
+        const ERROR_BROKEN_PIPE: u32 = 109;
+        const ERROR_NO_DATA: u32 = 232;
+        let len = len.min(u32::MAX as u64) as u32;
+        if !write && self.nonblocking() {
+            match self.available() {
+                Some(0) => return Err(crate::syscall::EAGAIN),
+                None => return Ok(0), // EOF
+                _ => {}
+            }
+        }
+        let ev = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        let mut o = Overlapped { internal: [0; 2], offset: 0, offset_high: 0, event: ev };
+        let op = (&mut o as *mut Overlapped).cast();
+        let mut done = 0u32;
+        let ok = unsafe {
+            if write { WriteFile(self.raw(), buf as *const u8, len, &mut done, op) } else { ReadFile(self.raw(), buf as *mut u8, len, &mut done, op) }
+        };
+        let mut err = if ok != 0 { 0 } else { unsafe { GetLastError() } };
+        if err == ERROR_IO_PENDING {
+            let intr = crate::signal::intr_event();
+            let waits = if intr != 0 { vec![ev, intr] } else { vec![ev] };
+            loop {
+                let r = unsafe { WaitForMultipleObjects(waits.len() as u32, waits.as_ptr(), 0, u32::MAX) };
+                if r == 0 || crate::signal::deliverable() {
+                    break;
+                }
+            }
+            unsafe {
+                if WaitForMultipleObjects(1, &ev, 0, 0) != 0 {
+                    CancelIoEx(self.raw(), op); // a signal arrived first
+                }
+                err = if GetOverlappedResult(self.raw(), op, &mut done, 1) != 0 { 0 } else { GetLastError() };
+            }
+            if err == 995 && done == 0 {
+                unsafe { CloseHandle(ev) };
+                return Err(crate::syscall::EINTR); // ERROR_OPERATION_ABORTED
+            }
+        }
+        unsafe { CloseHandle(ev) };
+        match err {
+            0 | 995 => Ok(done as i64),
+            ERROR_BROKEN_PIPE if !write => Ok(0), // EOF
+            ERROR_BROKEN_PIPE | ERROR_NO_DATA => Err(crate::syscall::EPIPE),
+            e => {
+                if crate::syscall::debug() {
+                    crate::syscall::dlog(format_args!("pipe {} on handle {:#x} failed: Windows error {e}", if write { "write" } else { "read" }, self.raw()));
+                }
+                Err(EIO)
+            }
+        }
+    }
+
+    fn ready(&self, events: i16) -> i16 {
+        // ponytail: write ends always report POLLOUT (a full pipe makes the write wait instead).
+        match self.available() {
+            None => POLLHUP | (events & POLLIN),
+            Some(0) => events & POLLOUT,
+            Some(_) => events & (POLLIN | POLLOUT),
+        }
+    }
+}
+
 /// `/dev/stdin|stdout|stderr`, `/dev/fd/N`, `/proc/self/fd/N`: opening one dups that fd.
 fn fd_alias(guest: &str) -> Option<u64> {
     match guest {
@@ -154,8 +248,16 @@ pub struct Fs {
     /// The container's writable layer: every change lands here, the image is never modified.
     /// None for a plain `lx <rootfs> cmd`, which writes the rootfs directly.
     upper: Option<PathBuf>,
+    /// Volumes (`lx run -v host:guest`): host folders mounted over guest paths, bypassing the layers.
+    mounts: Vec<Mount>,
     cwd: String,
     fds: Vec<Option<Slot>>,
+}
+
+pub struct Mount {
+    guest: Vec<String>,
+    host: PathBuf,
+    ro: bool,
 }
 
 // Whiteouts in the upper layer use the OCI layer format, so a container layer is a valid image layer.
@@ -180,7 +282,24 @@ pub fn init(root: PathBuf) {
         let owned = (h != 0 && h != -1).then(|| unsafe { BorrowedHandle::borrow_raw(h as _) }.try_clone_to_owned().ok());
         owned.flatten().map(|h| Slot { fd: Fd::Handle(h), cloexec: false })
     };
-    *FS.lock().unwrap() = Some(Fs { root, upper: None, cwd: "/".into(), fds: vec![std(-10), std(-11), std(-12)] });
+    *FS.lock().unwrap() = Some(Fs { root, upper: None, mounts: Vec::new(), cwd: "/".into(), fds: vec![std(-10), std(-11), std(-12)] });
+}
+
+/// Mount host folder `host` (canonical) at guest path `guest`. The mount point is created in the
+/// container layer if the image doesn't have it, so it shows up in its parent's listing.
+pub fn add_mount(guest: &str, host: PathBuf, ro: bool) -> Result<(), i64> {
+    with(|fs| {
+        let comps = comps_of(guest);
+        if comps.is_empty() {
+            return Err(EINVAL); // mounting over / would hide the whole image
+        }
+        if !exists(&fs.host(&comps)) {
+            fs::create_dir_all(fs.writable(&comps, false)?).map_err(errno)?;
+        }
+        fs.mounts.push(Mount { guest: comps, host, ro });
+        fs.mounts.sort_by_key(|m| std::cmp::Reverse(m.guest.len())); // longest prefix wins
+        Ok(())
+    })
 }
 
 /// Give the container a writable layer on top of the image (call right after init).
@@ -235,6 +354,7 @@ fn errno(e: io::Error) -> i64 {
         Some(80 | 183) => EEXIST,
         Some(145) => ENOTEMPTY,
         Some(267) => ENOTDIR,
+        Some(17) => 18, // ERROR_NOT_SAME_DEVICE -> EXDEV: rename across a volume boundary
         Some(123 | 87) => EINVAL,
         _ => EIO,
     }
@@ -267,6 +387,11 @@ impl Fs {
     /// Where `comps` lives now: the upper layer if it's there, else the image unless a whiteout or an
     /// opaque directory hides it. A path that exists nowhere maps into the upper layer.
     fn host(&self, comps: &[String]) -> PathBuf {
+        if let Some((m, rest)) = self.mount_of(comps) {
+            let mut p = m.host.clone();
+            p.extend(rest);
+            return p;
+        }
         let mut lower = self.root.clone();
         lower.extend(comps);
         let Some(up) = &self.upper else { return lower };
@@ -277,6 +402,11 @@ impl Fs {
         } else {
             lower
         }
+    }
+
+    /// The volume `comps` is in (the innermost one), and the path inside it.
+    fn mount_of<'a>(&self, comps: &'a [String]) -> Option<(&Mount, &'a [String])> {
+        self.mounts.iter().find(|m| comps.starts_with(&m.guest)).map(|m| (m, &comps[m.guest.len()..]))
     }
 
     /// Is the image's copy of `comps` deleted in the upper layer?
@@ -293,6 +423,9 @@ impl Fs {
     }
 
     fn in_lower(&self, comps: &[String]) -> bool {
+        if self.mount_of(comps).is_some() {
+            return false; // a volume hides what the image had there
+        }
         let mut lower = self.root.clone();
         lower.extend(comps);
         self.upper.is_some() && !self.hidden(comps) && exists(&lower)
@@ -301,6 +434,9 @@ impl Fs {
     /// The upper-layer path for changing `comps`: parent directories are created in the upper layer, a
     /// whiteout for the name is cleared, and with `copy` an image file is copied up first.
     fn writable(&self, comps: &[String], copy: bool) -> Result<PathBuf, i64> {
+        if let Some((m, _)) = self.mount_of(comps) {
+            return if m.ro { Err(EROFS) } else { Ok(self.host(comps)) }; // straight to the host folder
+        }
         let Some(up) = &self.upper else { return Ok(self.host(comps)) };
         let mut upper = up.clone();
         upper.extend(comps);
@@ -322,6 +458,16 @@ impl Fs {
 
     /// Delete `comps` from the container: remove the upper copy, and whiteout the image's copy.
     fn remove(&self, comps: &[String], dir: bool) -> Result<(), i64> {
+        if let Some((m, rest)) = self.mount_of(comps) {
+            if m.ro {
+                return Err(EROFS);
+            }
+            if rest.is_empty() {
+                return Err(EBUSY); // the mount point itself
+            }
+            let host = self.host(comps);
+            return if dir { fs::remove_dir(host) } else { fs::remove_file(host) }.map_err(errno);
+        }
         let lower = self.in_lower(comps);
         if let Some(up) = &self.upper {
             let mut upper = up.clone();
@@ -342,6 +488,10 @@ impl Fs {
 
     /// Directory entries of `comps` across both layers (names, is-dir), whiteouts applied.
     fn list(&self, comps: &[String]) -> Result<Vec<(String, bool)>, i64> {
+        if self.mount_of(comps).is_some() {
+            let rd = fs::read_dir(self.host(comps)).map_err(errno)?;
+            return Ok(rd.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().is_ok_and(|t| t.is_dir()))).collect());
+        }
         let mut out: Vec<(String, bool)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut hide = std::collections::HashSet::new();
@@ -490,12 +640,15 @@ pub fn proc_state(fork: bool) -> Vec<String> {
             }
         }
         let upper = fs.upper.as_ref().map(|u| u.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut v = vec![fs.root.to_string_lossy().into_owned(), upper, fs.cwd.clone(), String::new()];
+        let mounts: Vec<String> = fs.mounts.iter()
+            .map(|m| format!("/{}\x1f{}\x1f{}", m.guest.join("/"), m.host.to_string_lossy(), m.ro as u8)).collect();
+        let mut v = vec![fs.root.to_string_lossy().into_owned(), upper, mounts.join("\x1e"), fs.cwd.clone(), String::new()];
         let mut n = 0;
         for (i, s) in fs.fds.iter().enumerate() {
             let Some(s) = s.as_ref().filter(|s| fork || !s.cloexec) else { continue };
             let (kind, h, path) = match &s.fd {
                 Fd::Handle(h) => ("h", h.as_raw_handle() as usize, String::new()),
+                Fd::Pipe(p) => ("p", p.raw() as usize, (p.nonblocking() as u8).to_string()),
                 Fd::File { f, host } => ("f", f.as_raw_handle() as usize, host.to_string_lossy().into_owned()),
                 Fd::Dir { guest, .. } => ("d", 0, guest.clone()),
                 Fd::Dev(d) => (d.tag(), 0, String::new()),
@@ -508,7 +661,7 @@ pub fn proc_state(fork: bool) -> Vec<String> {
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
             n += 1;
         }
-        v[3] = n.to_string();
+        v[4] = n.to_string();
         v
     })
 }
@@ -516,7 +669,14 @@ pub fn proc_state(fork: bool) -> Vec<String> {
 /// Rebuild the fd table from `proc_state` fields (in the new lx). Returns the unparsed rest.
 pub fn init_from(fields: &[String]) -> Result<&[String], String> {
     let bad = || "malformed process state".to_string();
-    let [root, upper, cwd, n, rest @ ..] = fields else { return Err(bad()) };
+    let [root, upper, mounts, cwd, n, rest @ ..] = fields else { return Err(bad()) };
+    let mounts = mounts.split('\x1e').filter(|m| !m.is_empty()).map(|m| {
+        let f: Vec<&str> = m.split('\x1f').collect();
+        match f.as_slice() {
+            [g, h, ro] => Ok(Mount { guest: comps_of(g), host: PathBuf::from(h), ro: *ro == "1" }),
+            _ => Err(bad()),
+        }
+    }).collect::<Result<Vec<_>, _>>()?;
     let mut fds: Vec<Option<Slot>> = Vec::new();
     let mut rest = rest;
     for _ in 0..n.parse::<usize>().map_err(|_| bad())? {
@@ -525,6 +685,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
         let h: usize = h.parse().map_err(|_| bad())?;
         let fd_ = match kind.as_str() {
             "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(h as _) }),
+            "p" => Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (path == "1").into() })),
             "f" => Fd::File { f: unsafe { File::from_raw_handle(h as _) }, host: PathBuf::from(path) },
             "d" => Fd::Dir { guest: path.clone(), pos: 0 },
             "null" => Fd::Dev(Dev::Null),
@@ -540,7 +701,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
         rest = more;
     }
     let upper = (!upper.is_empty()).then(|| PathBuf::from(upper));
-    *FS.lock().unwrap() = Some(Fs { root: PathBuf::from(root), upper, cwd: cwd.clone(), fds });
+    *FS.lock().unwrap() = Some(Fs { root: PathBuf::from(root), upper, mounts, cwd: cwd.clone(), fds });
     Ok(rest)
 }
 
@@ -554,11 +715,30 @@ pub fn close_all() {
 }
 
 pub fn pipe2(fds: u64, flags: u64) -> R {
-    let (mut r, mut w) = (0isize, 0isize);
-    if unsafe { crate::win::CreatePipe(&mut r, &mut w, std::ptr::null_mut(), 65536) } == 0 {
+    use crate::win::*;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const PIPE_ACCESS_INBOUND: u32 = 0x1;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const OPEN_EXISTING: u32 = 3;
+    // An anonymous pipe with overlapped ends: a uniquely named pipe, used by name only for this open.
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name: Vec<u16> = format!("\\\\.\\pipe\\lx-{}-{n}", unsafe { GetCurrentProcessId() }).encode_utf16().chain([0]).collect();
+    let r = unsafe {
+        CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            0, 1, 65536, 65536, 0, std::ptr::null_mut()) // PIPE_TYPE_BYTE | PIPE_WAIT, one instance
+    };
+    if r == -1 {
         return Err(EIO);
     }
-    let own = |h: isize| Fd::Handle(unsafe { OwnedHandle::from_raw_handle(h as _) });
+    let w = unsafe { CreateFileW(name.as_ptr(), GENERIC_WRITE, 0, std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0) };
+    if w == -1 {
+        unsafe { CloseHandle(r) };
+        return Err(EIO);
+    }
+    let nonblock = flags & O_NONBLOCK != 0;
+    let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into() }));
     let cloexec = flags & O_CLOEXEC != 0;
     let (a, b) = with(|fs| (fs.add(own(r), 0, cloexec), fs.add(own(w), 0, cloexec)));
     unsafe { *(fds as *mut [i32; 2]) = [a as i32, b as i32] };
@@ -570,6 +750,7 @@ pub fn pipe2(fds: u64, flags: u64) -> R {
 fn handle(fd: &Fd) -> Result<isize, i64> {
     match fd {
         Fd::Handle(h) => Ok(h.as_raw_handle() as isize),
+        Fd::Pipe(p) => Ok(p.raw()),
         Fd::File { f, .. } => Ok(f.as_raw_handle() as isize),
         Fd::Dir { .. } => Err(EISDIR),
         Fd::Dev(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) => Err(EINVAL),
@@ -579,6 +760,7 @@ fn handle(fd: &Fd) -> Result<isize, i64> {
 /// What a read/write/poll on an fd talks to. Taken out of the fd table so blocking I/O runs unlocked.
 enum Io {
     Handle(isize),
+    Pipe(Arc<Pipe>),
     Dev(Dev),
     Sock(Arc<Sock>),
     Event(Arc<EventFd>),
@@ -589,6 +771,7 @@ fn io_target(fd: u64) -> Result<Io, i64> {
         Fd::Dev(d) => Ok(Io::Dev(*d)),
         Fd::Socket(s) => Ok(Io::Sock(s.clone())),
         Fd::Event(e) => Ok(Io::Event(e.clone())),
+        Fd::Pipe(p) => Ok(Io::Pipe(p.clone())),
         other => handle(other).map(Io::Handle),
     })
 }
@@ -596,6 +779,7 @@ fn io_target(fd: u64) -> Result<Io, i64> {
 pub fn read(fd: u64, buf: u64, len: u64) -> R {
     match io_target(fd)? {
         Io::Handle(h) => read_handle(h, buf, len),
+        Io::Pipe(p) => p.io(buf, len, false),
         Io::Sock(s) => s.recv(buf, len, 0),
         Io::Event(e) => e.read(buf, len),
         Io::Dev(Dev::Null) => Ok(0),
@@ -610,6 +794,7 @@ pub fn read(fd: u64, buf: u64, len: u64) -> R {
 pub fn write(fd: u64, buf: u64, len: u64) -> R {
     match io_target(fd)? {
         Io::Handle(h) => write_handle(h, buf, len),
+        Io::Pipe(p) => p.io(buf, len, true),
         Io::Sock(s) => s.send(buf, len, 0),
         Io::Dev(_) => Ok(len as i64), // devices swallow writes
         Io::Event(e) => e.write(buf, len),
@@ -657,6 +842,7 @@ pub fn readiness(fd: i32, events: i16) -> i16 {
         Ok(Io::Dev(_)) => events & (POLLIN | POLLOUT),
         Ok(Io::Sock(s)) => s.ready(events),
         Ok(Io::Event(e)) => e.ready(events),
+        Ok(Io::Pipe(p)) => p.ready(events),
         Ok(Io::Handle(h)) => match unsafe { crate::win::GetFileType(h) } {
             3 => {
                 // FILE_TYPE_PIPE. ponytail: write ends always report POLLOUT.
@@ -699,6 +885,10 @@ pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
             unsafe { *(arg as *mut i32) = s.available() as i32 };
             Ok(0)
         }
+        (FIONREAD, Io::Pipe(p)) => {
+            unsafe { *(arg as *mut i32) = p.available().unwrap_or(0) as i32 };
+            Ok(0)
+        }
         (FIONREAD, Io::Handle(h)) => {
             let mut avail = 0u32;
             unsafe { crate::win::PeekNamedPipe(h, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) };
@@ -737,6 +927,44 @@ pub fn poll(fds: u64, n: u64, timeout_ms: i64) -> R {
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+/// select / pselect6 on top of poll: fd_sets (bit arrays of u64) in, pollfds through `poll`, fd_sets out.
+/// Returns the number of set bits, like Linux.
+pub fn select(n: u64, rd: u64, wr: u64, ex: u64, timeout_ms: i64) -> R {
+    const POLLPRI: i16 = 2;
+    const POLLERR: i16 = 8;
+    if n > 1024 {
+        return Err(EINVAL);
+    }
+    let bit = |set: u64, fd: u64| set != 0 && (unsafe { *((set + fd / 64 * 8) as *const u64) } >> (fd % 64)) & 1 != 0;
+    let (mut fds, mut pfds) = (Vec::new(), Vec::<[i16; 4]>::new()); // struct pollfd { int fd; short events, revents }
+    for fd in 0..n {
+        let ev = if bit(rd, fd) { POLLIN } else { 0 } | if bit(wr, fd) { POLLOUT } else { 0 } | if bit(ex, fd) { POLLPRI } else { 0 };
+        if ev != 0 {
+            fds.push(fd);
+            pfds.push([fd as i16, (fd >> 16) as i16, ev, 0]);
+        }
+    }
+    poll(pfds.as_mut_ptr() as u64, pfds.len() as u64, timeout_ms)?;
+    for set in [rd, wr, ex].into_iter().filter(|&s| s != 0) {
+        unsafe { std::ptr::write_bytes(set as *mut u64, 0, n.div_ceil(64) as usize) };
+    }
+    let mut count = 0;
+    let mut mark = |set: u64, fd: u64| {
+        unsafe { *((set + fd / 64 * 8) as *mut u64) |= 1 << (fd % 64) };
+        count += 1;
+    };
+    for (fd, p) in fds.into_iter().zip(&pfds) {
+        let r = p[3];
+        if r & POLLNVAL != 0 {
+            return Err(EBADF);
+        }
+        if rd != 0 && p[2] & POLLIN != 0 && r & (POLLIN | POLLHUP | POLLERR) != 0 { mark(rd, fd) }
+        if wr != 0 && p[2] & POLLOUT != 0 && r & (POLLOUT | POLLERR) != 0 { mark(wr, fd) }
+        if ex != 0 && p[2] & POLLPRI != 0 && r & POLLPRI != 0 { mark(ex, fd) }
+    }
+    Ok(count)
 }
 
 /// sendfile: from the file position (cat), or from `*off` leaving the position alone and advancing
@@ -862,16 +1090,330 @@ pub fn openat(dirfd: u64, path: u64, flags: u64) -> R {
     })
 }
 
+/// close_range(first, last, flags): close every fd in the range, or with CLOSE_RANGE_CLOEXEC just mark them.
+pub fn close_range(first: u64, last: u64, flags: u64) -> R {
+    const CLOSE_RANGE_CLOEXEC: u64 = 4;
+    if first > last {
+        return Err(EINVAL); // an empty range is an error, not "close `first`" (Python passes these)
+    }
+    with(|fs| {
+        let Some(top) = fs.fds.len().checked_sub(1) else { return Ok(0) };
+        for i in first as usize..=last.min(top as u64) as usize { // empty when first is past the last fd
+            if flags & CLOSE_RANGE_CLOEXEC != 0 {
+                if let Some(s) = fs.fds[i].as_mut() {
+                    s.cloexec = true;
+                }
+            } else {
+                fs.fds[i] = None;
+            }
+        }
+        Ok(0)
+    })
+}
+
+/// link/linkat. In the upper layer or a volume this is a real NTFS hard link; a file that only exists
+/// in the image is copied up first (the image must not gain links into a container).
+pub fn linkat(olddir: u64, old: u64, newdir: u64, new: u64, flags: u64) -> R {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    with(|fs| {
+        let (og, oh) = fs.at(olddir, old, flags & AT_SYMLINK_FOLLOW != 0)?;
+        let (ng, nh) = fs.at(newdir, new, false)?;
+        if fs::symlink_metadata(&oh).map_err(errno)?.is_dir() {
+            return Err(crate::syscall::EPERM);
+        }
+        if exists(&nh) {
+            return Err(EEXIST);
+        }
+        let src = fs.writable(&comps_of(&og), true)?;
+        let dst = fs.writable(&comps_of(&ng), false)?;
+        fs::hard_link(&src, &dst).or_else(|_| fs::copy(&src, &dst).map(|_| ())).map(|_| 0).map_err(errno)
+    })
+}
+
+/// utimensat / futimens: set access and modification times (timespec pairs; UTIME_NOW / UTIME_OMIT).
+pub fn utimensat(dirfd: u64, path: u64, times: u64, flags: u64) -> R {
+    const UTIME_NOW: u64 = (1 << 30) - 1;
+    const UTIME_OMIT: u64 = (1 << 30) - 2;
+    let when = |i: u64| -> Option<std::time::SystemTime> {
+        let [s, ns] = if times == 0 { [0, UTIME_NOW] } else { unsafe { *((times + i * 16) as *const [u64; 2]) } };
+        match ns {
+            UTIME_OMIT => None,
+            UTIME_NOW => Some(std::time::SystemTime::now()),
+            _ => Some(UNIX_EPOCH + std::time::Duration::new(s, ns as u32)),
+        }
+    };
+    let mut t = fs::FileTimes::new();
+    if let Some(a) = when(0) { t = t.set_accessed(a) }
+    if let Some(m) = when(1) { t = t.set_modified(m) }
+    with(|fs| {
+        if path == 0 {
+            // futimens(fd)
+            return match fs.fd(dirfd)? {
+                Fd::File { f, .. } => f.set_times(t).map(|_| 0).map_err(errno),
+                _ => Ok(0),
+            };
+        }
+        let (guest, host) = fs.at(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+        if fs::metadata(&host).map_err(errno)?.is_dir() {
+            return Ok(0); // ponytail: directory times aren't settable through std; nothing relies on them
+        }
+        let target = fs.writable(&comps_of(&guest), true)?;
+        OpenOptions::new().write(true).open(target).and_then(|f| f.set_times(t)).map(|_| 0).map_err(errno)
+    })
+}
+
+/// statfs/fstatfs: the host volume's real sizes (df), reported as ext4, or tmpfs under /dev/shm.
+pub fn statfs(path: Option<u64>, fd: Option<u64>, buf: u64) -> R {
+    let (host, guest) = with(|fs| match (path, fd) {
+        (Some(p), _) => fs.at(AT_FDCWD, p, true).map(|(g, h)| (h, g)),
+        (_, Some(fd)) => match fs.fd(fd)? {
+            Fd::File { host, .. } => Ok((host.clone(), String::new())),
+            _ => Ok((fs.root.clone(), String::new())),
+        },
+        _ => Err(EINVAL),
+    })?;
+    let dir = if host.is_dir() { host.clone() } else { host.parent().map(Path::to_path_buf).unwrap_or(host.clone()) };
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    unsafe { crate::win::GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    const BS: u64 = 4096;
+    let ty: u64 = if guest.starts_with("/dev/shm") { 0x0102_1994 } else { 0xEF53 }; // TMPFS_MAGIC / EXT4
+    // struct statfs: type, bsize, blocks, bfree, bavail, files, ffree, fsid[2 x i32], namelen, frsize, flags, spare[4]
+    let s: [u64; 15] = [ty, BS, total / BS, free / BS, avail / BS, 1 << 24, 1 << 23, 0, 255, BS, 0, 0, 0, 0, 0];
+    unsafe { *(buf as *mut [u64; 15]) = s };
+    Ok(0)
+}
+
+/// The NT handle and size of a regular file's fd (for MAP_SHARED file mappings).
+pub fn file_handle(fd: u64) -> Result<(isize, u64), i64> {
+    with(|fs| match fs.fd(fd)? {
+        Fd::File { f, .. } => Ok((f.as_raw_handle() as isize, f.metadata().map(|m| m.len()).unwrap_or(0))),
+        _ => Err(crate::syscall::ENODEV),
+    })
+}
+
+/// Make a directory in the container (through the layer), e.g. /dev/shm.
+pub fn mkdir_guest(guest: &str) -> Result<(), i64> {
+    with(|fs| {
+        let c = comps_of(guest);
+        if exists(&fs.host(&c)) {
+            return Ok(());
+        }
+        fs::create_dir_all(fs.writable(&c, false)?).map_err(errno)
+    })
+}
+
 pub fn close(fd: u64) -> R {
     with(|fs| {
         let slot = fs.fds.get_mut(fd as usize).ok_or(EBADF)?;
-        slot.take().map(|_| 0).ok_or(EBADF)
+        let s = slot.take().ok_or(EBADF)?;
+        if let Fd::File { f, .. } = &s.fd {
+            let h = f.as_raw_handle() as isize;
+            LOCKS.lock().unwrap().retain(|l| l.0 != h); // NT drops the handle's locks with it
+        }
+        Ok(0)
     })
+}
+
+// ---- POSIX advisory locks (fcntl, flock) on NT byte-range locks ----
+//
+// NT locks are mandatory: a locked range can't be read or written through other handles. POSIX locks
+// are advisory. So a POSIX range [start, start+len) is locked at SHADOW + start, far beyond any real
+// file data: lockers conflict exactly as on Linux, while plain reads and writes never notice. flock()
+// uses a byte of its own, independent of fcntl locks as on Linux. NT can't split or convert a lock, so
+// held ranges are tracked: unlocking part of one re-locks the remainder, and changing a lock's type is
+// unlock + lock (restoring the old lock if the new one can't be had).
+// ponytail: locks belong to the fd's handle, not the whole process (Linux: per process / per open file
+// description); dup'd fds don't share them. SQLite and most lock users hold them on one fd.
+
+const SHADOW: u64 = 1 << 62;
+const FLOCK_AT: u64 = 1 << 63;
+
+/// Locks this process holds: (handle, start, len, exclusive), in shadow coordinates.
+static LOCKS: Mutex<Vec<(isize, u64, u64, bool)>> = Mutex::new(Vec::new());
+
+#[repr(C)]
+struct Overlapped {
+    internal: [usize; 2],
+    offset: u32,
+    offset_high: u32,
+    event: isize,
+}
+
+fn ov(at: u64) -> Overlapped {
+    Overlapped { internal: [0; 2], offset: at as u32, offset_high: (at >> 32) as u32, event: 0 }
+}
+
+fn nt_try_lock(h: isize, start: u64, len: u64, excl: bool) -> bool {
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
+    let flags = LOCKFILE_FAIL_IMMEDIATELY | if excl { LOCKFILE_EXCLUSIVE_LOCK } else { 0 };
+    let mut o = ov(start);
+    unsafe { crate::win::LockFileEx(h, flags, 0, len as u32, (len >> 32) as u32, (&mut o as *mut Overlapped).cast()) != 0 }
+}
+
+fn nt_unlock(h: isize, start: u64, len: u64) {
+    let mut o = ov(start);
+    unsafe { crate::win::UnlockFileEx(h, 0, len as u32, (len >> 32) as u32, (&mut o as *mut Overlapped).cast()) };
+}
+
+/// Take a lock; with `wait`, retry until it's free or a signal arrives (F_SETLKW / flock without LOCK_NB).
+fn take_lock(h: isize, start: u64, len: u64, excl: bool, wait: bool) -> Result<(), i64> {
+    loop {
+        if nt_try_lock(h, start, len, excl) {
+            LOCKS.lock().unwrap().push((h, start, len, excl));
+            return Ok(());
+        }
+        if !wait {
+            return Err(crate::syscall::EAGAIN);
+        }
+        if crate::signal::deliverable() {
+            return Err(crate::syscall::EINTR);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Drop [start, start+len) from our locks on `h`, keeping (re-locking) the parts outside it.
+/// Returns the pieces that were inside, so a failed type change can put them back.
+fn release(h: isize, start: u64, len: u64) -> Vec<(u64, u64, bool)> {
+    let end = start + len;
+    let mut locks = LOCKS.lock().unwrap();
+    let (mut keep, mut removed) = (Vec::new(), Vec::new());
+    for (lh, s, l, x) in locks.drain(..) {
+        if lh != h || s + l <= start || end <= s {
+            keep.push((lh, s, l, x));
+            continue;
+        }
+        nt_unlock(h, s, l);
+        removed.push((s.max(start), (s + l).min(end) - s.max(start), x));
+        if s < start && nt_try_lock(h, s, start - s, x) {
+            keep.push((h, s, start - s, x));
+        }
+        if s + l > end && nt_try_lock(h, end, s + l - end, x) {
+            keep.push((h, end, s + l - end, x));
+        }
+    }
+    *locks = keep;
+    removed
+}
+
+fn holds(h: isize, start: u64, len: u64) -> bool {
+    LOCKS.lock().unwrap().iter().any(|&(lh, s, l, _)| lh == h && s < start + len && start < s + l)
+}
+
+/// struct flock { short l_type, l_whence; off_t l_start, l_len; pid_t l_pid; }
+fn posix_lock(fd: u64, cmd: u64, arg: u64) -> R {
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
+    let (h, pos, size) = with(|fs| match fs.fd(fd)? {
+        Fd::File { f, .. } => {
+            let pos = f.stream_position().unwrap_or(0);
+            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            Ok((f.as_raw_handle() as isize, pos, size))
+        }
+        _ => Err(EBADF),
+    })?;
+    let p = arg as *mut u8;
+    let (ty, whence) = unsafe { (*(p as *const i16), *(p.add(2) as *const i16)) };
+    let (l_start, l_len) = unsafe { (*(p.add(8) as *const i64), *(p.add(16) as *const i64)) };
+    let base = match whence { 0 => 0, 1 => pos as i64, 2 => size as i64, _ => return Err(EINVAL) };
+    let (mut start, mut len) = (base + l_start, l_len);
+    if len < 0 {
+        start += len;
+        len = -len;
+    }
+    if start < 0 || start as u64 >= SHADOW || !(F_RDLCK..=F_UNLCK).contains(&ty) {
+        return Err(EINVAL);
+    }
+    let start = start as u64;
+    let len = if len == 0 { SHADOW - start } else { (len as u64).min(SHADOW - start) }; // 0 = to the end
+    let s = SHADOW + start;
+    match cmd {
+        5 | 36 => {
+            // F_GETLK: our own locks never conflict; otherwise probe the range.
+            if ty == F_UNLCK {
+                return Err(EINVAL);
+            }
+            let free = holds(h, s, len) || {
+                let ok = nt_try_lock(h, s, len, ty == F_WRLCK);
+                if ok {
+                    nt_unlock(h, s, len);
+                }
+                ok
+            };
+            unsafe {
+                if free {
+                    *(p as *mut i16) = F_UNLCK;
+                } else {
+                    *(p as *mut i16) = F_WRLCK; // ponytail: the holder's type and pid aren't known
+                    *(p.add(2) as *mut i16) = 0;
+                    *(p.add(8) as *mut i64) = start as i64;
+                    *(p.add(16) as *mut i64) = len as i64;
+                    *(p.add(24) as *mut i32) = -1;
+                }
+            }
+            Ok(0)
+        }
+        _ => {
+            let old = release(h, s, len);
+            if ty == F_UNLCK {
+                return Ok(0);
+            }
+            let r = take_lock(h, s, len, ty == F_WRLCK, cmd == 7 || cmd == 38);
+            if r.is_err() {
+                for (os, ol, ox) in old {
+                    let _ = take_lock(h, os, ol, ox, false); // keep what we had, as POSIX does
+                }
+            }
+            r.map(|_| 0)
+        }
+    }
+}
+
+/// fsync / fdatasync: flush the file to disk (databases rely on it for durability).
+pub fn fsync(fd: u64) -> R {
+    with(|fs| match fs.fd(fd)? {
+        Fd::File { f, .. } => f.sync_all().map(|_| 0).map_err(errno),
+        _ => Ok(0), // pipes, sockets, devices, directories: nothing to flush
+    })
+}
+
+/// flock(fd, LOCK_SH | LOCK_EX | LOCK_UN [| LOCK_NB]).
+pub fn flock(fd: u64, op: u64) -> R {
+    const LOCK_SH: u64 = 1;
+    const LOCK_EX: u64 = 2;
+    const LOCK_NB: u64 = 4;
+    const LOCK_UN: u64 = 8;
+    let h = with(|fs| match fs.fd(fd)? {
+        Fd::File { f, .. } => Ok(f.as_raw_handle() as isize),
+        Fd::Dir { .. } => Ok(-1), // directories: nothing to lock on NT here; succeed like an uncontended lock
+        _ => Err(EINVAL),
+    })?;
+    if h == -1 {
+        return Ok(0);
+    }
+    let old = release(h, FLOCK_AT, 1);
+    if op & LOCK_UN != 0 {
+        return Ok(0);
+    }
+    if op & (LOCK_SH | LOCK_EX) == 0 {
+        return Err(EINVAL);
+    }
+    let r = take_lock(h, FLOCK_AT, 1, op & LOCK_EX != 0, op & LOCK_NB == 0);
+    if r.is_err() {
+        for (os, ol, ox) in old {
+            let _ = take_lock(h, os, ol, ox, false);
+        }
+    }
+    r.map(|_| 0)
 }
 
 fn dup_fd(fd: &Fd) -> Result<Fd, i64> {
     Ok(match fd {
         Fd::Handle(h) => Fd::Handle(h.try_clone().map_err(errno)?),
+        Fd::Pipe(p) => Fd::Pipe(p.clone()),
         Fd::File { f, host } => Fd::File { f: f.try_clone().map_err(errno)?, host: host.clone() },
         Fd::Dir { guest, pos } => Fd::Dir { guest: guest.clone(), pos: *pos },
         Fd::Dev(d) => Fd::Dev(*d),
@@ -905,6 +1447,7 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
 
 pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
     match cmd {
+        5 | 6 | 7 | 36 | 37 | 38 => posix_lock(fd, cmd, arg), // F_GETLK/SETLK/SETLKW and the OFD variants
         0 => dup(fd, arg, false),    // F_DUPFD
         1030 => dup(fd, arg, true),  // F_DUPFD_CLOEXEC
         1 | 2 => with(|fs| {
@@ -921,10 +1464,12 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         4 => with(|fs| match fs.fd(fd)? {
             Fd::Socket(s) => { s.set_nonblocking(arg & O_NONBLOCK != 0); Ok(0) }
             Fd::Event(e) => { e.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
+            Fd::Pipe(p) => { p.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
             _ => Ok(0),
         }),
         3 => with(|fs| match fs.fd(fd)? {
             Fd::Socket(s) if s.nonblocking() => Ok(2 | O_NONBLOCK as i64),
+            Fd::Pipe(p) if p.nonblocking() => Ok(2 | O_NONBLOCK as i64),
             _ => Ok(2), // O_RDWR
         }),
         _ => Err(EINVAL),
@@ -944,7 +1489,7 @@ pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
         }
         Fd::Dir { pos, .. } if off == 0 && whence == 0 => { *pos = 0; Ok(0) }
         Fd::Dir { .. } => Err(EINVAL),
-        Fd::Handle(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) => Err(ESPIPE),
+        Fd::Handle(_) | Fd::Pipe(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) => Err(ESPIPE),
         Fd::Dev(_) => Ok(0),
     })
 }
@@ -983,7 +1528,18 @@ fn put_stat(buf: u64, s: [u64; 18]) -> R {
 
 pub fn fstat(fd: u64, buf: u64) -> R {
     let s = with(|fs| match fs.fd(fd)? {
-        Fd::File { host, .. } => stat_of(host),
+        // From the open handle, not the path: the file may have been renamed or deleted since (apt does
+        // both to its temp files), and Linux's fstat still answers.
+        Fd::File { f, host } => {
+            let m = f.metadata().map_err(errno)?;
+            let t = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).unwrap_or_default();
+            let mut s = [0u64; 18];
+            (s[0], s[1], s[2], s[3], s[6], s[7], s[8]) = (0x803, ino(host), 1, 0o100755, m.len(), 4096, m.len().div_ceil(512));
+            for i in [9, 11, 13] {
+                (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
+            }
+            Ok(s)
+        }
         Fd::Dir { guest, .. } => {
             let guest = guest.clone();
             stat_of(&fs.resolve("/", &guest, true)?.1)
@@ -996,6 +1552,11 @@ pub fn fstat(fd: u64, buf: u64) -> R {
             Ok(s)
         }
         Fd::Dev(d) => Ok(d.stat()),
+        Fd::Pipe(p) => {
+            let mut s = [0u64; 18];
+            (s[1], s[2], s[3], s[7]) = (p.raw() as u64, 1, 0o010600, 4096); // fifo
+            Ok(s)
+        }
         Fd::Socket(k) => {
             let mut s = [0u64; 18];
             (s[1], s[2], s[3], s[7]) = (k.s as u64, 1, 0o140777, 4096); // S_IFSOCK
@@ -1058,6 +1619,7 @@ fn proc_link(guest: &str) -> Option<String> {
                     Some(format!("/{}", rel.to_string_lossy().replace('\\', "/")))
                 }
                 Fd::Handle(_) => Some("pipe:[0]".into()),
+                Fd::Pipe(p) => Some(format!("pipe:[{}]", p.raw())),
                 Fd::Socket(k) => Some(format!("socket:[{}]", k.s)),
                 Fd::Epoll(_) => Some("anon_inode:[eventpoll]".into()),
                 Fd::Event(_) => Some("anon_inode:[eventfd]".into()),
@@ -1352,7 +1914,7 @@ fn resolve_stays_inside_rootfs() {
     write_link(&root.join("bin/sh"), "busybox").unwrap();
     write_link(&root.join("up"), "../../../..").unwrap();
     write_link(&root.join("loop"), "loop").unwrap();
-    let fs_ = Fs { root: root.clone(), upper: None, cwd: "/".into(), fds: vec![] };
+    let fs_ = Fs { root: root.clone(), upper: None, mounts: vec![], cwd: "/".into(), fds: vec![] };
     let r = |p: &str| fs_.resolve("/bin", p, true).map(|x| x.0);
     assert_eq!(r("sh"), Ok("/bin/busybox".into()));
     assert_eq!(r("/up/etc/passwd"), Ok("/etc/passwd".into()));
@@ -1371,7 +1933,7 @@ fn layer_never_touches_the_image() {
     fs::write(lower.join("etc/a.conf"), "image").unwrap();
     fs::write(lower.join("etc/conf.d/x"), "x").unwrap();
     fs::create_dir_all(&upper).unwrap();
-    let f = Fs { root: lower.clone(), upper: Some(upper.clone()), cwd: "/".into(), fds: vec![] };
+    let f = Fs { root: lower.clone(), upper: Some(upper.clone()), mounts: vec![], cwd: "/".into(), fds: vec![] };
     let c = |p: &str| comps_of(p);
     let names = |p: &str| { let mut v: Vec<String> = f.list(&c(p)).unwrap().into_iter().map(|e| e.0).collect(); v.sort(); v };
 

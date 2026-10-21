@@ -101,6 +101,17 @@ pub mod win {
         pub fn SetHandleInformation(h: isize, mask: u32, flags: u32) -> i32;
         pub fn CreatePipe(r: *mut isize, w: *mut isize, attr: *mut c_void, size: u32) -> i32;
         pub fn GetFileType(h: isize) -> u32;
+        pub fn LockFileEx(h: isize, flags: u32, reserved: u32, len_lo: u32, len_hi: u32, ov: *mut c_void) -> i32;
+        pub fn UnlockFileEx(h: isize, reserved: u32, len_lo: u32, len_hi: u32, ov: *mut c_void) -> i32;
+        pub fn MapViewOfFileEx(map: isize, access: u32, hi: u32, lo: u32, len: usize, base: *mut c_void) -> *mut c_void;
+        pub fn UnmapViewOfFile(base: *mut c_void) -> i32;
+        pub fn FlushViewOfFile(base: *const c_void, len: usize) -> i32;
+        pub fn CreateNamedPipeW(name: *const u16, mode: u32, pipe_mode: u32, instances: u32, out: u32, inp: u32, timeout: u32, attr: *mut c_void) -> isize;
+        pub fn CreateFileW(name: *const u16, access: u32, share: u32, attr: *mut c_void, disposition: u32, flags: u32, template: isize) -> isize;
+        pub fn GetOverlappedResult(h: isize, ov: *mut c_void, done: *mut u32, wait: i32) -> i32;
+        pub fn CancelIoEx(h: isize, ov: *mut c_void) -> i32;
+        pub fn GetPhysicallyInstalledSystemMemory(kb: *mut u64) -> i32;
+        pub fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
         pub fn CreateFileMappingW(file: isize, attr: *mut c_void, prot: u32, hi: u32, lo: u32, name: *const u16) -> isize;
         pub fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> isize;
         pub fn MapViewOfFile(map: isize, access: u32, hi: u32, lo: u32, len: usize) -> *mut c_void;
@@ -165,12 +176,41 @@ struct JobLimits {
 const _: () = assert!(size_of::<JobLimits>() == 144);
 
 /// Self-confinement: memory cap, and everything we spawn dies with us.
+/// Per-process memory cap (commit charge): `lx run -m`, carried to every lx process of the container in
+/// LX_MEMORY; by default the machine's physical RAM. NT commits on mmap where Linux overcommits (OpenBLAS
+/// reserves 32 MB per CPU up front), so a cap much below RAM breaks ordinary programs; RAM still keeps a
+/// runaway container from taking more than the machine has.
+fn memory_limit() -> usize {
+    if let Some(v) = env::var("LX_MEMORY").ok().and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    let mut kb = 0u64;
+    let ram = if unsafe { win::GetPhysicallyInstalledSystemMemory(&mut kb) } != 0 { kb << 10 } else { 4 << 30 };
+    ram as usize
+}
+
+/// `-m 512m`, `2g`, `1073741824`: bytes (k/m/g suffixes, base 1024).
+fn parse_memory(v: &str) -> Result<String, String> {
+    let v = v.to_ascii_lowercase();
+    let (num, mult) = match v.chars().last() {
+        Some('k') => (&v[..v.len() - 1], 1u64 << 10),
+        Some('m') => (&v[..v.len() - 1], 1 << 20),
+        Some('g') => (&v[..v.len() - 1], 1 << 30),
+        _ => (&v[..], 1),
+    };
+    let n: u64 = num.parse().map_err(|_| format!("bad -m {v:?}: want e.g. 512m or 2g"))?;
+    if n * mult < 64 << 20 {
+        return Err("-m: at least 64m".into());
+    }
+    Ok((n * mult).to_string())
+}
+
 fn enter_job() -> Result<(), String> {
     const LIMIT_PROCESS_MEMORY: u32 = 0x100;
     const KILL_ON_JOB_CLOSE: u32 = 0x2000;
     let limits = JobLimits {
         flags: LIMIT_PROCESS_MEMORY | KILL_ON_JOB_CLOSE,
-        process_memory: 512 << 20,
+        process_memory: memory_limit(),
         ..Default::default()
     };
     unsafe {
@@ -187,12 +227,36 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
        lx run [-p [ip:]hostport:port[/udp]]... <image> [command args...]
                                              runs the image's entrypoint/cmd, or the given command;
                                              -p publishes a container port (others stay on localhost)
+                                             -v C:\\data:/data[:ro] mounts a host folder (repeatable)
+                                             -m 2g caps each process's memory (default: the machine's RAM)
        lx ps                                 running containers
        lx stop <pid>                         SIGTERM, then SIGKILL after 10s
        lx kill <pid> [SIGNAL]                default TERM
        lx <rootfs-dir> <command> [args...]   run a command in an unpacked rootfs
        lx unpack <layer.tar[.gz]> <rootfs-dir>";
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// `-v HOST:/guest[:ro|:rw]`. HOST may be a Windows path with a drive letter (`C:\data:/data`), so the
+/// guest part starts at the first ":/" after it. The host folder is created if missing, like Docker.
+fn parse_volume(spec: &str) -> Result<(std::path::PathBuf, String, bool), String> {
+    let bad = || format!("bad -v {spec:?}: want HOSTPATH:/container/path[:ro]");
+    let i = spec.get(2..).and_then(|s| s.find(":/")).map(|i| i + 2).ok_or_else(bad)?;
+    let (host, guest) = (&spec[..i], &spec[i + 1..]);
+    let (guest, ro) = match guest.rsplit_once(':') {
+        Some((g, "ro")) => (g, true),
+        Some((g, "rw")) => (g, false),
+        _ => (guest, false),
+    };
+    if host.is_empty() || !guest.starts_with('/') || guest.contains(':') {
+        return Err(bad());
+    }
+    std::fs::create_dir_all(host).map_err(|e| format!("-v {host}: {e}"))?;
+    let host = std::fs::canonicalize(host).map_err(|e| format!("-v {host}: {e}"))?;
+    if !host.is_dir() {
+        return Err(format!("-v {}: not a folder", host.display()));
+    }
+    Ok((host, guest.to_string(), ro))
+}
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -236,8 +300,14 @@ fn run() -> Result<(), String> {
     if let [cmd, rest @ ..] = args.as_slice() && cmd == "run" {
         // Flags before the image: -p/--publish [hostip:]hostport:containerport[/udp], repeatable.
         let (mut rest, mut ports) = (rest, Vec::new());
-        while let [flag, value, more @ ..] = rest && (flag == "-p" || flag == "--publish") {
-            ports.push(net::parse_publish(value)?);
+        let mut volumes = Vec::new();
+        while let [flag, value, more @ ..] = rest {
+            match flag.as_str() {
+                "-p" | "--publish" => ports.push(net::parse_publish(value)?),
+                "-v" | "--volume" => volumes.push(parse_volume(value)?),
+                "-m" | "--memory" => unsafe { env::set_var("LX_MEMORY", parse_memory(value)?) },
+                _ => break,
+            }
             rest = more;
         }
         let [image, rest @ ..] = rest else { return Err(USAGE.into()) };
@@ -257,6 +327,10 @@ fn run() -> Result<(), String> {
         let (resolv, hosts) = net::dns_files();
         let _ = fs::write_guest_file("/etc/resolv.conf", resolv.as_bytes());
         let _ = fs::write_guest_file("/etc/hosts", hosts.as_bytes());
+        let _ = fs::mkdir_guest("/dev/shm"); // POSIX shared memory and semaphores (glibc's sem_open) live here
+        for (host, guest, ro) in volumes {
+            fs::add_mount(&guest, host, ro).map_err(|_| format!("-v: can't mount at {guest}"))?;
+        }
         fs::set_cwd(&c.workdir).map_err(|_| format!("WorkingDir {} not found in image", c.workdir))?;
         proc::register_container(&format!("{image}  {}", c.argv.join(" ")));
         return start(&c.argv[0], c.argv.clone(), c.env);
