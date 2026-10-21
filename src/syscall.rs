@@ -868,6 +868,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         31 => shmctl(a[0], a[1], a[2]),
         25 => mremap(a[0], a[1], a[2], a[3]),
         26 => msync(a[0], a[1]),
+        27 => mincore(a[0], a[1], a[2]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
@@ -1668,6 +1669,25 @@ fn getcpu(cpu: u64, node: u64) -> R {
     }
     if node != 0 {
         unsafe { *(node as *mut u32) = 0 };
+    }
+    Ok(0)
+}
+/// mincore: one byte per page, 1 where committed. ENOMEM if part of the range isn't mapped at all,
+/// which callers use to probe for holes (grep's stack-limit scan loops until it sees one).
+fn mincore(addr: u64, len: u64, vec: u64) -> R {
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_FREE: u32 = 0x10000;
+    let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
+    let mut p = start;
+    while p < end {
+        let mut m = MemoryBasicInformation::default();
+        if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 || m.state == MEM_FREE {
+            return Err(ENOMEM);
+        }
+        let top = (m.base as u64 + m.region_size as u64).min(end);
+        let n = ((top - p) / 4096) as usize;
+        unsafe { std::ptr::write_bytes((vec + (p - start) / 4096) as *mut u8, (m.state == MEM_COMMIT) as u8, n) };
+        p = top;
     }
     Ok(0)
 }
