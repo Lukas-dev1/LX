@@ -930,6 +930,8 @@ fn dispatch(c: &mut Context) -> i64 {
         229 => clock_getres(a[1]),
         201 => time(a[0]),
         221 => Ok(0),                  // fadvise64: advice only
+        237 | 238 => Ok(0),            // mbind, set_mempolicy: NUMA placement has no meaning here; accept it
+        239 => Err(ENOSYS),            // get_mempolicy: callers treat this as "no NUMA" 
         188..=199 => Err(95),          // *xattr: EOPNOTSUPP, like a filesystem without extended attributes
         435 => Err(ENOSYS),            // clone3: glibc falls back to clone, which we have
         436 => fs::close_range(a[0], a[1], a[2]),
