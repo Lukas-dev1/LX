@@ -10,6 +10,29 @@ use std::sync::Mutex;
 pub const SIGCHLD: u64 = 17;
 const SA_NODEFER: u64 = 0x4000_0000;
 const SA_RESETHAND: u64 = 0x8000_0000;
+const SA_ONSTACK: u64 = 0x0800_0000;
+const SS_ONSTACK: u64 = 1;
+const SS_DISABLE: u64 = 2;
+
+/// sigaltstack(ss, old_ss), per thread. Go requires it: goroutine stacks are too small for signal frames.
+/// stack_t is { void *ss_sp; int ss_flags; size_t ss_size; }.
+pub fn sigaltstack(ss: u64, old: u64, rsp: u64) -> R {
+    let t = crate::syscall::ts();
+    let on = t.altstack.is_some_and(|(b, n)| (b..b + n).contains(&rsp));
+    if old != 0 {
+        let (b, n) = t.altstack.unwrap_or((0, 0));
+        let flags = if t.altstack.is_none() { SS_DISABLE } else if on { SS_ONSTACK } else { 0 };
+        unsafe { *(old as *mut [u64; 3]) = [b, flags, n] };
+    }
+    if ss != 0 {
+        if on {
+            return Err(crate::syscall::EPERM);
+        }
+        let [b, flags, n] = unsafe { *(ss as *const [u64; 3]) };
+        t.altstack = if flags as u32 as u64 & SS_DISABLE != 0 { None } else { Some((b, n)) };
+    }
+    Ok(0)
+}
 
 #[derive(Clone, Copy)]
 struct Action {
@@ -142,7 +165,11 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
             handler => {
                 let restore_mask = s.suspended_mask.take().unwrap_or(s.blocked);
                 // Below the red zone: [return address = restorer][ucontext][siginfo].
-                let info = (c.rsp - 128 - SI_SIZE) & !15;
+                // SA_ONSTACK handlers start at the top of the thread's alternate stack, unless already on it.
+                let t = crate::syscall::ts();
+                let alt = t.altstack.filter(|&(b, n)| a.flags & SA_ONSTACK != 0 && !(b..b + n).contains(&c.rsp));
+                let top = alt.map(|(b, n)| b + n).unwrap_or(c.rsp - 128); // else below the red zone
+                let info = (top - SI_SIZE) & !15;
                 let uc = (info - UC_SIZE) & !15;
                 let sp = uc - 8; // handler entry: rsp % 16 == 8, as after a call
                 let mut frame = vec![0u8; (info + SI_SIZE - sp) as usize];
@@ -159,8 +186,17 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
                 }
                 put(uc + UC_MCONTEXT + 8 * 17, flags);
                 put(uc + UC_SIGMASK, restore_mask);
+                if let Some((b, n)) = t.altstack {
+                    // uc_stack describes the alternate stack (Go reads it back).
+                    let on_alt = alt.is_some() || (b..b + n).contains(&c.rsp);
+                    put(uc + 16, b);
+                    put(uc + 24, if on_alt { SS_ONSTACK } else { 0 });
+                    put(uc + 32, n);
+                } else {
+                    put(uc + 24, SS_DISABLE);
+                }
                 if crate::syscall::debug() {
-                    eprintln!("[lx] signal {sig}: handler {handler:#x}, frame {sp:#x}, resume {:#x}", c.rip);
+                    crate::syscall::dlog(format_args!("signal {sig}: handler {handler:#x}, frame {sp:#x}, interrupted rip {:#x} rsp {:#x}, alt {:?}", c.rip, c.rsp, alt));
                 }
                 (c.rsp, c.rip, c.rdi, c.rsi, c.rdx) = (sp, handler, sig, info, uc);
                 s.blocked |= (a.mask | if a.flags & SA_NODEFER == 0 { bit(sig) } else { 0 }) & !UNBLOCKABLE;
@@ -183,7 +219,7 @@ pub fn sigreturn(c: &mut Context) {
     }
     c.eflags = saved[17] as u32;
     if crate::syscall::debug() {
-        eprintln!("[lx] sigreturn to {:#x} (rsp {:#x})", c.rip, c.rsp);
+        crate::syscall::dlog(format_args!("sigreturn to rip {:#x} rsp {:#x}", c.rip, c.rsp));
     }
     S.lock().unwrap().blocked = unsafe { *((uc + UC_SIGMASK) as *const u64) } & !UNBLOCKABLE;
 }

@@ -117,37 +117,48 @@ pub fn receive_fork(state: &str, parent: &str, ready: &str) -> Result<([u64; 18]
     Ok((regs, stack))
 }
 
-pub fn clone(c: &mut Context, flags: u64, stack: u64) -> R {
+/// clone(flags, stack, ptid, ctid, tls) (x86-64 argument order).
+pub fn clone(c: &mut Context, flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) -> R {
     const CLONE_THREAD: u64 = 0x10000;
     if flags & CLONE_THREAD != 0 {
-        eprintln!("[lx] clone(CLONE_THREAD): threads not implemented yet");
-        return Err(EAGAIN);
+        return crate::thread::clone_thread(c, flags, stack, ptid, ctid, tls);
     }
-    // CLONE_VM|CLONE_VFORK (posix_spawn) works as a fork: the child only runs until it execs.
+    // CLONE_VM|CLONE_VFORK (posix_spawn, Go's os/exec) works as a fork: the child only runs until it execs.
+    // ponytail: other threads keep running while the child copies memory, so the copy can be torn;
+    // harmless for a child that execs right away, which is what multithreaded programs do.
     fork(c, stack)
 }
 
 pub fn wait4(pid: i64, status: u64, options: u64) -> R {
     const WNOHANG: u64 = 1;
-    let mut kids = CHILDREN.lock().unwrap();
-    // ponytail: process groups (pid 0 or < -1) are treated as "any child".
-    let idx: Vec<usize> = (0..kids.len()).filter(|&i| pid <= 0 || kids[i].pid as i64 == pid).take(64).collect();
-    if idx.is_empty() {
-        return Err(ECHILD);
+    loop {
+        // Wait on our own duplicates with the lock released: other threads keep making syscalls,
+        // and one of them may reap (and close) a child meanwhile.
+        let waits: Vec<(u32, OwnedHandle)> = {
+            let kids = CHILDREN.lock().unwrap();
+            // ponytail: process groups (pid 0 or < -1) are treated as "any child".
+            kids.iter().filter(|k| pid <= 0 || k.pid as i64 == pid).take(64)
+                .filter_map(|k| k.process.try_clone().ok().map(|h| (k.pid, h))).collect()
+        };
+        if waits.is_empty() {
+            return Err(ECHILD);
+        }
+        let hs: Vec<isize> = waits.iter().map(|(_, h)| h.as_raw_handle() as isize).collect();
+        let timeout = if options & WNOHANG != 0 { 0 } else { u32::MAX };
+        let r = unsafe { WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), 0, timeout) } as usize;
+        if r >= hs.len() {
+            return Ok(0); // WAIT_TIMEOUT under WNOHANG
+        }
+        let mut kids = CHILDREN.lock().unwrap();
+        let Some(i) = kids.iter().position(|k| k.pid == waits[r].0) else { continue }; // reaped elsewhere
+        let kid = kids.remove(i);
+        let mut code = 0u32;
+        unsafe { GetExitCodeProcess(kid.process.as_raw_handle() as isize, &mut code) };
+        if status != 0 {
+            unsafe { *(status as *mut i32) = ((code & 0xff) << 8) as i32 }; // WIFEXITED, WEXITSTATUS = code
+        }
+        return Ok(kid.pid as i64);
     }
-    let hs: Vec<isize> = idx.iter().map(|&i| kids[i].process.as_raw_handle() as isize).collect();
-    let timeout = if options & WNOHANG != 0 { 0 } else { u32::MAX };
-    let r = unsafe { WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), 0, timeout) } as usize;
-    if r >= hs.len() {
-        return Ok(0); // WAIT_TIMEOUT under WNOHANG
-    }
-    let kid = kids.remove(idx[r]);
-    let mut code = 0u32;
-    unsafe { GetExitCodeProcess(kid.process.as_raw_handle() as isize, &mut code) };
-    if status != 0 {
-        unsafe { *(status as *mut i32) = ((code & 0xff) << 8) as i32 }; // WIFEXITED, WEXITSTATUS = code
-    }
-    Ok(kid.pid as i64)
 }
 
 /// Raise SIGCHLD for children that exited since we last looked (cheap: a zero-timeout wait each).
@@ -231,6 +242,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
         eprintln!("[lx] execve: {e}");
         EAGAIN
     })?;
+    crate::thread::stop_others(); // exec replaces the whole image: no other threads survive it
     fs::close_all(); // we only wait from here on; don't hold pipe ends open
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
     exit(code as u64)

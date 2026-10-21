@@ -5,6 +5,7 @@ mod image;
 mod proc;
 mod signal;
 mod syscall;
+mod thread;
 
 use std::ffi::c_void;
 use std::{env, path::Path, process};
@@ -16,6 +17,8 @@ pub mod win {
     pub const MEM_RESERVE: u32 = 0x2000;
     pub const MEM_COMMIT_RESERVE: u32 = 0x3000;
     pub const MEM_DECOMMIT: u32 = 0x4000;
+    pub const MEM_FREE: u32 = 0x10000;
+    pub const MEM_RELEASE: u32 = 0x8000;
     pub const PAGE_READWRITE: u32 = 0x04;
 
     #[repr(C)]
@@ -96,6 +99,27 @@ pub mod win {
         pub fn PeekNamedPipe(h: isize, buf: *mut c_void, len: u32, read: *mut u32, avail: *mut u32, left: *mut u32) -> i32;
         pub fn DuplicateHandle(sp: isize, h: isize, tp: isize, out: *mut isize, access: u32, inherit: i32, opts: u32) -> i32;
         pub fn ReadProcessMemory(p: isize, from: *const c_void, to: *mut c_void, len: usize, done: *mut usize) -> i32;
+        pub fn TlsAlloc() -> u32;
+        pub fn TlsGetValue(idx: u32) -> *mut c_void;
+        pub fn TlsSetValue(idx: u32, v: *mut c_void) -> i32;
+        pub fn CreateThread(
+            attr: *mut c_void, stack: usize, start: unsafe extern "system" fn(*mut c_void) -> u32,
+            param: *mut c_void, flags: u32, tid: *mut u32,
+        ) -> isize;
+        pub fn ResumeThread(h: isize) -> u32;
+        pub fn ExitThread(code: u32) -> !;
+        pub fn TerminateThread(h: isize, code: u32) -> i32;
+        pub fn GetCurrentThreadId() -> u32;
+        pub fn SwitchToThread() -> i32;
+        pub fn FlushProcessWriteBuffers();
+        pub fn GetModuleHandleW(name: *const u16) -> isize;
+    }
+    #[link(name = "synchronization")]
+    unsafe extern "system" {
+        /// The futex of Windows: sleep while *addr == *compare, atomically with respect to WakeByAddress*.
+        pub fn WaitOnAddress(addr: *const c_void, compare: *const c_void, size: usize, ms: u32) -> i32;
+        pub fn WakeByAddressSingle(addr: *const c_void);
+        pub fn WakeByAddressAll(addr: *const c_void);
     }
     #[link(name = "bcrypt")]
     unsafe extern "system" {

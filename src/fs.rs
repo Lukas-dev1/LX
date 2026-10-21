@@ -183,7 +183,7 @@ impl Fs {
     }
 
     fn dir_of(&self, dirfd: u64) -> Result<String, i64> {
-        if dirfd == AT_FDCWD {
+        if dirfd as i32 == AT_FDCWD as i32 { // int argument: only the low 32 bits count (Go zero-extends)
             return Ok(self.cwd.clone());
         }
         match self.fds.get(dirfd as usize) {
@@ -301,7 +301,10 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
 /// Drop every fd (closing the handles). Used by a process that has exec'd and only waits now,
 /// so it doesn't hold pipe ends open.
 pub fn close_all() {
-    with(|fs| fs.fds.clear());
+    // try_lock: after execve stopped the other threads, one of them may have died holding this lock.
+    if let Ok(mut g) = FS.try_lock() && let Some(fs) = g.as_mut() {
+        fs.fds.clear();
+    }
 }
 
 pub fn pipe2(fds: u64, flags: u64) -> R {

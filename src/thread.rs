@@ -1,0 +1,198 @@
+//! Guest threads: clone(CLONE_THREAD) is a Windows thread in this process that runs guest code, with
+//! its own ThreadState (FS base, trampoline slots). futex maps onto WaitOnAddress/WakeByAddress*,
+//! which compare-and-sleep atomically just like FUTEX_WAIT.
+use crate::syscall::{self, R, EAGAIN, EINVAL, ENOSYS};
+use crate::win::*;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+
+const ETIMEDOUT: i64 = 110;
+
+/// Windows id of the thread that started the guest: Linux makes the main thread's tid equal the pid.
+static MAIN_TID: AtomicU32 = AtomicU32::new(0);
+/// Running guest threads; the last one out ends the process.
+static LIVE: AtomicU64 = AtomicU64::new(1);
+/// Other guest threads (tid, handle), so execve can stop them like Linux does.
+static THREADS: Mutex<Vec<(u32, isize)>> = Mutex::new(Vec::new());
+
+pub fn set_main() {
+    MAIN_TID.store(unsafe { GetCurrentThreadId() }, Relaxed);
+}
+
+pub fn gettid() -> R {
+    let me = unsafe { GetCurrentThreadId() };
+    if me == MAIN_TID.load(Relaxed) { crate::proc::getpid() } else { Ok(me as i64) }
+}
+
+struct Init {
+    regs: [u64; 18],
+    fs: u64,
+    clear_tid: u64,
+}
+
+/// clone(CLONE_VM | CLONE_THREAD | ...): run the child on a new Windows thread with the parent's
+/// registers, rax = 0, and the stack (and TLS) the caller set up.
+pub fn clone_thread(c: &Context, flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) -> R {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_SETTLS: u64 = 0x80000;
+    const CLONE_PARENT_SETTID: u64 = 0x100000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+    const CLONE_CHILD_SETTID: u64 = 0x1000000;
+    if flags & CLONE_VM == 0 || stack == 0 {
+        return Err(EINVAL);
+    }
+    let next = c.rip + 2;
+    let regs = [0, next, c.rdx, c.rbx, stack, c.rbp, c.rsi, c.rdi, c.r8, c.r9, c.r10, c.eflags as u64,
+                c.r12, c.r13, c.r14, c.r15, next, c.eflags as u64];
+    let init = Box::new(Init {
+        regs,
+        fs: if flags & CLONE_SETTLS != 0 { tls } else { syscall::ts().fs },
+        clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
+    });
+    let mut tid = 0u32;
+    // Small host stack: the thread switches to the guest's stack right away.
+    let p = Box::into_raw(init);
+    let h = unsafe { CreateThread(std::ptr::null_mut(), 64 << 10, thread_main, p as *mut _, 0x4 | 0x10000, &mut tid) };
+    if h == 0 {
+        drop(unsafe { Box::from_raw(p) });
+        return Err(EAGAIN);
+    }
+    // Same address space, so the parent can write both tids before the child runs.
+    if flags & CLONE_PARENT_SETTID != 0 {
+        unsafe { *(ptid as *mut u32) = tid };
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        unsafe { *(ctid as *mut u32) = tid };
+    }
+    LIVE.fetch_add(1, Relaxed);
+    THREADS.lock().unwrap().push((tid, h));
+    if syscall::debug() {
+        syscall::dlog(format_args!("clone thread -> t{tid}: rip {next:#x} rsp {stack:#x} fs {:#x} flags {flags:#x}", unsafe { (*p).fs }));
+    }
+    unsafe { ResumeThread(h) }; // created CREATE_SUSPENDED (0x4), stack size is a reservation (0x10000)
+    Ok(tid as i64)
+}
+
+unsafe extern "system" fn thread_main(p: *mut std::ffi::c_void) -> u32 {
+    let init = unsafe { Box::from_raw(p as *mut Init) };
+    let t = syscall::ts();
+    t.fs = init.fs;
+    t.clear_tid = init.clear_tid;
+    let (lo, hi) = syscall::alloc_containing(init.regs[4] - 1).unwrap_or((init.regs[4] - (1 << 20), init.regs[4]));
+    syscall::enter(init.regs, lo, hi)
+}
+
+/// SYS_exit: end this thread. Wakes pthread_join through clear_tid; the last thread ends the process.
+pub fn exit(code: u64) -> ! {
+    let t = syscall::ts();
+    if t.clear_tid != 0 {
+        unsafe {
+            *(t.clear_tid as *mut u32) = 0;
+            WakeByAddressAll(t.clear_tid as *const _);
+        }
+    }
+    if LIVE.fetch_sub(1, Relaxed) == 1 {
+        crate::proc::exit(code);
+    }
+    let me = unsafe { GetCurrentThreadId() };
+    THREADS.lock().unwrap().retain(|&(tid, h)| {
+        if tid == me {
+            unsafe { CloseHandle(h) };
+        }
+        tid != me
+    });
+    unsafe { ExitThread(code as u32) }
+}
+
+/// execve replaces the whole process image: stop every other guest thread first (Linux kills them).
+pub fn stop_others() {
+    let me = unsafe { GetCurrentThreadId() };
+    // ponytail: TerminateThread can leave a lock of ours held by the victim; execve only spawns and waits
+    // afterwards, and uses try_lock where it touches shared state.
+    if let Ok(threads) = THREADS.try_lock() {
+        for &(tid, h) in threads.iter().filter(|(tid, _)| *tid != me) {
+            let _ = tid;
+            unsafe { TerminateThread(h, 0) };
+        }
+    }
+}
+
+/// futex(2): the subset libc and Go use. Waking reports 0 woken (callers don't rely on the count).
+pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
+    const FUTEX_CLOCK_REALTIME: u64 = 256;
+    let cmd = op & 0x7f; // without FUTEX_PRIVATE_FLAG / CLOCK_REALTIME
+    let cur = || unsafe { std::ptr::read_volatile(uaddr as *const u32) };
+    match cmd {
+        0 | 9 => {
+            // FUTEX_WAIT (relative timeout), FUTEX_WAIT_BITSET (absolute). ponytail: bitsets ignored.
+            let expect = val as u32;
+            if cur() != expect {
+                return Err(EAGAIN);
+            }
+            let ms = if timeout == 0 {
+                u32::MAX
+            } else {
+                let [s, ns] = unsafe { *(timeout as *const [u64; 2]) };
+                let mut want = std::time::Duration::new(s, ns as u32);
+                if cmd == 9 {
+                    let (s, ns) = syscall::now(if op & FUTEX_CLOCK_REALTIME != 0 { 0 } else { 1 });
+                    want = want.saturating_sub(std::time::Duration::new(s, ns as u32));
+                }
+                want.as_millis().min(u32::MAX as u128 - 1) as u32
+            };
+            let woke = unsafe { WaitOnAddress(uaddr as *const _, &expect as *const u32 as *const _, 4, ms) };
+            if woke == 0 && unsafe { GetLastError() } == 1460 { Err(ETIMEDOUT) } else { Ok(0) } // ERROR_TIMEOUT
+        }
+        1 | 10 => {
+            // FUTEX_WAKE, FUTEX_WAKE_BITSET. Waking more than asked is a spurious wakeup, which is allowed.
+            if val == 1 {
+                unsafe { WakeByAddressSingle(uaddr as *const _) };
+            } else if val > 1 {
+                unsafe { WakeByAddressAll(uaddr as *const _) };
+            }
+            Ok(0)
+        }
+        3 | 4 => {
+            // FUTEX_REQUEUE / FUTEX_CMP_REQUEUE: wake everyone instead of moving them; they re-check.
+            if cmd == 4 && cur() != val3 as u32 {
+                return Err(EAGAIN);
+            }
+            unsafe { WakeByAddressAll(uaddr as *const _) };
+            Ok(0)
+        }
+        _ => Err(ENOSYS),
+    }
+}
+
+/// membarrier: FlushProcessWriteBuffers is exactly "a memory barrier on every thread of this process".
+pub fn membarrier(cmd: u64) -> R {
+    const QUERY: u64 = 0;
+    const GLOBAL: u64 = 1;
+    const PRIVATE_EXPEDITED: u64 = 8;
+    const REGISTER_PRIVATE_EXPEDITED: u64 = 16;
+    match cmd {
+        QUERY => Ok((GLOBAL | PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED) as i64),
+        GLOBAL | PRIVATE_EXPEDITED => {
+            unsafe { FlushProcessWriteBuffers() };
+            Ok(0)
+        }
+        REGISTER_PRIVATE_EXPEDITED => Ok(0),
+        _ => Err(EINVAL),
+    }
+}
+
+pub fn sched_yield() -> R {
+    unsafe { SwitchToThread() };
+    Ok(0)
+}
+
+/// sched_getaffinity: all CPUs (up to 64). Go sizes its scheduler from this.
+pub fn sched_getaffinity(len: u64, mask: u64) -> R {
+    if len < 8 {
+        return Err(EINVAL);
+    }
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64);
+    let bits = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+    unsafe { *(mask as *mut u64) = bits };
+    Ok(8)
+}

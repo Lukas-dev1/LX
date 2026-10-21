@@ -4,7 +4,7 @@
 //! - NT resets FS base to 0 on context switches, so a guest `%fs:` access faults (low/kernel address).
 //!   We bounce through `fs_tramp`, which reloads FS base in user mode and resumes the faulting instruction.
 //!   Every return to the guest goes through the trampoline, because NtContinue also loses FS base.
-use crate::{fs, proc, signal};
+use crate::{fs, proc, signal, thread};
 use crate::win::*;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -12,6 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Ok(value) or Err(positive errno); the guest sees -errno.
 pub type R = Result<i64, i64>;
+pub const EPERM: i64 = 1;
 pub const ESRCH: i64 = 3;
 pub const EINTR: i64 = 4;
 pub const ENXIO: i64 = 6;
@@ -39,11 +40,51 @@ pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
 pub const ENOENT: i64 = 2;
 
-// ponytail: one guest thread, so plain globals. Move to TEB TLS slots (gs:[0x1480+8*i]) when clone() lands.
+/// Per guest thread: what the trampolines need (fixed offsets, read from assembly) plus Linux thread state.
+#[repr(C)]
+pub struct ThreadState {
+    /// Guest FS base (arch_prctl / CLONE_SETTLS). Offset 0.
+    pub fs: u64,
+    /// Where lx_fs_tramp jumps. Offset 8.
+    resume: u64,
+    /// Pending signal frame for lx_sig_tramp: length at 16, bytes from 24.
+    frame_len: u64,
+    frame: [u8; signal::FRAME_MAX],
+    /// Guest stack bounds, published in the TEB because our handler code runs on the guest stack
+    /// (big frames, e.g. __chkstk inside CreateProcess, probe against them). Forked children reuse them.
+    pub stack: (u64, u64),
+    /// set_tid_address / CLONE_CHILD_CLEARTID: zeroed and futex-woken when the thread exits.
+    pub clear_tid: u64,
+    /// sigaltstack: (base, size), or None when disabled.
+    pub altstack: Option<(u64, u64)>,
+    /// Our own stack for handling this thread's traps (top), and whether we're on it right now.
+    host_stack: u64,
+    on_host: bool,
+}
+
+const _: () = assert!(std::mem::offset_of!(ThreadState, resume) == 8);
+const _: () = assert!(std::mem::offset_of!(ThreadState, frame_len) == 16);
+const _: () = assert!(std::mem::offset_of!(ThreadState, frame) == 24);
+
+/// TEB offset of our TLS slot (gs:[0x1480 + 8*index]); the trampolines load the ThreadState pointer from it.
 #[unsafe(no_mangle)]
-static LX_GUEST_FS: AtomicU64 = AtomicU64::new(0);
-#[unsafe(no_mangle)]
-static LX_RESUME_RIP: AtomicU64 = AtomicU64::new(0);
+static LX_TLS_OFF: AtomicU64 = AtomicU64::new(0);
+static TLS_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// This thread's state, created on first use.
+pub fn ts() -> &'static mut ThreadState {
+    let idx = TLS_INDEX.load(Relaxed) as u32;
+    let p = unsafe { TlsGetValue(idx) } as *mut ThreadState;
+    if !p.is_null() {
+        return unsafe { &mut *p };
+    }
+    let st = Box::leak(Box::new(ThreadState {
+        fs: 0, resume: 0, frame_len: 0, frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None,
+        host_stack: 0, on_host: false,
+    }));
+    unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
+    st
+}
 static START: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Guest code ranges and the patched syscall sites inside them (sorted).
@@ -53,18 +94,22 @@ struct Code {
 }
 static CODE: Mutex<Code> = Mutex::new(Code { regions: Vec::new(), sites: Vec::new() });
 
-// Clobbers nothing the guest can see: skips the 128-byte red zone, touches only rax (restored).
-// wrfsbase is emitted as bytes so we don't need the fsgsbase target feature.
+// Clobbers nothing the guest can see: skips the 128-byte red zone, saves rax, and leaves flags alone.
+// The resume address is pushed, then jumped to from just below the restored rsp (nothing writes a
+// thread's user stack asynchronously). wrfsbase is bytes so we don't need the fsgsbase target feature.
 std::arch::global_asm!(
     ".globl lx_fs_tramp",
     "lx_fs_tramp:",
     "lea rsp, [rsp - 128]",
     "push rax",
-    "mov rax, qword ptr [rip + LX_GUEST_FS]",
+    "mov rax, qword ptr [rip + LX_TLS_OFF]",
+    "mov rax, qword ptr gs:[rax]",        // ThreadState*
+    "push qword ptr [rax + 8]",           // resume
+    "mov rax, qword ptr [rax]",           // fs
     ".byte 0xf3, 0x48, 0x0f, 0xae, 0xd0", // wrfsbase rax
-    "pop rax",
-    "lea rsp, [rsp + 128]",
-    "jmp qword ptr [rip + LX_RESUME_RIP]",
+    "mov rax, qword ptr [rsp + 8]",
+    "lea rsp, [rsp + 144]",
+    "jmp qword ptr [rsp - 144]",
 );
 // Enter or resume the guest with a full register set: [rax rcx rdx rbx rsp rbp rsi rdi r8..r15 rip rflags].
 // Flags are restored first (on our stack), then plain movs (which leave flags alone), and the jump goes
@@ -74,8 +119,10 @@ std::arch::global_asm!(
     "lx_resume:",
     "push qword ptr [rcx + 17*8]",
     "popfq",
-    "mov rax, qword ptr [rcx + 16*8]",
-    "mov qword ptr [rip + LX_RESUME_RIP], rax",
+    "mov rax, qword ptr [rip + LX_TLS_OFF]",
+    "mov rax, qword ptr gs:[rax]",        // ThreadState*
+    "mov rdx, qword ptr [rcx + 16*8]",
+    "mov qword ptr [rax + 8], rdx",       // resume = rip
     "mov rax, qword ptr [rcx + 0*8]",
     "mov rdx, qword ptr [rcx + 2*8]",
     "mov rbx, qword ptr [rcx + 3*8]",
@@ -99,13 +146,9 @@ unsafe extern "C" {
     fn lx_resume(regs: *const [u64; 18]) -> !;
 }
 
-/// Guest stack bounds, published in the TEB because our handler code runs on the guest stack
-/// (big frames, e.g. __chkstk inside CreateProcess, probe against them). Forked children reuse them.
-static STACK: Mutex<(u64, u64)> = Mutex::new((0, 0));
-
-/// Jump into guest code. Never returns: the guest ends the process with exit_group.
+/// Jump into guest code on this thread. Never returns: the guest ends it with exit or exit_group.
 pub fn enter(regs: [u64; 18], stack_lo: u64, stack_hi: u64) -> ! {
-    *STACK.lock().unwrap() = (stack_lo, stack_hi);
+    ts().stack = (stack_lo, stack_hi);
     let regs = Box::leak(Box::new(regs));
     unsafe {
         std::arch::asm!("mov qword ptr gs:[0x08], {hi}", "mov qword ptr gs:[0x10], {lo}", // NT_TIB StackBase/Limit
@@ -125,10 +168,25 @@ static NEXT: AtomicU64 = AtomicU64::new(WINDOW.0);
 
 /// Reserve+commit RW guest memory, at `fixed` or anywhere in the guest window.
 pub fn alloc(fixed: Option<u64>, len: u64) -> Option<u64> {
+    alloc_ex(fixed, len, true)
+}
+
+/// Like `alloc`, optionally reserve-only: Linux PROT_NONE reservations (Go reserves hundreds of GB up
+/// front) must not count against the commit limit.
+fn alloc_ex(fixed: Option<u64>, len: u64, commit: bool) -> Option<u64> {
     let len = len.next_multiple_of(PAGE);
-    let at = |a: u64| unsafe { VirtualAlloc(a as *mut _, len as usize, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
+    let (ty, prot) = if commit { (MEM_COMMIT_RESERVE, PAGE_READWRITE) } else { (MEM_RESERVE, 0x01) }; // PAGE_NOACCESS
+    let at = |a: u64| unsafe { VirtualAlloc(a as *mut _, len as usize, ty, prot) } as u64;
     let p = match fixed {
-        Some(a) => Some(a).filter(|&a| at(a) == a)?,
+        Some(a) => match at(a) {
+            got if got == a => a,
+            0 => return None,
+            got => {
+                // NT rounded an unaligned address down to its 64K granularity: not what was asked for.
+                unsafe { VirtualFree(got as *mut _, 0, MEM_RELEASE) };
+                return None;
+            }
+        },
         None => loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
             if a + len > WINDOW.1 {
@@ -172,8 +230,9 @@ pub fn snapshot() -> Vec<String> {
     v.extend(code.regions.iter().flat_map(|&(a, b)| [a, b]));
     v.push(code.sites.len() as u64);
     v.extend(&code.sites);
-    let stack = *STACK.lock().unwrap();
-    v.extend([NEXT.load(Relaxed), LX_GUEST_FS.load(Relaxed), stack.0, stack.1]);
+    // Only the forking thread survives a fork, as on Linux: its FS base and stack come along.
+    let t = ts();
+    v.extend([NEXT.load(Relaxed), t.fs, t.stack.0, t.stack.1]);
     v.into_iter().map(|n| n.to_string()).collect()
 }
 
@@ -211,7 +270,7 @@ pub fn restore<'a>(f: &'a [String], parent: isize) -> Result<((u64, u64), &'a [S
     }
     drop(code);
     NEXT.store(next()?, Relaxed);
-    LX_GUEST_FS.store(next()?, Relaxed);
+    ts().fs = next()?;
     let stack = (next()?, next()?);
     let used = f.len() - it.len();
     Ok((stack, &f[used..]))
@@ -222,6 +281,13 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 
+/// One debug line, written in one piece and tagged with the thread id (threads interleave otherwise).
+pub fn dlog(msg: std::fmt::Arguments) {
+    let line = format!("[lx t{}] {msg}
+", unsafe { GetCurrentThreadId() });
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+}
+
 /// Verbose [lx] diagnostics, enabled by setting LX_DEBUG in the host environment.
 pub fn debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -230,6 +296,11 @@ pub fn debug() -> bool {
 
 pub fn install() {
     START.lock().unwrap().get_or_insert_with(Instant::now);
+    let idx = unsafe { TlsAlloc() };
+    assert!(idx < 64, "TLS index {idx} is past the TEB's inline slots"); // inline slots: gs:[0x1480 + 8*i]
+    TLS_INDEX.store(idx as u64, Relaxed);
+    LX_TLS_OFF.store(0x1480 + 8 * idx as u64, Relaxed);
+    crate::thread::set_main();
     unsafe { AddVectoredExceptionHandler(1, veh) };
 }
 
@@ -272,28 +343,25 @@ fn syscall_inside_immediate_is_not_patched() {
 }
 
 fn resume(c: &mut Context, rip: u64) -> i32 {
-    LX_RESUME_RIP.store(rip, Relaxed);
+    ts().resume = rip;
     c.rip = lx_fs_tramp as *const () as u64;
     EXCEPTION_CONTINUE_EXECUTION
 }
 
-/// A signal frame waiting to be placed at the guest's (new) rsp. It can't be written from the handler:
-/// NT keeps the CONTEXT we're editing, and our own call frames, right below the guest rsp, exactly
-/// where the frame goes. lx_sig_tramp copies it after NtContinue, when that area is dead.
-#[unsafe(no_mangle)]
-static mut LX_FRAME: [u8; signal::FRAME_MAX] = [0; signal::FRAME_MAX];
-#[unsafe(no_mangle)]
-static LX_FRAME_LEN: AtomicU64 = AtomicU64::new(0);
-
+// A signal frame waiting to be placed at the guest's (new) rsp (ThreadState.frame). It can't be written
+// from the handler: NT keeps the CONTEXT we're editing, and our own call frames, right below the guest
+// rsp, exactly where the frame goes. lx_sig_tramp copies it after NtContinue, when that area is dead.
 std::arch::global_asm!(
     ".globl lx_sig_tramp",
     "lx_sig_tramp:", // rsp = frame start; rdi/rsi/rdx already hold the handler's arguments
     "push rsi",
     "push rdi",
     "push rcx",
+    "mov rsi, qword ptr [rip + LX_TLS_OFF]",
+    "mov rsi, qword ptr gs:[rsi]",        // ThreadState*
+    "mov rcx, qword ptr [rsi + 16]",      // frame_len
+    "lea rsi, [rsi + 24]",                // frame
     "lea rdi, [rsp + 24]",
-    "lea rsi, [rip + LX_FRAME]",
-    "mov rcx, qword ptr [rip + LX_FRAME_LEN]",
     "cld",
     "rep movsb",
     "pop rcx",
@@ -309,9 +377,10 @@ unsafe extern "C" {
 fn resume_with_signals(c: &mut Context) -> i32 {
     match signal::deliver(c) {
         Some(frame) => {
-            unsafe { (&raw mut LX_FRAME).cast::<u8>().copy_from_nonoverlapping(frame.as_ptr(), frame.len()) };
-            LX_FRAME_LEN.store(frame.len() as u64, Relaxed);
-            LX_RESUME_RIP.store(c.rip, Relaxed);
+            let t = ts();
+            t.frame[..frame.len()].copy_from_slice(&frame);
+            t.frame_len = frame.len() as u64;
+            t.resume = c.rip;
             c.rip = lx_sig_tramp as *const () as u64;
             EXCEPTION_CONTINUE_EXECUTION
         }
@@ -319,7 +388,63 @@ fn resume_with_signals(c: &mut Context) -> i32 {
     }
 }
 
+// Call f(arg) with rsp switched to `top` (Win64 ABI: rcx = top, rdx = f, r8 = arg).
+std::arch::global_asm!(
+    ".globl lx_on_stack",
+    "lx_on_stack:",
+    "push rbp",
+    "mov rbp, rsp",
+    "lea rsp, [rcx - 32]", // shadow space; top is 16-aligned
+    "mov rcx, r8",
+    "call rdx",
+    "mov rsp, rbp",
+    "pop rbp",
+    "ret",
+);
+unsafe extern "system" {
+    fn lx_on_stack(top: u64, f: unsafe extern "system" fn(*mut ExceptionPointers) -> i32, arg: *mut ExceptionPointers) -> i32;
+}
+
+const HOST_STACK: usize = 512 << 10;
+
+/// Entry for every exception. A Linux kernel never touches the user stack, and guests rely on that (Go
+/// runs syscalls on 16 KB stacks), so all real work happens on a per-thread host stack. Only NT's own
+/// exception frame lands on the guest stack. While on our stack, the TEB bounds describe it (for
+/// __chkstk); nested faults (our own bugs) stay where they are.
 unsafe extern "system" fn veh(ep: *mut ExceptionPointers) -> i32 {
+    if debug() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let here: u64;
+        unsafe { std::arch::asm!("mov {}, rsp", out(reg) here) };
+        let guest_rsp = unsafe { (*(*ep).context).rsp };
+        ONCE.call_once(|| dlog(format_args!("trap uses {} bytes of guest stack before our handler", guest_rsp - here)));
+    }
+    let t = ts();
+    if t.on_host {
+        return unsafe { veh_body(ep) };
+    }
+    if t.host_stack == 0 {
+        let lo = unsafe { VirtualAlloc(std::ptr::null_mut(), HOST_STACK, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
+        if lo == 0 {
+            return unsafe { veh_body(ep) }; // no memory for a stack: best effort on the guest's
+        }
+        t.host_stack = lo + HOST_STACK as u64;
+    }
+    let top = t.host_stack;
+    let (base, limit): (u64, u64);
+    unsafe {
+        std::arch::asm!("mov {b}, qword ptr gs:[0x08]", "mov {l}, qword ptr gs:[0x10]", b = out(reg) base, l = out(reg) limit);
+        std::arch::asm!("mov qword ptr gs:[0x08], {b}", "mov qword ptr gs:[0x10], {l}", b = in(reg) top, l = in(reg) top - HOST_STACK as u64);
+    }
+    t.on_host = true;
+    let r = unsafe { lx_on_stack(top, veh_body, ep) };
+    let t = ts();
+    t.on_host = false;
+    unsafe { std::arch::asm!("mov qword ptr gs:[0x08], {b}", "mov qword ptr gs:[0x10], {l}", b = in(reg) base, l = in(reg) limit) };
+    r
+}
+
+unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
     let (rec, c) = unsafe { (&*(*ep).record, &mut *(*ep).context) };
     let (region, is_site) = {
         let code = CODE.lock().unwrap();
@@ -327,6 +452,13 @@ unsafe extern "system" fn veh(ep: *mut ExceptionPointers) -> i32 {
         (r, code.sites.binary_search(&c.rip).is_ok())
     };
     let Some((_, end)) = region else {
+        if debug() && rec.code == STATUS_ACCESS_VIOLATION {
+            let base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
+            let msg = format!("[lx] host fault at rip {:#x} (lx.exe+{:#x}) addr {:#x} tid {}
+",
+                c.rip, c.rip.wrapping_sub(base), rec.info[1], unsafe { GetCurrentThreadId() });
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
+        }
         return EXCEPTION_CONTINUE_SEARCH; // not guest code: our own bug, let it crash normally
     };
     match rec.code {
@@ -340,7 +472,7 @@ unsafe extern "system" fn veh(ep: *mut ExceptionPointers) -> i32 {
             (c.rax, c.rcx, c.r11, c.rip) = (ret as u64, next, c.eflags as u64, next); // kernel ABI: rcx=rip, r11=rflags
             resume_with_signals(c)
         }
-        STATUS_ACCESS_VIOLATION if LX_GUEST_FS.load(Relaxed) != 0 && lost_fs_base(c, rec.info[1] as u64, end) => {
+        STATUS_ACCESS_VIOLATION if ts().fs != 0 && lost_fs_base(c, rec.info[1] as u64, end) => {
             resume(c, c.rip)
         }
         _ => guest_crash(rec, c),
@@ -372,7 +504,11 @@ fn lost_fs_base(c: &Context, fault_addr: u64, code_end: u64) -> bool {
 }
 
 fn guest_crash(rec: &ExceptionRecord, c: &Context) -> ! {
-    eprintln!("[lx] guest fault {:#x} at rip {:#x} (addr {:#x})", rec.code, c.rip, rec.info[1]);
+    // One line, one write: several threads may fault at once.
+    let msg = format!("[lx] guest fault {:#x} at rip {:#x} (addr {:#x}) tid {} rsp {:#x} fs {:#x}
+",
+        rec.code, c.rip, rec.info[1], unsafe { GetCurrentThreadId() }, c.rsp, ts().fs);
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
     proc::exit(139) // 128 + SIGSEGV, like a shell would report
 }
 
@@ -391,12 +527,13 @@ fn dispatch(c: &mut Context) -> i64 {
         8 => fs::lseek(a[0], a[1] as i64, a[2]),
         9 => mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
         10 => mprotect(a[0], a[1], a[2]),
-        11 => munmap(a[0], a[1]),
+        11 => munmap(a[0], a[1], c.rsp),
         25 => mremap(a[0], a[1], a[2], a[3]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
-        131 => Ok(0),                  // sigaltstack. ponytail: handlers always run on the current stack
+        131 => signal::sigaltstack(a[0], a[1], c.rsp),
+        97 | 302 => prlimit(if c.rax == 97 { a[0] } else { a[1] }, if c.rax == 97 { a[1] } else { a[3] }),
         7 => fs::poll(a[0], a[1], a[2] as i32 as i64),
         271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
         34 => signal::sigsuspend(0),   // pause
@@ -409,14 +546,17 @@ fn dispatch(c: &mut Context) -> i64 {
         32 => fs::dup(a[0], 0, false),
         33 => fs::dup3(a[0], a[1], 0),
         35 => nanosleep(a[0]),
-        39 | 186 => proc::getpid(),
-        40 => fs::sendfile(a[0], a[1], a[2], a[3]),    // getpid, gettid (single-threaded: tid == pid)
-        56 => proc::clone(c, a[0], a[1]),
+        39 => proc::getpid(),
+        186 => thread::gettid(),
+        24 => thread::sched_yield(),
+        40 => fs::sendfile(a[0], a[1], a[2], a[3]),
+        56 => proc::clone(c, a[0], a[1], a[2], a[3], a[4]),
         57 | 58 => proc::fork(c, 0),   // fork, vfork
         59 => proc::execve(a[0], a[1], a[2]),
-        60 | 231 => proc::exit(a[0]),  // exit, exit_group (single thread)
-        61 => proc::wait4(a[0] as i64, a[1], a[2]),
-        62 => proc::kill(a[0] as i64, a[1]),
+        60 => thread::exit(a[0]),      // exit: this thread (the process when it's the last one)
+        231 => proc::exit(a[0]),       // exit_group
+        61 => proc::wait4(a[0] as i32 as i64, a[1], a[2]),
+        62 => proc::kill(a[0] as i32 as i64, a[1]),
         63 => uname(a[0]),
         72 => fs::fcntl(a[0], a[1], a[2]),
         79 => fs::getcwd(a[0], a[1]),
@@ -434,9 +574,13 @@ fn dispatch(c: &mut Context) -> i64 {
         109 => Ok(0),                  // setpgid. ponytail: no process groups / job control
         110 => proc::getppid(),
         111 | 112 | 121 => proc::getpid(), // getpgrp, setsid, getpgid
-        158 if a[0] == 0x1002 => { LX_GUEST_FS.store(a[1], Relaxed); Ok(0) } // arch_prctl(ARCH_SET_FS)
+        158 if a[0] == 0x1002 => { ts().fs = a[1]; Ok(0) } // arch_prctl(ARCH_SET_FS)
         217 => fs::getdents64(a[0], a[1], a[2]),
-        218 => Ok(1),                  // set_tid_address
+        202 => thread::futex(a[0], a[1], a[2], a[3], a[5]),
+        204 => thread::sched_getaffinity(a[1], a[2]),
+        324 => thread::membarrier(a[0]),
+        218 => { ts().clear_tid = a[0]; thread::gettid() } // set_tid_address
+        230 => clock_nanosleep(a[0], a[1], a[2]),
         228 => clock_gettime(a[0], a[1]),
         257 => fs::openat(a[0], a[1], a[2]),
         258 => fs::mkdirat(a[0], a[1]),
@@ -447,8 +591,9 @@ fn dispatch(c: &mut Context) -> i64 {
         267 => fs::readlinkat(a[0], a[1], a[2], a[3]),
         269 | 439 => fs::faccessat(a[0], a[1]),
         273 => Ok(0),                  // set_robust_list
-        200 => proc::kill(proc::getpid().unwrap_or(0), a[1]), // tkill on ourselves (single thread)
-        234 => proc::kill(proc::getpid().unwrap_or(0), a[2]), // tgkill
+        // tkill, tgkill. ponytail: signals are process-wide; whichever thread returns from a syscall next runs it.
+        200 => proc::kill(proc::getpid().unwrap_or(0), a[1]),
+        234 => proc::kill(proc::getpid().unwrap_or(0), a[2]),
         292 => fs::dup3(a[0], a[1], a[2]),
         293 => fs::pipe2(a[0], a[1]),
         318 => getrandom(a[0], a[1]),
@@ -520,8 +665,9 @@ fn page_prot(prot: u64) -> u32 {
     }
 }
 
-/// VirtualProtect refuses to span allocations, so walk the range region by region (skipping reserved holes).
-fn protect(addr: u64, len: u64, prot: u32) -> bool {
+/// Visit [addr, addr+len) region by region: NT calls refuse to span allocations.
+/// Returns false if part of the range isn't reserved at all, or `f` fails.
+fn each_region(addr: u64, len: u64, mut f: impl FnMut(u64, u64, u32) -> bool) -> bool {
     let (mut p, end) = (addr, addr + len);
     while p < end {
         let mut mbi = MemoryBasicInformation::default();
@@ -529,13 +675,32 @@ fn protect(addr: u64, len: u64, prot: u32) -> bool {
             return false;
         }
         let next = (mbi.base as u64 + mbi.region_size as u64).min(end);
-        let mut old = 0;
-        if mbi.state == MEM_COMMIT && unsafe { VirtualProtect(p as *mut _, (next - p) as usize, prot, &mut old) } == 0 {
+        if mbi.state == MEM_FREE || !f(p, next - p, mbi.state) {
             return false;
         }
         p = next;
     }
     true
+}
+
+/// Set protection over a range, committing reserved pages on the way (Linux: mprotect of a PROT_NONE
+/// reservation makes it usable). PROT_NONE leaves reserved pages reserved.
+fn protect(addr: u64, len: u64, prot: u32) -> bool {
+    each_region(addr, len, |p, n, state| {
+        let mut old = 0;
+        match state {
+            MEM_COMMIT => unsafe { VirtualProtect(p as *mut _, n as usize, prot, &mut old) != 0 },
+            _ if prot == 0x01 => true, // reserved and staying inaccessible
+            _ => unsafe { !VirtualAlloc(p as *mut _, n as usize, MEM_COMMIT, prot).is_null() },
+        }
+    })
+}
+
+/// Drop the contents of a range (reserved again, zero on next commit) without touching the pages.
+fn decommit(addr: u64, len: u64) -> bool {
+    each_region(addr, len, |p, n, state| {
+        state != MEM_COMMIT || unsafe { VirtualFree(p as *mut _, n as usize, MEM_DECOMMIT) != 0 }
+    })
 }
 
 fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
@@ -545,23 +710,26 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
         return Err(EINVAL);
     }
     let len = len.next_multiple_of(PAGE);
+    let reserve_only = prot == 0 && flags & MAP_ANONYMOUS != 0; // PROT_NONE: address space, no memory
     let p = if flags & MAP_FIXED != 0 {
-        // Inside one of our reservations (the usual case: ld.so carving up a library span) just commit;
-        // otherwise try a fresh reservation at that address.
-        // ponytail: a fixed range spanning two reservations fails with ENOMEM.
-        let mut p = unsafe { VirtualAlloc(addr as *mut _, len as usize, MEM_COMMIT, PAGE_READWRITE) } as u64;
-        if p == 0 {
-            p = alloc(Some(addr), len).unwrap_or(0);
+        // Inside our reservations (ld.so carving up a library span, Go committing arena chunks): replace the
+        // contents with fresh zero pages; elsewhere, a new reservation at exactly that address.
+        if decommit(addr, len) {
+            if !reserve_only && !protect(addr, len, PAGE_READWRITE as u32) {
+                return Err(ENOMEM);
+            }
+        } else if alloc_ex(Some(addr), len, !reserve_only) != Some(addr) {
+            return Err(ENOMEM); // ponytail: partly free, partly ours
         }
-        if p != addr || !protect(addr, len, PAGE_READWRITE as u32) {
-            return Err(ENOMEM);
-        }
-        unsafe { guest_mut(addr, len as usize) }.fill(0);
-        p
+        addr
     } else {
-        // ponytail: address hints ignored; every mapping gets its own 64K-aligned reservation.
-        alloc(None, len).ok_or(ENOMEM)?
+        // A free hint is honored, like Linux (Go places its heap with hints); otherwise our own window.
+        let hinted = (addr != 0).then(|| alloc_ex(Some(addr), len, !reserve_only)).flatten();
+        hinted.or_else(|| alloc_ex(None, len, !reserve_only)).ok_or(ENOMEM)?
     };
+    if reserve_only {
+        return Ok(p as i64);
+    }
     if flags & MAP_ANONYMOUS == 0 {
         // ponytail: file mappings are private copies; MAP_SHARED writes never reach the file.
         fs::read_at(fd, unsafe { guest_mut(p, len as usize) }, off)?;
@@ -596,14 +764,25 @@ fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
     let new = alloc(None, new_len).ok_or(ENOMEM)?;
     unsafe { std::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, old_len.min(new_len) as usize) };
     protect(new, new_len.next_multiple_of(PAGE), m.protect);
-    munmap(old, old_len)?;
+    munmap(old, old_len, 0)?;
     Ok(new as i64)
 }
 
-fn munmap(addr: u64, len: u64) -> R {
+fn munmap(addr: u64, len: u64, rsp: u64) -> R {
+    let len = len.next_multiple_of(PAGE);
+    // A thread unmapping its own stack is about to exit (musl's detached-thread exit does this); NT
+    // still needs that stack to dispatch the final exit syscall, so leave it mapped.
+    if (addr..addr + len).contains(&rsp) {
+        return Ok(0);
+    }
     // ponytail: decommit only; the address space stays reserved (and leaks) until exit.
-    unsafe { VirtualFree(addr as *mut _, len.next_multiple_of(PAGE) as usize, MEM_DECOMMIT) };
+    decommit(addr, len);
     Ok(0)
+}
+
+/// The registered guest allocation containing `addr`, as (low, high).
+pub fn alloc_containing(addr: u64) -> Option<(u64, u64)> {
+    ALLOCS.lock().unwrap().iter().find(|&&(b, l)| (b..b + l).contains(&addr)).map(|&(b, l)| (b, b + l))
 }
 
 // ---- process, time, misc ----
@@ -617,7 +796,7 @@ fn uname(buf: u64) -> R {
     Ok(0)
 }
 
-fn now(clock: u64) -> (u64, u64) {
+pub fn now(clock: u64) -> (u64, u64) {
     let d = if clock == 0 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default() // CLOCK_REALTIME
     } else {
@@ -643,6 +822,34 @@ fn gettimeofday(tv: u64) -> R {
 fn nanosleep(ts: u64) -> R {
     let [s, ns] = unsafe { *(ts as *const [u64; 2]) };
     std::thread::sleep(std::time::Duration::new(s, ns as u32));
+    Ok(0)
+}
+
+/// getrlimit / prlimit64 (own process): generous fixed limits. Setting is accepted and ignored.
+fn prlimit(resource: u64, old: u64) -> R {
+    const INFINITY: u64 = u64::MAX;
+    let lim = match resource {
+        3 => [8 << 20, INFINITY],         // RLIMIT_STACK: 8 MiB, like the stack we give the main thread
+        7 => [1 << 20, 1 << 20],          // RLIMIT_NOFILE
+        _ => [INFINITY, INFINITY],
+    };
+    if old != 0 {
+        unsafe { *(old as *mut [u64; 2]) = lim };
+    }
+    Ok(0)
+}
+
+fn clock_nanosleep(clock: u64, flags: u64, req: u64) -> R {
+    const TIMER_ABSTIME: u64 = 1;
+    let [s, ns] = unsafe { *(req as *const [u64; 2]) };
+    let want = std::time::Duration::new(s, ns as u32);
+    let wait = if flags & TIMER_ABSTIME != 0 {
+        let (s, ns) = now(clock);
+        want.saturating_sub(std::time::Duration::new(s, ns as u32))
+    } else {
+        want
+    };
+    std::thread::sleep(wait);
     Ok(0)
 }
 
