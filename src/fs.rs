@@ -627,9 +627,42 @@ pub fn faccessat(dirfd: u64, path: u64) -> R {
     fs::symlink_metadata(host).map(|_| 0).map_err(errno)
 }
 
+/// The guest path of the running ELF, for /proc/self/exe (ld.so resolves $ORIGIN with it).
+static EXE: Mutex<String> = Mutex::new(String::new());
+
+pub fn set_exe(guest: &str) {
+    *EXE.lock().unwrap() = guest.to_string();
+}
+
+/// The few /proc links programs actually read. ponytail: no /proc filesystem otherwise (DESIGN.md §5).
+fn proc_link(guest: &str) -> Option<String> {
+    let rest = guest.strip_prefix("/proc/self/").or_else(|| {
+        let r = guest.strip_prefix("/proc/")?;
+        let (pid, rest) = r.split_once('/')?;
+        (pid.parse::<u32>().ok()? == unsafe { crate::win::GetCurrentProcessId() }).then_some(rest)
+    })?;
+    match rest {
+        "exe" => Some(EXE.lock().unwrap().clone()),
+        "cwd" => Some(with(|fs| fs.cwd.clone())),
+        "root" => Some("/".into()),
+        _ => {
+            let fd: usize = rest.strip_prefix("fd/")?.parse().ok()?;
+            with(|fs| match &fs.fds.get(fd)?.as_ref()?.fd {
+                Fd::Dir { guest, .. } => Some(guest.clone()),
+                Fd::Dev(d) => Some(format!("/dev/{}", d.tag())),
+                Fd::File { host, .. } => {
+                    let rel = host.strip_prefix(&fs.root).ok()?;
+                    Some(format!("/{}", rel.to_string_lossy().replace('\\', "/")))
+                }
+                Fd::Handle(_) => Some("pipe:[0]".into()),
+            })
+        }
+    }
+}
+
 pub fn readlinkat(dirfd: u64, path: u64, buf: u64, size: u64) -> R {
-    let host = with_path(|fs| fs.at(dirfd, path, false))?;
-    let t = read_link(&host).ok_or(EINVAL)?;
+    let (guest, host) = with(|fs| fs.at(dirfd, path, false))?;
+    let t = proc_link(&guest).or_else(|| read_link(&host)).ok_or(EINVAL)?;
     let n = t.len().min(size as usize);
     unsafe { guest_mut(buf, n) }.copy_from_slice(&t.as_bytes()[..n]);
     Ok(n as i64)
@@ -675,6 +708,18 @@ pub fn getcwd(buf: u64, size: u64) -> R {
         out[..n - 1].copy_from_slice(fs.cwd.as_bytes());
         out[n - 1] = 0;
         Ok(n as i64)
+    })
+}
+
+/// Set the starting directory (an image's WorkingDir). It must exist in the rootfs.
+pub fn set_cwd(dir: &str) -> Result<(), i64> {
+    with(|fs| {
+        let (guest, host) = fs.resolve("/", dir, true)?;
+        if !fs::metadata(&host).map_err(errno)?.is_dir() {
+            return Err(ENOTDIR);
+        }
+        fs.cwd = guest;
+        Ok(())
     })
 }
 
@@ -748,11 +793,15 @@ pub fn read_at(fd: u64, dst: &mut [u8], off: u64) -> R {
 
 // ---- image layers ----
 
-/// Unpack a (gzipped) OCI/Docker layer tarball into `dest`.
-/// Entry paths are untrusted: absolute paths and `..` are rejected, never joined.
-pub fn unpack(tgz: &Path, dest: &Path) -> Result<(u32, u32), String> {
-    let f = File::open(tgz).map_err(|e| format!("{}: {e}", tgz.display()))?;
-    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(io::BufReader::new(f)));
+/// Unpack an OCI/Docker layer (tar, gzipped or not) into `dest`, on top of earlier layers.
+/// Entry paths are untrusted: absolute paths and `..` are rejected, never joined. Our symlinks are plain
+/// marker files on the host, so an entry can't be written "through" a symlink either.
+/// Whiteouts: `.wh.NAME` deletes NAME from lower layers, `.wh..wh..opq` empties its directory.
+pub fn unpack(layer: &Path, dest: &Path) -> Result<(u32, u32), String> {
+    let mut f = io::BufReader::new(File::open(layer).map_err(|e| format!("{}: {e}", layer.display()))?);
+    let gz = io::BufRead::fill_buf(&mut f).map_err(|e| e.to_string())?.starts_with(&[0x1f, 0x8b]);
+    let input: Box<dyn Read> = if gz { Box::new(flate2::read::GzDecoder::new(f)) } else { Box::new(f) };
+    let mut ar = tar::Archive::new(input);
     fs::create_dir_all(dest).map_err(|e| e.to_string())?;
     let (mut done, mut skipped) = (0, 0);
     let clean = |p: &Path| -> Option<PathBuf> {
@@ -774,7 +823,26 @@ pub fn unpack(tgz: &Path, dest: &Path) -> Result<(u32, u32), String> {
         if let Some(p) = host.parent() {
             fs::create_dir_all(p).map_err(|e| e.to_string())?;
         }
+        let name = rel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if let Some(target) = name.strip_prefix(".wh.") {
+            let dir = host.parent().unwrap_or(dest);
+            if target == ".wh..opq" {
+                for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+                    remove_any(&e.path());
+                }
+            } else {
+                remove_any(&dir.join(target));
+            }
+            done += 1;
+            continue;
+        }
         let ty = e.header().entry_type();
+        // A later layer may replace a path with a different kind of entry.
+        if let Ok(m) = fs::symlink_metadata(&host) {
+            if !(ty.is_dir() && m.is_dir()) {
+                remove_any(&host);
+            }
+        }
         let r = if ty.is_dir() {
             fs::create_dir_all(&host)
         } else if ty.is_symlink() {
@@ -797,6 +865,10 @@ pub fn unpack(tgz: &Path, dest: &Path) -> Result<(u32, u32), String> {
         }
     }
     Ok((done, skipped))
+}
+
+fn remove_any(p: &Path) {
+    let _ = if p.is_dir() { fs::remove_dir_all(p) } else { fs::remove_file(p) };
 }
 
 #[test]

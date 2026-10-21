@@ -1,6 +1,7 @@
 //! lx: run a static x86-64 Linux ELF natively on NT. See DESIGN.md.
 mod elf;
 mod fs;
+mod image;
 mod proc;
 mod signal;
 mod syscall;
@@ -99,6 +100,10 @@ pub mod win {
     #[link(name = "bcrypt")]
     unsafe extern "system" {
         pub fn BCryptGenRandom(alg: *mut c_void, buf: *mut u8, len: u32, flags: u32) -> i32;
+        pub fn BCryptCreateHash(alg: isize, h: *mut isize, obj: *mut u8, objlen: u32, secret: *mut u8, seclen: u32, flags: u32) -> i32;
+        pub fn BCryptHashData(h: isize, data: *const u8, len: u32, flags: u32) -> i32;
+        pub fn BCryptFinishHash(h: isize, out: *mut u8, len: u32, flags: u32) -> i32;
+        pub fn BCryptDestroyHash(h: isize) -> i32;
     }
 }
 
@@ -139,7 +144,10 @@ fn enter_job() -> Result<(), String> {
     }
 }
 
-const USAGE: &str = "usage: lx <rootfs-dir> <command> [args...]\n       lx unpack <layer.tar.gz> <rootfs-dir>";
+const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull nginx:alpine
+       lx run <image> [command args...]      runs the image's entrypoint/cmd, or the given command
+       lx <rootfs-dir> <command> [args...]   run a command in an unpacked rootfs
+       lx unpack <layer.tar[.gz]> <rootfs-dir>";
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 fn run() -> Result<(), String> {
@@ -161,6 +169,22 @@ fn run() -> Result<(), String> {
         let (regs, (lo, hi)) = proc::receive_fork(state, parent, ready)?;
         syscall::enter(regs, lo, hi)
     }
+    if let [cmd, image] = args.as_slice() && cmd == "pull" {
+        let dir = image::pull(&image::Ref::parse(image))?;
+        eprintln!("[lx] pulled {image} into {}", dir.display());
+        return Ok(());
+    }
+    if let [cmd, image, rest @ ..] = args.as_slice() && cmd == "run" {
+        let r = image::Ref::parse(image);
+        let dir = if r.dir().join("config.json").exists() { r.dir() } else { image::pull(&r)? };
+        let c = image::run_config(&dir, rest)?;
+        // ponytail: the container writes straight into the pulled image; a per-container
+        // copy-on-write layer (DESIGN.md §6) is still to come.
+        let root = std::fs::canonicalize(dir.join("rootfs")).map_err(|e| e.to_string())?;
+        fs::init(root);
+        fs::set_cwd(&c.workdir).map_err(|_| format!("WorkingDir {} not found in image", c.workdir))?;
+        return start(&c.argv[0], c.argv.clone(), c.env);
+    }
     let [rootfs, cmd, rest @ ..] = args.as_slice() else { return Err(USAGE.into()) };
     let root = std::fs::canonicalize(rootfs).map_err(|e| format!("{rootfs}: {e}"))?;
     fs::init(root);
@@ -171,7 +195,8 @@ fn run() -> Result<(), String> {
 /// Load `cmd` (and its ELF interpreter, or its #! interpreter) and jump into it. Never returns on success.
 fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), String> {
     let not_found = |e: i64| format!("{cmd}: {}", if e == syscall::EACCES { "permission denied" } else { "not found in image" });
-    let (mut exe, mut image) = fs::find_exe(cmd, PATH).map_err(not_found)?;
+    let path = env.iter().find_map(|e| e.strip_prefix("PATH=")).unwrap_or(PATH).to_string();
+    let (mut exe, mut image) = fs::find_exe(cmd, &path).map_err(not_found)?;
     // #! scripts (nested up to 4 deep, like Linux): argv becomes [interp, optional-arg, script, args...].
     for _ in 0..4 {
         let Some(line) = image.strip_prefix(b"#!") else { break };
@@ -185,8 +210,9 @@ fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), Strin
         new.push(exe.clone());
         new.extend(argv.drain(..).skip(1));
         argv = new;
-        (exe, image) = fs::find_exe(&interp, PATH).map_err(|_| format!("{exe}: bad interpreter {interp}"))?;
+        (exe, image) = fs::find_exe(&interp, &path).map_err(|_| format!("{exe}: bad interpreter {interp}"))?;
     }
+    fs::set_exe(&exe);
 
     enter_job()?;
     syscall::install();

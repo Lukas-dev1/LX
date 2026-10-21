@@ -105,7 +105,7 @@ The translation layer is **not** a security boundary. Guest code runs natively i
 4. Threads and `futex`: static Go binaries (`hello`, then `net/http` once epoll exists).
 5. ✅ Process model: `fork`/`execve`/`wait4`/pipes/signals. Shell entrypoints work, with pipelines, `$(...)`, background jobs + `wait`, `trap`, `#!` scripts and a final `exec` (`guest/entrypoint.sh`).
 6. AFD epoll and Winsock: an Alpine nginx or node image serves HTTP.
-7. OCI pull/unpack and a `docker run`-shaped CLI.
+7. ✅ (basic) `lx pull <image>` / `lx run <image> [cmd]`. Registry token auth, multi-arch index → linux/amd64, sha256-verified blobs (BCrypt), layers with whiteouts, and Entrypoint/Cmd/Env/WorkingDir from the image config. HTTPS goes through Windows' own `curl.exe`. Tested with `alpine`, `nginx:alpine` (its entrypoint scripts run) and `python:3.12-alpine`. Missing: private registries (credentials), zstd layers, and a per-container copy-on-write layer (containers currently write into the pulled image).
 
 ## Build and run
 
@@ -116,6 +116,8 @@ tools/rust/cargo/bin/cargo build --release
 tools/zig-x86_64-windows-0.15.2/zig.exe cc -target x86_64-linux-musl -static -O2 -o rootfs/hello guest/hello.c
 target/release/lx.exe unpack alpine-minirootfs-x86_64.tar.gz rootfs/alpine   # an image layer
 target/release/lx.exe rootfs/alpine ls -la /                               # PATH lookup inside the image
+target/release/lx.exe pull python:3.12-alpine                                # from Docker Hub
+target/release/lx.exe run python:3.12-alpine python3 -c 'print(1+1)'
 cp guest/entrypoint.sh rootfs/alpine/ && target/release/lx.exe rootfs/alpine /entrypoint.sh   # shell entrypoint
 LX_DEBUG=1 target/release/lx.exe ...                                       # verbose [lx] diagnostics
 target/release/lx.exe rootfs /hello        # → "hello from linux ... tls=42", exit 7

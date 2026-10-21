@@ -392,6 +392,7 @@ fn dispatch(c: &mut Context) -> i64 {
         9 => mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
         10 => mprotect(a[0], a[1], a[2]),
         11 => munmap(a[0], a[1]),
+        25 => mremap(a[0], a[1], a[2], a[3]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
@@ -463,6 +464,9 @@ fn dispatch(c: &mut Context) -> i64 {
             Err(ENOSYS)
         }
     };
+    if let Err(e) = r && debug() {
+        eprintln!("[lx] syscall {} ({:#x}, {:#x}, {:#x}, {:#x}) -> -{e}", c.rax, a[0], a[1], a[2], a[3]);
+    }
     r.unwrap_or_else(|e| -e)
 }
 
@@ -577,6 +581,23 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> R {
         patch_code(addr, len as usize);
     }
     if protect(addr, len, page_prot(prot)) { Ok(0) } else { Err(ENOMEM) }
+}
+
+/// Moves only (MREMAP_MAYMOVE): reservations can't grow in place. Keeps the old protection.
+fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
+    const MREMAP_MAYMOVE: u64 = 1;
+    if flags & MREMAP_MAYMOVE == 0 || new_len == 0 {
+        return Err(ENOMEM);
+    }
+    let mut m = MemoryBasicInformation::default();
+    if unsafe { VirtualQuery(old as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 || m.state != MEM_COMMIT {
+        return Err(EFAULT);
+    }
+    let new = alloc(None, new_len).ok_or(ENOMEM)?;
+    unsafe { std::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, old_len.min(new_len) as usize) };
+    protect(new, new_len.next_multiple_of(PAGE), m.protect);
+    munmap(old, old_len)?;
+    Ok(new as i64)
 }
 
 fn munmap(addr: u64, len: u64) -> R {
