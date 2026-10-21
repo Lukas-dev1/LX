@@ -12,8 +12,9 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
+use crate::net::{Epoll, Sock};
 
 const LINK_MAGIC: &[u8] = b"\0lxlink\0";
 pub const AT_FDCWD: u64 = -100i64 as u64;
@@ -27,6 +28,7 @@ const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200000;
 const O_NOFOLLOW: u64 = 0o400000;
 const O_CLOEXEC: u64 = 0o2000000;
+pub const O_NONBLOCK: u64 = 0o4000;
 
 pub enum Fd {
     /// Console or pipe: plain read/write on a Windows handle.
@@ -36,6 +38,9 @@ pub enum Fd {
     Dir { guest: String, pos: usize },
     /// Emulated character devices; image /dev directories are empty.
     Dev(Dev),
+    /// Shared like a Linux open file description: dup and fork share the socket and its O_NONBLOCK.
+    Socket(Arc<Sock>),
+    Epoll(Arc<Mutex<Epoll>>),
 }
 
 #[derive(Clone, Copy)]
@@ -236,7 +241,8 @@ pub fn find_exe(cmd: &str, path_var: &str) -> Result<(String, Vec<u8>), i64> {
 
 fn handle_any(fd: &Fd) -> Result<isize, i64> {
     match fd {
-        Fd::Dir { .. } => Err(EISDIR),
+        Fd::Dir { .. } | Fd::Epoll(_) => Err(EISDIR),
+        Fd::Socket(s) => Ok(s.s as isize), // Winsock sockets are kernel handles and inherit like them
         _ => handle(fd),
     }
 }
@@ -260,6 +266,9 @@ pub fn proc_state(fork: bool) -> Vec<String> {
                 Fd::File { f, host } => ("f", f.as_raw_handle() as usize, host.to_string_lossy().into_owned()),
                 Fd::Dir { guest, .. } => ("d", 0, guest.clone()),
                 Fd::Dev(d) => (d.tag(), 0, String::new()),
+                Fd::Socket(k) => ("s", k.s, (k.nonblocking() as u8).to_string()),
+                // ponytail: epoll instances aren't carried across fork/exec (servers make one per worker).
+                Fd::Epoll(_) => continue,
             };
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
             n += 1;
@@ -286,6 +295,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
             "null" => Fd::Dev(Dev::Null),
             "zero" => Fd::Dev(Dev::Zero),
             "random" => Fd::Dev(Dev::Random),
+            "s" => Fd::Socket(Arc::new(Sock::inherited(h, path == "1"))),
             _ => return Err(bad()),
         };
         while fds.len() <= fd {
@@ -323,45 +333,141 @@ fn handle(fd: &Fd) -> Result<isize, i64> {
         Fd::Handle(h) => Ok(h.as_raw_handle() as isize),
         Fd::File { f, .. } => Ok(f.as_raw_handle() as isize),
         Fd::Dir { .. } => Err(EISDIR),
-        Fd::Dev(_) => Err(EINVAL),
+        Fd::Dev(_) | Fd::Socket(_) | Fd::Epoll(_) => Err(EINVAL),
     }
 }
 
-/// A Windows handle to do the I/O on, or the device to emulate.
-fn io_target(fd: u64) -> Result<Result<isize, Dev>, i64> {
+/// What a read/write/poll on an fd talks to. Taken out of the fd table so blocking I/O runs unlocked.
+enum Io {
+    Handle(isize),
+    Dev(Dev),
+    Sock(Arc<Sock>),
+}
+
+fn io_target(fd: u64) -> Result<Io, i64> {
     with(|fs| match fs.fd(fd)? {
-        Fd::Dev(d) => Ok(Err(*d)),
-        other => handle(other).map(Ok),
+        Fd::Dev(d) => Ok(Io::Dev(*d)),
+        Fd::Socket(s) => Ok(Io::Sock(s.clone())),
+        other => handle(other).map(Io::Handle),
     })
 }
 
 pub fn read(fd: u64, buf: u64, len: u64) -> R {
     match io_target(fd)? {
-        Ok(h) => read_handle(h, buf, len), // outside the lock: stdin may block
-        Err(Dev::Null) => Ok(0),
-        Err(Dev::Zero) => {
+        Io::Handle(h) => read_handle(h, buf, len),
+        Io::Sock(s) => s.recv(buf, len, 0),
+        Io::Dev(Dev::Null) => Ok(0),
+        Io::Dev(Dev::Zero) => {
             unsafe { guest_mut(buf, len as usize) }.fill(0);
             Ok(len as i64)
         }
-        Err(Dev::Random) => crate::syscall::getrandom(buf, len),
+        Io::Dev(Dev::Random) => crate::syscall::getrandom(buf, len),
     }
 }
 
 pub fn write(fd: u64, buf: u64, len: u64) -> R {
     match io_target(fd)? {
-        Ok(h) => write_handle(h, buf, len),
-        Err(_) => Ok(len as i64), // devices swallow writes
+        Io::Handle(h) => write_handle(h, buf, len),
+        Io::Sock(s) => s.send(buf, len, 0),
+        Io::Dev(_) => Ok(len as i64), // devices swallow writes
     }
 }
 
-/// poll/ppoll: pipes are checked with PeekNamedPipe, console input by waiting on it, files and devices
-/// are always ready. ponytail: busy-waits in 1ms steps while nothing is ready; an IOCP/AFD-based wait
-/// replaces it together with epoll and sockets.
+pub fn sock(fd: u64) -> Result<Arc<Sock>, i64> {
+    with(|fs| match fs.fd(fd)? {
+        Fd::Socket(s) => Ok(s.clone()),
+        _ => Err(crate::syscall::ENOTSOCK),
+    })
+}
+
+pub fn epoll(fd: u64) -> Result<Arc<Mutex<Epoll>>, i64> {
+    with(|fs| match fs.fd(fd)? {
+        Fd::Epoll(e) => Ok(e.clone()),
+        _ => Err(EINVAL),
+    })
+}
+
+pub fn add_fd(fd: Fd, cloexec: bool) -> i64 {
+    with(|fs| fs.add(fd, 0, cloexec))
+}
+
+/// The socket behind an fd, if it is one (epoll uses it for an efficient wait).
+pub fn socket_of(fd: i32) -> Option<usize> {
+    with(|fs| match fs.fd(fd as u64) {
+        Ok(Fd::Socket(s)) => Some(s.s),
+        _ => None,
+    })
+}
+
+const POLLIN: i16 = 1;
+const POLLOUT: i16 = 4;
+const POLLHUP: i16 = 0x10;
+const POLLNVAL: i16 = 0x20;
+
+/// Which of `events` (poll bits) are ready on `fd` right now, plus POLLERR/POLLHUP/POLLNVAL.
+pub fn readiness(fd: i32, events: i16) -> i16 {
+    if fd < 0 {
+        return 0;
+    }
+    match io_target(fd as u64) {
+        Err(_) => POLLNVAL,
+        Ok(Io::Dev(_)) => events & (POLLIN | POLLOUT),
+        Ok(Io::Sock(s)) => s.ready(events),
+        Ok(Io::Handle(h)) => match unsafe { crate::win::GetFileType(h) } {
+            3 => {
+                // FILE_TYPE_PIPE. ponytail: write ends always report POLLOUT.
+                let mut avail = 0u32;
+                let ok = unsafe { crate::win::PeekNamedPipe(h, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) };
+                match (ok, avail) {
+                    (0, _) => POLLHUP | (events & POLLIN),
+                    (_, 0) => events & POLLOUT,
+                    _ => events & (POLLIN | POLLOUT),
+                }
+            }
+            2 => {
+                // FILE_TYPE_CHAR (console): input is ready when the handle is signaled.
+                let r = unsafe { crate::win::WaitForMultipleObjects(1, &h, 0, 0) } == 0;
+                (if r { events & POLLIN } else { 0 }) | (events & POLLOUT)
+            }
+            _ => events & (POLLIN | POLLOUT),
+        },
+    }
+}
+
+/// ioctl: just what works without a tty.
+pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
+    const FIONREAD: u64 = 0x541B;
+    const FIONBIO: u64 = 0x5421;
+    const FIONCLEX: u64 = 0x5450;
+    const FIOCLEX: u64 = 0x5451;
+    const FIOASYNC: u64 = 0x5452;
+    if req == FIOCLEX || req == FIONCLEX {
+        return fcntl(fd, 2, (req == FIOCLEX) as u64); // F_SETFD
+    }
+    match (req, io_target(fd)?) {
+        (FIOASYNC, _) => Ok(0), // ponytail: no SIGIO; nginx's channels work without it
+        (FIONBIO, Io::Sock(s)) => {
+            s.set_nonblocking(unsafe { *(arg as *const i32) } != 0);
+            Ok(0)
+        }
+        (FIONBIO, _) => Ok(0),
+        (FIONREAD, Io::Sock(s)) => {
+            unsafe { *(arg as *mut i32) = s.available() as i32 };
+            Ok(0)
+        }
+        (FIONREAD, Io::Handle(h)) => {
+            let mut avail = 0u32;
+            unsafe { crate::win::PeekNamedPipe(h, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) };
+            unsafe { *(arg as *mut i32) = avail as i32 };
+            Ok(0)
+        }
+        _ => Err(crate::syscall::ENOTTY), // no terminals yet
+    }
+}
+
+/// poll/ppoll: pipes are checked with PeekNamedPipe, console input by waiting on it, sockets with
+/// WSAPoll, files and devices are always ready. ponytail: re-checks in 1ms steps while nothing is ready.
 pub fn poll(fds: u64, n: u64, timeout_ms: i64) -> R {
-    const POLLIN: i16 = 1;
-    const POLLOUT: i16 = 4;
-    const POLLHUP: i16 = 0x10;
-    const POLLNVAL: i16 = 0x20;
     if n > 1024 {
         return Err(EINVAL);
     }
@@ -372,33 +478,7 @@ pub fn poll(fds: u64, n: u64, timeout_ms: i64) -> R {
             let p = (fds + i * 8) as *mut [i16; 4]; // struct pollfd { int fd; short events, revents; }
             let entry = unsafe { &mut *p };
             let fd = (entry[0] as u16 as u32 | (entry[1] as u16 as u32) << 16) as i32;
-            let events = entry[2];
-            let revents = if fd < 0 {
-                0
-            } else {
-                match io_target(fd as u64) {
-                    Err(_) => POLLNVAL,
-                    Ok(Err(_)) => events & (POLLIN | POLLOUT),
-                    Ok(Ok(h)) => match unsafe { crate::win::GetFileType(h) } {
-                        3 => {
-                            // FILE_TYPE_PIPE. ponytail: write ends always report POLLOUT.
-                            let mut avail = 0u32;
-                            let ok = unsafe { crate::win::PeekNamedPipe(h, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) };
-                            match (ok, avail) {
-                                (0, _) => POLLHUP | (events & POLLIN),
-                                (_, 0) => events & POLLOUT,
-                                _ => events & (POLLIN | POLLOUT),
-                            }
-                        }
-                        2 => {
-                            // FILE_TYPE_CHAR (console): input is ready when the handle is signaled.
-                            let r = unsafe { crate::win::WaitForMultipleObjects(1, &h, 0, 0) } == 0;
-                            (if r { events & POLLIN } else { 0 }) | (events & POLLOUT)
-                        }
-                        _ => events & (POLLIN | POLLOUT),
-                    },
-                }
-            };
+            let revents = readiness(fd, entry[2]);
             entry[3] = revents;
             if revents != 0 {
                 ready += 1;
@@ -415,17 +495,65 @@ pub fn poll(fds: u64, n: u64, timeout_ms: i64) -> R {
     }
 }
 
-/// sendfile from the current file position (cat, cp). With an explicit offset, callers fall back.
+/// sendfile: from the file position (cat), or from `*off` leaving the position alone and advancing
+/// `*off` instead (nginx). ponytail: a bounce buffer, up to 64K per call; TransmitFile would be zero-copy.
 pub fn sendfile(out: u64, inp: u64, off: u64, count: u64) -> R {
-    if off != 0 {
-        return Err(EINVAL);
-    }
     let mut buf = vec![0u8; count.min(1 << 16) as usize];
-    let n = read(inp, buf.as_mut_ptr() as u64, buf.len() as u64)?;
+    let n = if off != 0 {
+        pread(inp, buf.as_mut_ptr() as u64, buf.len() as u64, unsafe { *(off as *const u64) }, false)?
+    } else {
+        read(inp, buf.as_mut_ptr() as u64, buf.len() as u64)?
+    };
     if n == 0 {
         return Ok(0);
     }
-    write(out, buf.as_ptr() as u64, n as u64)
+    let sent = write(out, buf.as_ptr() as u64, n as u64)?;
+    if off != 0 {
+        unsafe { *(off as *mut u64) += sent as u64 };
+    } else if sent < n {
+        lseek(inp, sent - n, 1)?; // give back what the socket didn't take
+    }
+    Ok(sent)
+}
+
+/// pread64/pwrite64: I/O at an offset without moving the file position. NT's positioned I/O does
+/// move it on synchronous handles, so put it back.
+pub fn pread(fd: u64, buf: u64, len: u64, off: u64, write: bool) -> R {
+    use std::os::windows::fs::FileExt;
+    with(|fs| {
+        let Fd::File { f, .. } = fs.fd(fd)? else { return Err(ESPIPE) };
+        let keep = f.stream_position().map_err(errno)?;
+        let len = len.min(u32::MAX as u64) as usize;
+        let r = if write {
+            f.seek_write(unsafe { std::slice::from_raw_parts(buf as *const u8, len) }, off)
+        } else {
+            f.seek_read(unsafe { guest_mut(buf, len) }, off)
+        };
+        f.seek(SeekFrom::Start(keep)).map_err(errno)?;
+        match r {
+            Ok(n) => Ok(n as i64),
+            Err(e) if e.raw_os_error() == Some(38) => Ok(0), // ERROR_HANDLE_EOF: read past the end
+            Err(e) => Err(errno(e)),
+        }
+    })
+}
+
+pub fn readv(fd: u64, iov: u64, cnt: u64) -> R {
+    if cnt > 1024 {
+        return Err(EINVAL);
+    }
+    let mut total = 0;
+    for i in 0..cnt {
+        let [base, len] = unsafe { *((iov + i * 16) as *const [u64; 2]) };
+        match read(fd, base, len) {
+            Ok(n) => {
+                total += n;
+                if (n as u64) < len { break } // short read: don't block for more
+            }
+            Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
+        }
+    }
+    Ok(total)
 }
 
 pub fn writev(fd: u64, iov: u64, cnt: u64) -> R {
@@ -498,6 +626,8 @@ fn dup_fd(fd: &Fd) -> Result<Fd, i64> {
         Fd::File { f, host } => Fd::File { f: f.try_clone().map_err(errno)?, host: host.clone() },
         Fd::Dir { guest, pos } => Fd::Dir { guest: guest.clone(), pos: *pos },
         Fd::Dev(d) => Fd::Dev(*d),
+        Fd::Socket(s) => Fd::Socket(s.clone()),
+        Fd::Epoll(e) => Fd::Epoll(e.clone()),
     })
 }
 
@@ -533,8 +663,16 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             if cmd == 2 { slot.cloexec = arg & 1 != 0 } // F_SETFD
             Ok(slot.cloexec as i64)                      // F_GETFD
         }),
-        4 => with(|fs| fs.fd(fd).map(|_| 0)), // F_SETFL. ponytail: no O_NONBLOCK yet
-        3 => with(|fs| fs.fd(fd).map(|_| 2)), // F_GETFL: O_RDWR
+        // F_SETFL / F_GETFL: O_NONBLOCK matters for sockets. ponytail: ignored on pipes and files.
+        8 => with(|fs| fs.fd(fd).map(|_| 0)), // F_SETOWN: only matters for SIGIO, which we don't send
+        4 => with(|fs| match fs.fd(fd)? {
+            Fd::Socket(s) => { s.set_nonblocking(arg & O_NONBLOCK != 0); Ok(0) }
+            _ => Ok(0),
+        }),
+        3 => with(|fs| match fs.fd(fd)? {
+            Fd::Socket(s) if s.nonblocking() => Ok(2 | O_NONBLOCK as i64),
+            _ => Ok(2), // O_RDWR
+        }),
         _ => Err(EINVAL),
     }
 }
@@ -552,7 +690,7 @@ pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
         }
         Fd::Dir { pos, .. } if off == 0 && whence == 0 => { *pos = 0; Ok(0) }
         Fd::Dir { .. } => Err(EINVAL),
-        Fd::Handle(_) => Err(ESPIPE),
+        Fd::Handle(_) | Fd::Socket(_) | Fd::Epoll(_) => Err(ESPIPE),
         Fd::Dev(_) => Ok(0),
     })
 }
@@ -602,6 +740,16 @@ pub fn fstat(fd: u64, buf: u64) -> R {
             Ok(s)
         }
         Fd::Dev(d) => Ok(d.stat()),
+        Fd::Socket(k) => {
+            let mut s = [0u64; 18];
+            (s[1], s[2], s[3], s[7]) = (k.s as u64, 1, 0o140777, 4096); // S_IFSOCK
+            Ok(s)
+        }
+        Fd::Epoll(_) => {
+            let mut s = [0u64; 18];
+            (s[2], s[3], s[7]) = (1, 0o600, 4096); // anon inode
+            Ok(s)
+        }
     })?;
     put_stat(buf, s)
 }
@@ -658,6 +806,8 @@ fn proc_link(guest: &str) -> Option<String> {
                     Some(format!("/{}", rel.to_string_lossy().replace('\\', "/")))
                 }
                 Fd::Handle(_) => Some("pipe:[0]".into()),
+                Fd::Socket(k) => Some(format!("socket:[{}]", k.s)),
+                Fd::Epoll(_) => Some("anon_inode:[eventpoll]".into()),
             })
         }
     }

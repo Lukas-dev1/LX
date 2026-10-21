@@ -2,6 +2,7 @@
 mod elf;
 mod fs;
 mod image;
+mod net;
 mod proc;
 mod signal;
 mod syscall;
@@ -16,7 +17,9 @@ pub mod win {
     pub const MEM_RESERVE: u32 = 0x2000;
     pub const MEM_COMMIT_RESERVE: u32 = 0x3000;
     pub const MEM_DECOMMIT: u32 = 0x4000;
+    pub const MEM_RELEASE: u32 = 0x8000;
     pub const PAGE_READWRITE: u32 = 0x04;
+    pub const PAGE_GUARD: u32 = 0x100;
     pub const FILE_MAP_WRITE: u32 = 0x02;
     pub const EVENT_MODIFY_STATE: u32 = 0x02;
 
@@ -192,7 +195,7 @@ fn run() -> Result<(), String> {
     if let [cmd] = args.as_slice() && cmd == "ps" {
         println!("{:<8} COMMAND", "PID");
         for (pid, desc) in proc::ps() {
-            println!("{pid:<8} {desc}");
+            println!("{pid:<8} {}", desc.split_whitespace().collect::<Vec<_>>().join(" ")); // one line per container
         }
         return Ok(());
     }
@@ -211,6 +214,13 @@ fn run() -> Result<(), String> {
         // ponytail: the container writes straight into the pulled image; a per-container
         // copy-on-write layer (DESIGN.md §6) is still to come.
         let root = std::fs::canonicalize(dir.join("rootfs")).map_err(|e| e.to_string())?;
+        // Like Docker: the container resolves names through the host's DNS servers.
+        let (resolv, hosts) = net::dns_files();
+        let etc = root.join("etc");
+        let _ = std::fs::create_dir_all(&etc);
+        let _ = std::fs::remove_file(etc.join("resolv.conf")); // may be a symlink marker
+        let _ = std::fs::write(etc.join("resolv.conf"), resolv);
+        let _ = std::fs::write(etc.join("hosts"), hosts);
         fs::init(root);
         fs::set_cwd(&c.workdir).map_err(|_| format!("WorkingDir {} not found in image", c.workdir))?;
         proc::register_container(&format!("{image}  {}", c.argv.join(" ")));

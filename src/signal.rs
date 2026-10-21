@@ -218,6 +218,31 @@ pub fn interruptible_sleep(ms: u32) -> R {
     }
 }
 
+/// setitimer(ITIMER_REAL) / alarm: SIGALRM after `value_ms`, then every `interval_ms` (0 = once).
+/// Each call replaces the previous timer. ponytail: the old timer's remaining time reads as 0, and
+/// ITIMER_VIRTUAL/PROF (CPU-time timers) aren't supported.
+pub fn set_alarm(value_ms: u64, interval_ms: u64) {
+    static GEN: AtomicU64 = AtomicU64::new(0);
+    let id = GEN.fetch_add(1, SeqCst) + 1;
+    if value_ms == 0 {
+        return; // disarm
+    }
+    std::thread::spawn(move || {
+        let mut wait = value_ms;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(wait));
+            if GEN.load(SeqCst) != id {
+                return; // replaced or disarmed meanwhile
+            }
+            arrive(14); // SIGALRM
+            if interval_ms == 0 {
+                return;
+            }
+            wait = interval_ms;
+        }
+    });
+}
+
 /// `TERM`, `SIGTERM`, `15` -> 15.
 pub fn parse(name: &str) -> Option<u64> {
     const NAMES: [&str; 31] = ["HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2",

@@ -23,6 +23,26 @@ struct Kid {
 static CHILDREN: Mutex<Vec<Kid>> = Mutex::new(Vec::new());
 static PARENT: AtomicU32 = AtomicU32::new(0);
 
+/// Linux user/group ids, as the guest sees them. Containers start as root (0).
+/// ponytail: tracked, not enforced (on Windows the whole container runs as the host user), and not
+/// carried across fork/exec yet; servers drop privileges in the process that keeps running.
+pub static UID: AtomicU32 = AtomicU32::new(0);
+pub static GID: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_id(id: &AtomicU32, v: u64) -> R {
+    if v as u32 != u32::MAX {
+        id.store(v as u32, Relaxed); // -1 means "unchanged"
+    }
+    Ok(0)
+}
+
+pub fn get_res(id: &AtomicU32, out: [u64; 3]) -> R {
+    for p in out.into_iter().filter(|&p| p != 0) {
+        unsafe { *(p as *mut u32) = id.load(Relaxed) };
+    }
+    Ok(0)
+}
+
 pub fn getpid() -> R {
     Ok(unsafe { GetCurrentProcessId() } as i64)
 }
@@ -320,6 +340,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
     })?;
     fs::close_all(); // we only wait from here on; don't hold pipe ends open
     signal::FORWARD_TO.store(child.id(), Relaxed); // our pid is its pid: pass signals on
+    syscall::release_guest_memory();
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
     exit(code as u64)
 }
