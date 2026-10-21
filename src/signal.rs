@@ -181,7 +181,12 @@ pub fn listen() {
 /// A signal from outside: forward it (if we only wait for an exec'd successor) or raise and wake.
 fn arrive(sig: u64) {
     if crate::syscall::siglog() {
-        crate::syscall::dlog(format_args!("pid {} arrive {sig}", unsafe { crate::win::GetCurrentProcessId() }));
+        let s = &crate::syscall::IN_SYSCALL;
+        let now = match s[0].load(SeqCst) {
+            0 => "running guest code".to_string(),
+            nr => format!("in syscall {} ({:#x}, {:#x}, {:#x})", nr - 1, s[1].load(SeqCst), s[2].load(SeqCst), s[3].load(SeqCst)),
+        };
+        crate::syscall::dlog(format_args!("pid {} arrive {sig}; guest {now}", unsafe { crate::win::GetCurrentProcessId() }));
     }
     let to = FORWARD_TO.load(SeqCst);
     if to != 0 {
