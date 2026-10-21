@@ -119,7 +119,34 @@ pub fn raise(sig: u64) -> R {
 }
 
 pub fn deliverable() -> bool {
-    S.lock().unwrap().pending & !mask() != 0
+    let s = S.lock().unwrap();
+    (s.pending | crate::syscall::ts().tpending.load(SeqCst)) & !mask() != 0
+}
+
+/// tkill/tgkill: a signal for one thread of ours (`tid` as gettid says it: the main thread is the pid).
+/// It's woken if parked in a futex; Go's AllThreadsSyscall (setuid in gosu) waits for every thread.
+pub fn send_thread(tid: u64, sig: u64) -> R {
+    if sig > 64 {
+        return Err(EINVAL);
+    }
+    let main = crate::thread::MAIN_TID.load(Relaxed);
+    let wtid = if tid as u32 == proc::pid() { main } else { tid as u32 };
+    let t = crate::syscall::ts_of(wtid).ok_or(crate::syscall::ESRCH)?;
+    if sig == 0 {
+        return Ok(0);
+    }
+    {
+        let _s = S.lock().unwrap(); // deliver() takes it from under the same lock
+        t.tpending.fetch_or(bit(sig), SeqCst);
+    }
+    let addr = t.futex_addr.load(SeqCst);
+    if addr != 0 {
+        unsafe { crate::win::WakeByAddressAll(addr as *const _) };
+    }
+    if wtid == main {
+        unsafe { crate::win::SetEvent(INTR.load(SeqCst)) }; // the main thread's sleeps and waits use it
+    }
+    Ok(0)
 }
 
 // ---- signalfd ----
@@ -399,13 +426,19 @@ pub const FRAME_MAX: usize = (8 + UC_SIZE + SI_SIZE + 32) as usize;
 pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
     proc::notice_child_exits();
     let mut s = S.lock().unwrap();
+    let mine = &crate::syscall::ts().tpending;
     loop {
-        let ready = s.pending & !mask();
+        let own = mine.load(SeqCst) & !mask(); // this thread's own signals go first
+        let ready = own | s.pending & !mask();
         if ready == 0 {
             return None;
         }
         let sig = ready.trailing_zeros() as u64 + 1;
-        s.pending &= !bit(sig);
+        if own & bit(sig) != 0 {
+            mine.fetch_and(!bit(sig), SeqCst);
+        } else {
+            s.pending &= !bit(sig);
+        }
         let a = s.actions[sig as usize];
         match a.handler {
             0 if default_ignores(sig) => continue,

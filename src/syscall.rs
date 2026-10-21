@@ -69,6 +69,10 @@ pub struct ThreadState {
     /// This thread's blocked signals, and the one to restore after rt_sigsuspend's handler.
     pub sigmask: u64,
     pub suspended_mask: Option<u64>,
+    /// Signals sent to this thread alone (tkill/tgkill), and the futex address it sleeps on (0 = none),
+    /// so a sender can wake it. Read and written by other threads.
+    pub tpending: std::sync::atomic::AtomicU64,
+    pub futex_addr: std::sync::atomic::AtomicU64,
     /// Whether we're running on host_stack right now.
     on_host: bool,
     /// The TEB's own stack fields (StackBase, StackLimit, DeallocationStack) before the guest took over.
@@ -95,6 +99,19 @@ pub fn tls_slot_offsets() -> (u32, u32) {
     (LX_TLS_OFF.load(Relaxed) as u32, SCRATCH_OFF.load(Relaxed) as u32)
 }
 
+/// Every guest thread's ThreadState by Windows tid, for signals sent to one thread (they're leaked, so
+/// the pointers stay valid; an exiting thread takes itself out).
+static THREAD_TS: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+
+pub fn ts_of(tid: u32) -> Option<&'static ThreadState> {
+    THREAD_TS.lock().unwrap().iter().find(|e| e.0 == tid).map(|e| unsafe { &*(e.1 as *const ThreadState) })
+}
+
+pub fn forget_ts() {
+    let me = unsafe { GetCurrentThreadId() };
+    THREAD_TS.lock().unwrap().retain(|e| e.0 != me);
+}
+
 /// This thread's state, created on first use.
 pub fn ts() -> &'static mut ThreadState {
     let idx = TLS_INDEX.load(Relaxed) as u32;
@@ -107,9 +124,11 @@ pub fn ts() -> &'static mut ThreadState {
     let st = Box::leak(Box::new(ThreadState {
         fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host + HOST_STACK as u64,
         frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None,
+        tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
         on_host: false, host_teb: None,
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
+    THREAD_TS.lock().unwrap().push((unsafe { GetCurrentThreadId() }, st as *const ThreadState as usize));
     st
 }
 static START: Mutex<Option<Instant>> = Mutex::new(None);
@@ -1018,8 +1037,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         269 | 439 => fs::faccessat(a[0], a[1]),
         273 => Ok(0),                  // set_robust_list
         // tkill, tgkill. ponytail: signals are process-wide; whichever thread returns from a syscall next runs it.
-        200 => proc::kill(proc::getpid().unwrap_or(0), a[1]),
-        234 => proc::kill(proc::getpid().unwrap_or(0), a[2]),
+        200 => signal::send_thread(a[0], a[1]),        // tkill
+        234 => if a[0] as u32 == crate::proc::pid() { signal::send_thread(a[1], a[2]) } else { proc::kill(a[0] as i32 as i64, a[2]) }, // tgkill
         292 => fs::dup3(a[0], a[1], a[2]),
         293 => fs::pipe2(a[0], a[1]),
         318 => getrandom(a[0], a[1]),
