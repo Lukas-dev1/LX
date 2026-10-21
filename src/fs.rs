@@ -427,7 +427,6 @@ fn link_target(host: &Path, m: &Attrs) -> Option<String> {
         return None;
     }
     let stamp = m.mtime ^ m.len.rotate_left(48);
-    static LINKS: FileFacts<Option<String>> = Mutex::new(None);
     cached(&LINKS, host, stamp, || {
         let d = fs::read(host).ok()?;
         d.strip_prefix(LINK_MAGIC).map(|t| String::from_utf8_lossy(t).into_owned())
@@ -435,9 +434,19 @@ fn link_target(host: &Path, m: &Attrs) -> Option<String> {
 }
 
 /// Facts that cost an open to learn (is this small file a symlink marker, its :lx stream), remembered per
-/// (path, mtime): a write to the file or to its stream bumps its LastWriteTime, so a change made by any
-/// process just misses. Each costs ~60 us, most of a stat. ponytail: 64k entries, then all forgotten.
+/// (path, mtime): a write to the file or to its stream bumps its LastWriteTime, so a change made by another
+/// process misses. The clock behind file times ticks only every 1-15 ms, so our own writes (set_meta,
+/// write_link) also forget the path. Each fact costs ~60 us, most of a stat.
+/// ponytail: 64k entries, then all forgotten.
 type FileFacts<T> = Mutex<Option<HashMap<PathBuf, (u64, T)>>>;
+static LINKS: FileFacts<Option<String>> = Mutex::new(None);
+static METAS: FileFacts<Option<[u32; 3]>> = Mutex::new(None);
+
+fn forget<T>(facts: &FileFacts<T>, host: &Path) {
+    if let Some(m) = facts.lock().unwrap().as_mut() {
+        m.remove(host);
+    }
+}
 
 fn cached<T: Clone>(facts: &FileFacts<T>, host: &Path, stamp: u64, learn: impl FnOnce() -> T) -> T {
     if let Some((s, v)) = facts.lock().unwrap().as_ref().and_then(|m| m.get(host)) && *s == stamp {
@@ -454,6 +463,7 @@ fn cached<T: Clone>(facts: &FileFacts<T>, host: &Path, stamp: u64, learn: impl F
 }
 
 fn write_link(host: &Path, target: &str) -> io::Result<()> {
+    forget(&LINKS, host);
     fs::write(host, [LINK_MAGIC, target.as_bytes()].concat())
 }
 
@@ -1698,6 +1708,7 @@ fn get_meta(host: &Path) -> Option<[u32; 3]> {
 }
 
 fn set_meta(host: &Path, m: [u32; 3]) -> io::Result<()> {
+    forget(&METAS, host);
     fs::write(meta_stream(host), m.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
 }
 
@@ -1715,7 +1726,6 @@ pub fn umask(mask: u64) -> R {
 
 /// Fill st_mode's permission bits, st_uid and st_gid from the stored metadata.
 fn with_meta(s: &mut [u64; 18], host: &Path) {
-    static METAS: FileFacts<Option<[u32; 3]>> = Mutex::new(None);
     let stamp = s[11].wrapping_mul(1_000_000_000).wrapping_add(s[12]); // mtime
     let meta = cached(&METAS, host, stamp, || get_meta(host));
     let [perm, uid, gid] = meta.unwrap_or([s[3] as u32 & 0o7777, 0, 0]);
