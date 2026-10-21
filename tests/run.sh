@@ -63,7 +63,7 @@ if [ -x $GO ]; then
 fi
 
 # ---- images: pull what's missing; guest scripts reach containers through a read-only volume ----
-for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine node:alpine; do
+for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine node:alpine golang:alpine; do
   dir=$STORE/library_${img%%:*}/${img#*:}/rootfs
   # Pulled before lx kept file modes, every file reads 0755 (no real image has /etc/passwd so): re-pull.
   if [ -d "$dir" ] && [ "$($LX run "$img" stat -c %a /etc/passwd 2> /dev/null < /dev/null)" = 755 ]; then
@@ -113,6 +113,8 @@ expect "redis: daemonized server"  0 "PONG" -- run redis:alpine sh -c 'redis-ser
 expect "postgres: initdb, pg_ctl start, query, stop" 0 "answer 42" -- run -v "$GUEST" postgres:alpine sh /t/pgtest.sh
 # node: musl's pthread_getattr_np measures the main stack with mremap; an HTTP round trip in one process.
 expect "node: http server + client" 0 "node ok 2" -- run node:alpine node -e 'const h=require("http");const s=h.createServer((q,r)=>r.end("ok")).listen(0,()=>h.get("http://127.0.0.1:"+s.address().port,r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>{console.log("node",d,1+1);s.close()})}))'
+# go run builds the standard library first, forking compilers from many threads at once.
+expect "golang: go run (parallel forks)" 0 "go ok" -- run golang:alpine sh -c 'cd /tmp && printf "package main\nimport \"fmt\"\nfunc main(){fmt.Println(\"go ok\")}\n" > m.go && go run m.go'
 
 # ---- volumes: data written in one container run is there in the next; the image stays untouched ----
 VOL="$ROOT/rootfs/voltest-suite"
