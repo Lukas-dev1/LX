@@ -3,6 +3,7 @@
 import sys, traceback
 
 results = []
+checks = []  # registered at import, run under the __main__ guard (spawn re-imports this file)
 
 
 ONLY = sys.argv[1:]  # optional name filters: run only checks whose name contains one of them
@@ -10,8 +11,15 @@ ONLY = sys.argv[1:]  # optional name filters: run only checks whose name contain
 
 def check(name):
     def wrap(fn):
+        checks.append((name, fn))
+        return fn
+    return wrap
+
+
+def run_checks():
+    for name, fn in checks:
         if ONLY and not any(o in name for o in ONLY):
-            return fn
+            continue
         print(f"... {name}", flush=True)
         try:
             detail = fn()
@@ -19,8 +27,6 @@ def check(name):
         except Exception as e:
             results.append((name, False, f"{type(e).__name__}: {e}"))
             traceback.print_exc()
-        return fn
-    return wrap
 
 
 @check("libc")
@@ -143,9 +149,13 @@ def _():
 def _():
     import multiprocessing as mp
     with mp.get_context("fork").Pool(3) as pool:
-        r = pool.map(pow, range(10), [2] * 10)
+        r = pool.starmap(pow, [(i, 2) for i in range(10)])
     assert r == [i * i for i in range(10)]
     return str(sum(r))
+
+
+def _child(q):
+    q.put("from child")
 
 
 @check("multiprocessing (spawn)")
@@ -159,10 +169,6 @@ def _():
     p.join(60)
     assert v == "from child" and p.exitcode == 0, (v, p.exitcode)
     return "ok"
-
-
-def _child(q):
-    q.put("from child")
 
 
 @check("threads + concurrent.futures")
@@ -252,8 +258,10 @@ def _():
     return out.stdout.split(" from ")[0]
 
 
-ok = sum(r[1] for r in results)
-for name, good, detail in results:
-    print(f"{'ok  ' if good else 'FAIL'} {name}: {detail}")
-print(f"---- {ok}/{len(results)} OK")
-sys.exit(0 if ok == len(results) else 1)
+if __name__ == "__main__":
+    run_checks()
+    ok = sum(r[1] for r in results)
+    for name, good, detail in results:
+        print(f"{'ok  ' if good else 'FAIL'} {name}: {detail}")
+    print(f"---- {ok}/{len(results)} OK")
+    sys.exit(0 if ok == len(results) else 1)
