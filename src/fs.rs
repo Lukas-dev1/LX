@@ -646,7 +646,10 @@ impl Fs {
     }
 
     fn at(&self, dirfd: u64, path: u64, follow: bool) -> Result<(String, PathBuf), i64> {
-        self.resolve(&self.dir_of(dirfd)?, &cstr(path)?, follow)
+        let path = cstr(path)?;
+        // An absolute path ignores dirfd, even an invalid one (mariadb passes -1).
+        let dir = if path.starts_with('/') { String::new() } else { self.dir_of(dirfd)? };
+        self.resolve(&dir, &path, follow)
     }
 
     fn fd(&mut self, fd: u64) -> Result<&mut Fd, i64> {
