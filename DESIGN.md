@@ -87,7 +87,7 @@ Anything unimplemented logs its number and returns `-ENOSYS`, so the trace from 
   - **Symlinks** (✅): NTFS symlinks need Developer Mode or a privilege, so they're small marker files that `lx` resolves.
   - **Path resolution** (✅): done in `lx`, component by component, against the guest root. `..` can never climb above the root, and absolute symlink targets are re-rooted.
   - **Case sensitivity** (planned): set the per-directory case-sensitive flag (`FILE_CASE_SENSITIVE_INFORMATION`) on unpack. This works without admin on directories we create.
-  - **Modes and ownership** (planned): keep them in an alternate data stream (`:lx.meta`) and return them from `stat`. Today every file reads as 0755 root:root.
+  - **Modes and ownership** (✅): permission bits, uid and gid live in an alternate data stream of each entry (`<host>:lx`, three u32s). Unpack writes them from the tar headers; `stat`/`fstat` read them; `chmod`/`chown` (and the f-/l-/at variants) write them through the writable layer, which also gives the directories it creates the image's metadata; `open(O_CREAT)`, `creat` and `mkdir` record `mode & ~umask` and the effective ids. No stream: 0755 root:root (images pulled before this). Volumes' host files get none (chmod there is accepted and ignored). Not enforced: everyone is effectively root for access checks. The stream costs one extra read per `stat` (~7%).
 
 ## 7. Isolation and safety model (be honest about it)
 
