@@ -155,6 +155,17 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     }
     let pid = child.id();
     CHILDREN.lock().unwrap().push(Kid { pid, process: OwnedHandle::from(child), notified: false });
+    // A parent blocked in epoll_wait/poll/read hears of the exit at once, not at its next syscall return
+    // (postgres's postmaster sleeps up to 60 s waiting for its startup process to exit).
+    std::thread::spawn(move || {
+        let h = unsafe { OpenProcess(0x0010_0000, 0, pid) }; // SYNCHRONIZE
+        if h != 0 {
+            unsafe { WaitForMultipleObjects(1, &h, 0, u32::MAX) };
+            unsafe { CloseHandle(h) };
+            notice_child_exits();
+            signal::wake_if_handled(signal::SIGCHLD);
+        }
+    });
     Ok(pid as i64)
 }
 

@@ -227,6 +227,17 @@ fn arrive(sig: u64) {
     }
 }
 
+/// Break a blocking wait for a signal raised from another thread of ours, if the guest has a handler for
+/// it (an ignored SIGCHLD needn't interrupt anything).
+pub fn wake_if_handled(sig: u64) {
+    if S.lock().unwrap().actions[sig as usize].handler > 1 { // not SIG_DFL (0) or SIG_IGN (1)
+        unsafe {
+            crate::win::SetEvent(INTR.load(SeqCst));
+            crate::win::CancelSynchronousIo(GUEST_THREAD.load(SeqCst));
+        }
+    }
+}
+
 /// Ctrl-C / Ctrl-Break / console close, which every process on the console gets, like a terminal's
 /// foreground group gets SIGINT. A waiting exec proxy ignores it: its successor gets its own.
 unsafe extern "system" fn console_ctrl(kind: u32) -> i32 {
