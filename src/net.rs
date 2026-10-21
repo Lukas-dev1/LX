@@ -647,6 +647,28 @@ pub fn sys_recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, lenp: u6
 
 /// struct msghdr { name, namelen, iov, iovlen, control, controllen, flags }.
 /// ponytail: data only; control messages (SCM_RIGHTS, credentials) aren't supported.
+/// sendmmsg/recvmmsg: an array of struct mmsghdr { msghdr (56 bytes); u32 msg_len; pad } = 64 bytes.
+/// glibc's resolver sends its A and AAAA queries in one sendmmsg. Returns how many went through.
+pub fn sys_mmsg(fd: u64, vec: u64, n: u64, flags: u64, send: bool) -> R {
+    const MSG_WAITFORONE: u64 = 0x10000;
+    let mut done = 0u64;
+    for i in 0..n.min(1024) {
+        let hdr = vec + i * 64;
+        // After the first message, recvmmsg(MSG_WAITFORONE) must not block for more.
+        let f = if !send && flags & MSG_WAITFORONE != 0 && done > 0 { flags | MSG_DONTWAIT } else { flags } & !MSG_WAITFORONE;
+        let r = if send { sys_sendmsg(fd, hdr, f) } else { sys_recvmsg(fd, hdr, f) };
+        match r {
+            Ok(len) => {
+                unsafe { *((hdr + 56) as *mut u32) = len as u32 };
+                done += 1;
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done as i64)
+}
+
 pub fn sys_sendmsg(fd: u64, msg: u64, flags: u64) -> R {
     let m = unsafe { *(msg as *const [u64; 7]) };
     let data = gather(m[2], m[3])?;

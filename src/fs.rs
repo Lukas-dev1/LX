@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -924,6 +925,108 @@ pub fn openat(dirfd: u64, path: u64, flags: u64) -> R {
             Fd::File { f, host }
         };
         Ok(fs.add(fd, 0, cloexec))
+    })
+}
+
+/// close_range(first, last, flags): close every fd in the range, or with CLOSE_RANGE_CLOEXEC just mark them.
+pub fn close_range(first: u64, last: u64, flags: u64) -> R {
+    const CLOSE_RANGE_CLOEXEC: u64 = 4;
+    with(|fs| {
+        let end = (last.min(fs.fds.len() as u64 - 1) as usize).max(first as usize);
+        for i in first as usize..=end.min(fs.fds.len().saturating_sub(1)) {
+            if flags & CLOSE_RANGE_CLOEXEC != 0 {
+                if let Some(s) = fs.fds[i].as_mut() {
+                    s.cloexec = true;
+                }
+            } else {
+                fs.fds[i] = None;
+            }
+        }
+        Ok(0)
+    })
+}
+
+/// link/linkat. In the upper layer or a volume this is a real NTFS hard link; a file that only exists
+/// in the image is copied up first (the image must not gain links into a container).
+pub fn linkat(olddir: u64, old: u64, newdir: u64, new: u64, flags: u64) -> R {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    with(|fs| {
+        let (og, oh) = fs.at(olddir, old, flags & AT_SYMLINK_FOLLOW != 0)?;
+        let (ng, nh) = fs.at(newdir, new, false)?;
+        if fs::symlink_metadata(&oh).map_err(errno)?.is_dir() {
+            return Err(crate::syscall::EPERM);
+        }
+        if exists(&nh) {
+            return Err(EEXIST);
+        }
+        let src = fs.writable(&comps_of(&og), true)?;
+        let dst = fs.writable(&comps_of(&ng), false)?;
+        fs::hard_link(&src, &dst).or_else(|_| fs::copy(&src, &dst).map(|_| ())).map(|_| 0).map_err(errno)
+    })
+}
+
+/// utimensat / futimens: set access and modification times (timespec pairs; UTIME_NOW / UTIME_OMIT).
+pub fn utimensat(dirfd: u64, path: u64, times: u64, flags: u64) -> R {
+    const UTIME_NOW: u64 = (1 << 30) - 1;
+    const UTIME_OMIT: u64 = (1 << 30) - 2;
+    let when = |i: u64| -> Option<std::time::SystemTime> {
+        let [s, ns] = if times == 0 { [0, UTIME_NOW] } else { unsafe { *((times + i * 16) as *const [u64; 2]) } };
+        match ns {
+            UTIME_OMIT => None,
+            UTIME_NOW => Some(std::time::SystemTime::now()),
+            _ => Some(UNIX_EPOCH + std::time::Duration::new(s, ns as u32)),
+        }
+    };
+    let mut t = fs::FileTimes::new();
+    if let Some(a) = when(0) { t = t.set_accessed(a) }
+    if let Some(m) = when(1) { t = t.set_modified(m) }
+    with(|fs| {
+        if path == 0 {
+            // futimens(fd)
+            return match fs.fd(dirfd)? {
+                Fd::File { f, .. } => f.set_times(t).map(|_| 0).map_err(errno),
+                _ => Ok(0),
+            };
+        }
+        let (guest, host) = fs.at(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+        if fs::metadata(&host).map_err(errno)?.is_dir() {
+            return Ok(0); // ponytail: directory times aren't settable through std; nothing relies on them
+        }
+        let target = fs.writable(&comps_of(&guest), true)?;
+        OpenOptions::new().write(true).open(target).and_then(|f| f.set_times(t)).map(|_| 0).map_err(errno)
+    })
+}
+
+/// statfs/fstatfs: the host volume's real sizes (df), reported as ext4, or tmpfs under /dev/shm.
+pub fn statfs(path: Option<u64>, fd: Option<u64>, buf: u64) -> R {
+    let (host, guest) = with(|fs| match (path, fd) {
+        (Some(p), _) => fs.at(AT_FDCWD, p, true).map(|(g, h)| (h, g)),
+        (_, Some(fd)) => match fs.fd(fd)? {
+            Fd::File { host, .. } => Ok((host.clone(), String::new())),
+            _ => Ok((fs.root.clone(), String::new())),
+        },
+        _ => Err(EINVAL),
+    })?;
+    let dir = if host.is_dir() { host.clone() } else { host.parent().map(Path::to_path_buf).unwrap_or(host.clone()) };
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    unsafe { crate::win::GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    const BS: u64 = 4096;
+    let ty: u64 = if guest.starts_with("/dev/shm") { 0x0102_1994 } else { 0xEF53 }; // TMPFS_MAGIC / EXT4
+    // struct statfs: type, bsize, blocks, bfree, bavail, files, ffree, fsid[2 x i32], namelen, frsize, flags, spare[4]
+    let s: [u64; 15] = [ty, BS, total / BS, free / BS, avail / BS, 1 << 24, 1 << 23, 0, 255, BS, 0, 0, 0, 0, 0];
+    unsafe { *(buf as *mut [u64; 15]) = s };
+    Ok(0)
+}
+
+/// Make a directory in the container (through the layer), e.g. /dev/shm.
+pub fn mkdir_guest(guest: &str) -> Result<(), i64> {
+    with(|fs| {
+        let c = comps_of(guest);
+        if exists(&fs.host(&c)) {
+            return Ok(());
+        }
+        fs::create_dir_all(fs.writable(&c, false)?).map_err(errno)
     })
 }
 

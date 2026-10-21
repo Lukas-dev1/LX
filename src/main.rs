@@ -101,6 +101,7 @@ pub mod win {
         pub fn SetHandleInformation(h: isize, mask: u32, flags: u32) -> i32;
         pub fn CreatePipe(r: *mut isize, w: *mut isize, attr: *mut c_void, size: u32) -> i32;
         pub fn GetFileType(h: isize) -> u32;
+        pub fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
         pub fn CreateFileMappingW(file: isize, attr: *mut c_void, prot: u32, hi: u32, lo: u32, name: *const u16) -> isize;
         pub fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> isize;
         pub fn MapViewOfFile(map: isize, access: u32, hi: u32, lo: u32, len: usize) -> *mut c_void;
@@ -285,6 +286,7 @@ fn run() -> Result<(), String> {
         let (resolv, hosts) = net::dns_files();
         let _ = fs::write_guest_file("/etc/resolv.conf", resolv.as_bytes());
         let _ = fs::write_guest_file("/etc/hosts", hosts.as_bytes());
+        let _ = fs::mkdir_guest("/dev/shm"); // POSIX shared memory and semaphores (glibc's sem_open) live here
         for (host, guest, ro) in volumes {
             fs::add_mount(&guest, host, ro).map_err(|_| format!("-v: can't mount at {guest}"))?;
         }

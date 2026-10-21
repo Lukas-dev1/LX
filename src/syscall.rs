@@ -904,6 +904,19 @@ fn dispatch(c: &mut Context) -> i64 {
         218 => { ts().clear_tid = a[0]; thread::gettid() } // set_tid_address
         230 => clock_nanosleep(a[0], a[1], a[2]),
         228 => clock_gettime(a[0], a[1]),
+        229 => clock_getres(a[1]),
+        201 => time(a[0]),
+        221 => Ok(0),                  // fadvise64: advice only
+        188..=199 => Err(95),          // *xattr: EOPNOTSUPP, like a filesystem without extended attributes
+        435 => Err(ENOSYS),            // clone3: glibc falls back to clone, which we have
+        436 => fs::close_range(a[0], a[1], a[2]),
+        86 => fs::linkat(CWD, a[0], CWD, a[1], 0),
+        265 => fs::linkat(a[0], a[1], a[2], a[3], a[4]),
+        280 => fs::utimensat(a[0], a[1], a[2], a[3]),
+        137 => fs::statfs(Some(a[0]), None, a[1]),
+        138 => fs::statfs(None, Some(a[0]), a[1]),
+        299 => net::sys_mmsg(a[0], a[1], a[2], a[3], false), // recvmmsg
+        307 => net::sys_mmsg(a[0], a[1], a[2], a[3], true),  // sendmmsg
         257 => fs::openat(a[0], a[1], a[2]),
         258 => fs::mkdirat(a[0], a[1]),
         262 => fs::fstatat(a[0], a[1], a[2], a[3]),
@@ -1157,6 +1170,23 @@ pub fn now(clock: u64) -> (u64, u64) {
         START.lock().unwrap().unwrap().elapsed() // every other clock: monotonic since start
     };
     (d.as_secs(), d.subsec_nanos() as u64)
+}
+
+/// time(): seconds since the epoch, also stored at `out` if given.
+fn time(out: u64) -> R {
+    let (s, _) = now(0);
+    if out != 0 {
+        unsafe { *(out as *mut u64) = s };
+    }
+    Ok(s as i64)
+}
+
+/// All our clocks tick in nanoseconds (QueryPerformanceCounter is finer than that on modern hardware).
+fn clock_getres(ts: u64) -> R {
+    if ts != 0 {
+        unsafe { *(ts as *mut [u64; 2]) = [0, 1] };
+    }
+    Ok(0)
 }
 
 fn clock_gettime(clock: u64, ts: u64) -> R {
