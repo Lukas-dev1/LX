@@ -142,6 +142,7 @@ pub mod win {
         pub fn SwitchToThread() -> i32;
         pub fn FlushProcessWriteBuffers();
         pub fn GetModuleHandleW(name: *const u16) -> isize;
+        pub fn GetModuleHandleExW(flags: u32, addr: *const c_void, out: *mut isize) -> i32;
     }
     #[link(name = "synchronization")]
     unsafe extern "system" {

@@ -722,7 +722,15 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
         let r = code.regions.iter().find(|(lo, hi)| (*lo..*hi).contains(&c.rip)).copied();
         (r, code.sites.binary_search(&c.rip).is_ok())
     };
-    let Some((_, end)) = region else {
+    // Guest code is a loaded ELF region, or memory outside every Windows module: JIT code (HotSpot,
+    // V8) lives in plain mmap'd pages and faults on purpose.
+    let jit = region.is_none() && {
+        const FROM_ADDRESS: u32 = 4;
+        const UNCHANGED_REFCOUNT: u32 = 2;
+        let mut m = 0isize;
+        (unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, c.rip as *const _, &mut m) }) == 0
+    };
+    let Some((_, end)) = region.or(jit.then_some((c.rip, c.rip + 15))) else {
         if debug() && rec.code == STATUS_ACCESS_VIOLATION {
             let base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
             let msg = format!("[lx] host fault at rip {:#x} (lx.exe+{:#x}) addr {:#x} tid {}
