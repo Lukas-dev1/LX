@@ -63,7 +63,7 @@ if [ -x $GO ]; then
 fi
 
 # ---- images: pull what's missing; guest scripts reach containers through a read-only volume ----
-for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine; do
+for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine node:alpine; do
   dir=$STORE/library_${img%%:*}/${img#*:}/rootfs
   # Pulled before lx kept file modes, every file reads 0755 (no real image has /etc/passwd so): re-pull.
   if [ -d "$dir" ] && [ "$($LX run "$img" stat -c %a /etc/passwd 2> /dev/null < /dev/null)" = 755 ]; then
@@ -111,6 +111,8 @@ expect "run -u / USER + HOME"      0 "65534:65533 HOME=/." -- run -u nobody:nogr
 # A daemon outlives the process that started it (redis --daemonize forks; its parent exits at once).
 expect "redis: daemonized server"  0 "PONG" -- run redis:alpine sh -c 'redis-server --port 6390 --daemonize yes > /dev/null; sleep 2; redis-cli -p 6390 ping; redis-cli -p 6390 shutdown nosave'
 expect "postgres: initdb, pg_ctl start, query, stop" 0 "answer 42" -- run -v "$GUEST" postgres:alpine sh /t/pgtest.sh
+# node: musl's pthread_getattr_np measures the main stack with mremap; an HTTP round trip in one process.
+expect "node: http server + client" 0 "node ok 2" -- run node:alpine node -e 'const h=require("http");const s=h.createServer((q,r)=>r.end("ok")).listen(0,()=>h.get("http://127.0.0.1:"+s.address().port,r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>{console.log("node",d,1+1);s.close()})}))'
 
 # ---- volumes: data written in one container run is there in the next; the image stays untouched ----
 VOL="$ROOT/rootfs/voltest-suite"

@@ -1348,12 +1348,24 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> R {
 /// Moves only (MREMAP_MAYMOVE): reservations can't grow in place. Keeps the old protection.
 fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
     const MREMAP_MAYMOVE: u64 = 1;
-    if flags & MREMAP_MAYMOVE == 0 || new_len == 0 {
-        return Err(ENOMEM);
+    if new_len == 0 {
+        return Err(EINVAL);
     }
+    // Unmapped is EFAULT before anything else: musl's pthread_getattr_np finds the main thread's stack
+    // size by growing pages below it in place until one isn't mapped (ENOMEM means "mapped, keep going").
     let mut m = MemoryBasicInformation::default();
     if unsafe { VirtualQuery(old as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 || m.state != MEM_COMMIT {
         return Err(EFAULT);
+    }
+    let (old_pages, new_pages) = (old_len.next_multiple_of(PAGE), new_len.next_multiple_of(PAGE));
+    if new_pages <= old_pages {
+        if new_pages < old_pages {
+            munmap(old + new_pages, old_pages - new_pages, 0)?; // shrinking stays in place
+        }
+        return Ok(old as i64);
+    }
+    if flags & MREMAP_MAYMOVE == 0 {
+        return Err(ENOMEM); // ponytail: never grown in place
     }
     let new = alloc(None, new_len).ok_or(ENOMEM)?;
     unsafe { std::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, old_len.min(new_len) as usize) };
