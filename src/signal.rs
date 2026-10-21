@@ -78,9 +78,155 @@ pub fn raise(sig: u64) -> R {
     Ok(0)
 }
 
-fn deliverable() -> bool {
+pub fn deliverable() -> bool {
     let s = S.lock().unwrap();
     s.pending & !s.blocked != 0
+}
+
+// ---- signals from other processes (kill, lx kill/stop) and from the console (Ctrl-C) ----
+//
+// Each lx process owns a mailbox: shared memory `Local\lx-sig-<pid>` holding a pending bitmask, plus
+// the event `Local\lx-sigev-<pid>`. Senders OR their bit in and set the event. A watcher thread turns
+// arrivals into raise() + wake(). ponytail: a handler can't run while the guest spins without making
+// syscalls; that needs thread hijack (SuspendThread/SetThreadContext). Default "terminate" still works.
+
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicIsize, Ordering::SeqCst};
+
+/// Set by the waits a signal must cut short (sleep, poll, wait4, sigsuspend). Auto-reset.
+static INTR: AtomicIsize = AtomicIsize::new(0);
+/// The guest's thread, so CancelSynchronousIo can break a blocked ReadFile/WriteFile.
+static GUEST_THREAD: AtomicIsize = AtomicIsize::new(0);
+/// While this process only waits for an exec'd successor: pass signals on to it (same Linux pid).
+pub static FORWARD_TO: AtomicU32 = AtomicU32::new(0);
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+
+fn mailbox(pid: u32, create: bool) -> Option<(&'static AtomicU64, isize)> {
+    use crate::win::*;
+    let (map_name, ev_name) = (wide(&format!("Local\\lx-sig-{pid}")), wide(&format!("Local\\lx-sigev-{pid}")));
+    unsafe {
+        let (map, ev) = if create {
+            (CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, 0, 8, map_name.as_ptr()),
+             CreateEventW(std::ptr::null_mut(), 0, 0, ev_name.as_ptr()))
+        } else {
+            (OpenFileMappingW(FILE_MAP_WRITE, 0, map_name.as_ptr()), OpenEventW(EVENT_MODIFY_STATE, 0, ev_name.as_ptr()))
+        };
+        if map == 0 || ev == 0 {
+            return None;
+        }
+        let view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 8);
+        // ponytail: sender-side handles and views are never closed; senders are short-lived.
+        (!view.is_null()).then(|| (&*(view as *const AtomicU64), ev))
+    }
+}
+
+/// Put `sig` in another lx process's mailbox. ESRCH if it isn't a running lx guest.
+pub fn send(pid: u32, sig: u64) -> R {
+    if sig == 0 || sig > 64 {
+        return Err(EINVAL);
+    }
+    let (bits, ev) = mailbox(pid, false).ok_or(crate::syscall::ESRCH)?;
+    bits.fetch_or(bit(sig), SeqCst);
+    unsafe { crate::win::SetEvent(ev) };
+    Ok(0)
+}
+
+/// Make this process signalable: create the mailbox, start the watcher, take over Ctrl-C.
+pub fn listen() {
+    use crate::win::*;
+    unsafe {
+        let mut t = 0isize;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &mut t, 0, 0, 2); // SAME_ACCESS
+        GUEST_THREAD.store(t, SeqCst);
+        INTR.store(CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()), SeqCst);
+        SetConsoleCtrlHandler(Some(console_ctrl), 1);
+    }
+    let Some((bits, ev)) = mailbox(unsafe { GetCurrentProcessId() }, true) else { return };
+    std::thread::spawn(move || loop {
+        unsafe { WaitForMultipleObjects(1, &ev, 0, u32::MAX) };
+        let mut b = bits.swap(0, SeqCst);
+        while b != 0 {
+            let sig = b.trailing_zeros() as u64 + 1;
+            b &= b - 1;
+            arrive(sig);
+        }
+    });
+}
+
+/// A signal from outside: forward it (if we only wait for an exec'd successor) or raise and wake.
+fn arrive(sig: u64) {
+    let to = FORWARD_TO.load(SeqCst);
+    if to != 0 {
+        let _ = send(to, sig);
+        return;
+    }
+    if sig == 9 {
+        proc::exit(128 + 9); // SIGKILL can't be caught
+    }
+    let _ = raise(sig);
+    // Default action "terminate" needs no guest cooperation: do it now, even if the guest is spinning.
+    let fatal = {
+        let s = S.lock().unwrap();
+        s.pending & !s.blocked & bit(sig) != 0 && s.actions[sig as usize].handler == 0 && !default_ignores(sig)
+    };
+    if fatal {
+        proc::exit(128 + sig);
+    }
+    unsafe {
+        crate::win::SetEvent(INTR.load(SeqCst));
+        crate::win::CancelSynchronousIo(GUEST_THREAD.load(SeqCst));
+    }
+}
+
+/// Ctrl-C / Ctrl-Break / console close, which every process on the console gets, like a terminal's
+/// foreground group gets SIGINT. A waiting exec proxy ignores it: its successor gets its own.
+unsafe extern "system" fn console_ctrl(kind: u32) -> i32 {
+    if FORWARD_TO.load(SeqCst) == 0 {
+        arrive(match kind {
+            0 => 2,  // CTRL_C_EVENT -> SIGINT
+            1 => 3,  // CTRL_BREAK_EVENT -> SIGQUIT
+            _ => 1,  // close/logoff/shutdown -> SIGHUP
+        });
+    }
+    1
+}
+
+/// The event a blocking wait should include so a signal interrupts it (0 before listen()).
+pub fn intr_event() -> isize {
+    INTR.load(SeqCst)
+}
+
+/// Sleep up to `ms` (u32::MAX = forever), cut short by a deliverable signal: then Err(EINTR).
+pub fn interruptible_sleep(ms: u32) -> R {
+    let ev = intr_event();
+    let start = std::time::Instant::now();
+    loop {
+        if deliverable() {
+            return Err(EINTR);
+        }
+        let left = if ms == u32::MAX { u32::MAX } else { ms.saturating_sub(start.elapsed().as_millis() as u32) };
+        if left == 0 {
+            return Ok(0);
+        }
+        if ev == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(left.min(3_600_000) as u64));
+        } else {
+            unsafe { crate::win::WaitForMultipleObjects(1, &ev, 0, left) };
+        }
+    }
+}
+
+/// `TERM`, `SIGTERM`, `15` -> 15.
+pub fn parse(name: &str) -> Option<u64> {
+    const NAMES: [&str; 31] = ["HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2",
+        "PIPE", "ALRM", "TERM", "STKFLT", "CHLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ",
+        "VTALRM", "PROF", "WINCH", "IO", "PWR", "SYS"];
+    let n = name.trim_start_matches('-');
+    let n = n.strip_prefix("SIG").unwrap_or(n).to_ascii_uppercase();
+    n.parse().ok().filter(|&s| (1..=64).contains(&s))
+        .or_else(|| NAMES.iter().position(|&x| x == n).map(|i| i as u64 + 1))
 }
 
 /// rt_sigsuspend (mask_ptr != 0) and pause (mask_ptr == 0): swap in the mask, sleep until a signal
@@ -94,7 +240,7 @@ pub fn sigsuspend(mask_ptr: u64) -> R {
         }
     }
     while !deliverable() {
-        proc::wait_for_child_exit(); // the only asynchronous signal source we have: raises SIGCHLD
+        proc::wait_for_child_exit(); // returns on a child exit (raising SIGCHLD) or a signal from outside
     }
     Err(EINTR)
 }

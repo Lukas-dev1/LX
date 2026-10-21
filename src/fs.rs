@@ -408,6 +408,9 @@ pub fn poll(fds: u64, n: u64, timeout_ms: i64) -> R {
         if ready > 0 || expired {
             return Ok(ready);
         }
+        if crate::signal::deliverable() {
+            return Err(crate::syscall::EINTR);
+        }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }

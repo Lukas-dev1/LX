@@ -231,6 +231,7 @@ pub fn debug() -> bool {
 pub fn install() {
     START.lock().unwrap().get_or_insert_with(Instant::now);
     unsafe { AddVectoredExceptionHandler(1, veh) };
+    signal::listen();
 }
 
 /// Rewrite every `syscall` in writable guest code at [addr, addr+len) to `ud2` and register the range.
@@ -494,7 +495,11 @@ pub fn write_handle(h: isize, buf: u64, len: u64) -> R {
         return Ok(done as i64);
     }
     // ERROR_NO_DATA / ERROR_BROKEN_PIPE: the reader is gone. ponytail: EPIPE without SIGPIPE.
-    if matches!(unsafe { GetLastError() }, 232 | 109) { Err(EPIPE) } else { Err(EIO) }
+    match unsafe { GetLastError() } {
+        232 | 109 => Err(EPIPE),
+        995 => Err(EINTR), // a signal cancelled the write
+        _ => Err(EIO),
+    }
 }
 
 pub fn read_handle(h: isize, buf: u64, len: u64) -> R {
@@ -503,7 +508,11 @@ pub fn read_handle(h: isize, buf: u64, len: u64) -> R {
     if unsafe { ReadFile(h, buf as *mut u8, len, &mut done, std::ptr::null_mut()) } != 0 {
         return Ok(done as i64);
     }
-    if unsafe { GetLastError() } == 109 { Ok(0) } else { Err(EIO) } // ERROR_BROKEN_PIPE is EOF
+    match unsafe { GetLastError() } {
+        109 => Ok(0),       // ERROR_BROKEN_PIPE is EOF
+        995 => Err(EINTR),  // ERROR_OPERATION_ABORTED: a signal cancelled the read
+        _ => Err(EIO),
+    }
 }
 
 // ---- memory ----
@@ -641,9 +650,8 @@ fn gettimeofday(tv: u64) -> R {
 }
 
 fn nanosleep(ts: u64) -> R {
-    let [s, ns] = unsafe { *(ts as *const [u64; 2]) };
-    std::thread::sleep(std::time::Duration::new(s, ns as u32));
-    Ok(0)
+    // ponytail: on EINTR the remaining time isn't written back; callers (sleep) just exit.
+    signal::interruptible_sleep(timespec_ms(ts).clamp(0, u32::MAX as i64 - 1) as u32)
 }
 
 /// A `struct timespec *` timeout in ms; NULL means wait forever (-1).

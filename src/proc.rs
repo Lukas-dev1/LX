@@ -135,10 +135,22 @@ pub fn wait4(pid: i64, status: u64, options: u64) -> R {
     if idx.is_empty() {
         return Err(ECHILD);
     }
-    let hs: Vec<isize> = idx.iter().map(|&i| kids[i].process.as_raw_handle() as isize).collect();
-    let timeout = if options & WNOHANG != 0 { 0 } else { u32::MAX };
-    let r = unsafe { WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), 0, timeout) } as usize;
-    if r >= hs.len() {
+    let mut hs: Vec<isize> = idx.iter().map(|&i| kids[i].process.as_raw_handle() as isize).collect();
+    let n = hs.len();
+    let blocking = options & WNOHANG == 0;
+    if blocking && signal::intr_event() != 0 {
+        hs.push(signal::intr_event()); // a signal cuts the wait short
+    }
+    let r = loop {
+        let r = unsafe { WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), 0, if blocking { u32::MAX } else { 0 }) } as usize;
+        if r != n || !blocking {
+            break r;
+        }
+        if signal::deliverable() {
+            return Err(crate::syscall::EINTR);
+        }
+    };
+    if r >= n {
         return Ok(0); // WAIT_TIMEOUT under WNOHANG
     }
     let kid = kids.remove(idx[r]);
@@ -165,8 +177,11 @@ pub fn notice_child_exits() {
 /// Block until some child exits (raising SIGCHLD). With no running children nothing can wake us,
 /// which is also what Linux would do without other signal sources.
 pub fn wait_for_child_exit() {
-    let hs: Vec<isize> = CHILDREN.lock().unwrap().iter().filter(|k| !k.notified).take(64)
+    let mut hs: Vec<isize> = CHILDREN.lock().unwrap().iter().filter(|k| !k.notified).take(63)
         .map(|k| k.process.as_raw_handle() as isize).collect();
+    if signal::intr_event() != 0 {
+        hs.push(signal::intr_event()); // or a signal from outside
+    }
     if hs.is_empty() {
         std::thread::sleep(std::time::Duration::from_secs(3600));
         return;
@@ -176,20 +191,92 @@ pub fn wait_for_child_exit() {
 }
 
 pub fn kill(pid: i64, sig: u64) -> R {
-    if pid == unsafe { GetCurrentProcessId() } as i64 {
+    let me = unsafe { GetCurrentProcessId() } as i64;
+    if pid == me {
         return if sig == 0 { Ok(0) } else { signal::raise(sig) }; // delivered when this syscall returns
     }
-    let kids = CHILDREN.lock().unwrap();
-    // ponytail: only our own children are addressable, and they get the default "terminate".
-    let Some(k) = kids.iter().find(|k| k.pid as i64 == pid) else { return Err(ESRCH) };
-    if sig != 0 {
-        unsafe { TerminateProcess(k.process.as_raw_handle() as isize, 128 + sig as u32) };
+    if pid <= 0 {
+        // ponytail: no process groups; "my group" / "everyone" means our children.
+        let pids: Vec<u32> = CHILDREN.lock().unwrap().iter().map(|k| k.pid).collect();
+        for p in pids {
+            let _ = kill(p as i64, sig);
+        }
+        return Ok(0);
     }
-    Ok(0)
+    send(pid as u32, sig)
+}
+
+/// Signal any lx guest process by pid (the mailbox), SIGKILL by terminating it outright.
+pub fn send(pid: u32, sig: u64) -> R {
+    if sig == 9 {
+        let h = unsafe { OpenProcess(0x0001 | 0x0010_0000, 0, pid) }; // PROCESS_TERMINATE | SYNCHRONIZE
+        if h == 0 {
+            return Err(ESRCH);
+        }
+        // Its job object goes with it, taking any exec'd successor and its children along.
+        unsafe { TerminateProcess(h, 128 + 9) };
+        unsafe { CloseHandle(h) };
+        return Ok(0);
+    }
+    if sig == 0 {
+        let h = unsafe { OpenProcess(0x1000, 0, pid) }; // PROCESS_QUERY_LIMITED_INFORMATION
+        if h == 0 {
+            return Err(ESRCH);
+        }
+        unsafe { CloseHandle(h) };
+        return Ok(0);
+    }
+    signal::send(pid, sig)
+}
+
+/// `lx stop <pid>`: SIGTERM, then SIGKILL if it's still running after `grace`, like `docker stop`.
+pub fn stop(pid: u32, grace: std::time::Duration) -> Result<(), String> {
+    let h = unsafe { OpenProcess(0x0010_0000, 0, pid) }; // SYNCHRONIZE
+    if h == 0 {
+        return Err(format!("no process {pid}"));
+    }
+    send(pid, 15).map_err(|_| format!("{pid} is not an lx container process"))?;
+    let gone = unsafe { WaitForMultipleObjects(1, &h, 0, grace.as_millis() as u32) } == 0;
+    if !gone {
+        eprintln!("[lx] {pid} ignored SIGTERM for {}s, sending SIGKILL", grace.as_secs());
+        let _ = send(pid, 9);
+        unsafe { WaitForMultipleObjects(1, &h, 0, 5000) };
+    }
+    unsafe { CloseHandle(h) };
+    Ok(())
+}
+
+// ---- running containers, for `lx ps` ----
+
+const RUNNING: &str = "rootfs/containers";
+
+/// Record this top-level `lx run` so `lx ps` can list it (removed again on exit; stale entries,
+/// e.g. after a hard kill, are filtered out by checking the pid is still alive).
+pub fn register_container(desc: &str) {
+    let _ = std::fs::create_dir_all(RUNNING);
+    let _ = std::fs::write(format!("{RUNNING}/{}", unsafe { GetCurrentProcessId() }), desc);
+    CONTAINER.store(true, Relaxed);
+}
+static CONTAINER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn ps() -> Vec<(u32, String)> {
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(RUNNING).into_iter().flatten().flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+        if send(pid, 0).is_ok() {
+            v.push((pid, std::fs::read_to_string(e.path()).unwrap_or_default()));
+        } else {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    v
 }
 
 /// Exit immediately, without DLL teardown: the guest owns the process; nothing of ours needs flushing.
 pub fn exit(code: u64) -> ! {
+    if CONTAINER.load(Relaxed) {
+        let _ = std::fs::remove_file(format!("{RUNNING}/{}", unsafe { GetCurrentProcessId() }));
+    }
     if debug() {
         eprintln!("[lx] pid {} exit {}", unsafe { GetCurrentProcessId() }, code as u8);
     }
@@ -232,6 +319,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
         EAGAIN
     })?;
     fs::close_all(); // we only wait from here on; don't hold pipe ends open
+    signal::FORWARD_TO.store(child.id(), Relaxed); // our pid is its pid: pass signals on
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
     exit(code as u64)
 }
