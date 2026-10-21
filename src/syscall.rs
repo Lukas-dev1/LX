@@ -868,9 +868,6 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         45 => net::sys_recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]),
         46 => net::sys_sendmsg(a[0], a[1], a[2]),
         47 => net::sys_recvmsg(a[0], a[1], a[2]),
-        299 => net::sys_recvmmsg(a[0], a[1], a[2], a[3]),
-        307 => net::sys_sendmmsg(a[0], a[1], a[2], a[3]),
-        201 => sys_time(a[0]),
         48 => net::sys_shutdown(a[0], a[1]),
         49 => net::sys_bind(a[0], a[1], a[2]),
         50 => net::sys_listen(a[0], a[1]),
@@ -949,7 +946,6 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         201 => time(a[0]),
         221 => Ok(0),                  // fadvise64: advice only
         188..=199 => Err(95),          // *xattr: EOPNOTSUPP, like a filesystem without extended attributes
-        435 => Err(ENOSYS),            // clone3: glibc falls back to clone, which we have
         436 => fs::close_range(a[0], a[1], a[2]),
         86 => fs::linkat(CWD, a[0], CWD, a[1], 0),
         265 => fs::linkat(a[0], a[1], a[2], a[3], a[4]),
@@ -1392,15 +1388,6 @@ fn clock_gettime(clock: u64, ts: u64) -> R {
     let (s, ns) = now(clock);
     unsafe { *(ts as *mut [u64; 2]) = [s, ns] };
     Ok(0)
-}
-
-/// time(2): seconds since the epoch, also stored at `tloc` if given (glibc calls it at startup).
-fn sys_time(tloc: u64) -> R {
-    let (s, _) = now(0);
-    if tloc != 0 {
-        unsafe { *(tloc as *mut u64) = s };
-    }
-    Ok(s as i64)
 }
 
 fn gettimeofday(tv: u64) -> R {
