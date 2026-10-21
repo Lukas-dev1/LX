@@ -519,6 +519,12 @@ pub fn siglog() -> bool {
     *ON.get_or_init(|| std::env::var_os("LX_SIGLOG").is_some() || debug())
 }
 
+/// LX_STRACE=1: log every syscall with its arguments and result (see dispatch).
+pub fn strace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LX_STRACE").is_some())
+}
+
 /// Verbose [lx] diagnostics, enabled by setting LX_DEBUG in the host environment.
 pub fn debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -961,7 +967,11 @@ fn dispatch(c: &mut Context) -> i64 {
             Err(ENOSYS)
         }
     };
-    if let Err(e) = r && debug() {
+    if strace() {
+        // Every syscall, like strace: pid, number, first four arguments, result.
+        let res = match r { Ok(v) => format!("{v:#x}"), Err(e) => format!("-{e}") };
+        dlog(format_args!("pid {} syscall {} ({:#x}, {:#x}, {:#x}, {:#x}) = {res}", unsafe { GetCurrentProcessId() }, c.rax, a[0], a[1], a[2], a[3]));
+    } else if let Err(e) = r && debug() {
         eprintln!("[lx] syscall {} ({:#x}, {:#x}, {:#x}, {:#x}) -> -{e}", c.rax, a[0], a[1], a[2], a[3]);
     }
     r.unwrap_or_else(|e| -e)
