@@ -898,6 +898,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
         34 => signal::sigsuspend(0),   // pause
         130 => signal::sigsuspend(a[0]),
+        128 => signal::sigtimedwait(a[0], a[1], if a[2] == 0 { -1 } else { let [s, ns] = unsafe { *(a[2] as *const [u64; 2]) }; (s * 1000 + ns / 1_000_000) as i64 }),
         16 => fs::ioctl(a[0], a[1], a[2]),
         17 => fs::pread(a[0], a[1], a[2], a[3], false),
         18 => fs::pread(a[0], a[1], a[2], a[3], true),

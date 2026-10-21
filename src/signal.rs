@@ -352,6 +352,35 @@ pub fn interruptible_sleep(ms: u32) -> R {
     }
 }
 
+/// rt_sigtimedwait (sigwait, sigwaitinfo): take a pending signal from `set` without running its
+/// handler; daemons block their signals and wait for them in one thread. `timeout_ms` < 0: forever.
+pub fn sigtimedwait(set: u64, info: u64, timeout_ms: i64) -> R {
+    let want = unsafe { *(set as *const u64) } & !UNBLOCKABLE;
+    let start = std::time::Instant::now();
+    loop {
+        {
+            let mut s = S.lock().unwrap();
+            let mine = &crate::syscall::ts().tpending;
+            let ready = (mine.load(SeqCst) | s.pending) & want;
+            if ready != 0 {
+                let sig = ready.trailing_zeros() as u64 + 1;
+                if mine.load(SeqCst) & bit(sig) != 0 { mine.fetch_and(!bit(sig), SeqCst); } else { s.pending &= !bit(sig); }
+                if info != 0 {
+                    unsafe { std::ptr::write_bytes(info as *mut u8, 0, 128) };
+                    unsafe { *(info as *mut u32) = sig as u32 }; // si_signo; si_code 0 = SI_USER
+                }
+                return Ok(sig as i64);
+            }
+        }
+        let left = if timeout_ms < 0 { 10 } else { timeout_ms - start.elapsed().as_millis() as i64 };
+        if left <= 0 {
+            return Err(crate::syscall::EAGAIN);
+        }
+        // ponytail: re-checks every 10 ms; a signal from outside or a handled one cuts the sleep short.
+        interruptible_sleep(left.min(10) as u32)?;
+    }
+}
+
 /// setitimer(ITIMER_REAL) / alarm: SIGALRM after `value_ms`, then every `interval_ms` (0 = once).
 /// Each call replaces the previous timer. ponytail: the old timer's remaining time reads as 0, and
 /// ITIMER_VIRTUAL/PROF (CPU-time timers) aren't supported.
