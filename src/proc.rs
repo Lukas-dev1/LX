@@ -131,6 +131,8 @@ fn read_state(handle: &str) -> Result<Vec<String>, String> {
 }
 
 /// fork, vfork, and clone without CLONE_THREAD. `stack` is clone's new stack pointer (0 = keep).
+static SPAWN: Mutex<()> = Mutex::new(());
+
 pub fn fork(c: &mut Context, stack: u64) -> R {
     let next = c.rip + 2;
     // What the child resumes with: the state right after the syscall, rax = 0 (kernel ABI: rcx = rip,
@@ -138,6 +140,10 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     let rsp = if stack != 0 { stack } else { c.rsp };
     let regs = [0, next, c.rdx, c.rbx, rsp, c.rbp, c.rsi, c.rdi, c.r8, c.r9, c.r10, c.eflags as u64,
                 c.r12, c.r13, c.r14, c.r15, next, c.eflags as u64];
+    // One spawn at a time: building the state marks handles inheritable and views_inheritable(false) takes
+    // the sections back, so another thread's fork in between (Go forks from many) would hand its child
+    // handles that weren't inherited ("shared mapping can't be placed in the child").
+    let spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = fs::proc_state(true);
     state.extend(syscall::snapshot());
     state.extend(signal::snapshot());
@@ -157,6 +163,7 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     let (ready_r, ready_w) = inheritable_pipe().map_err(|e| fail(e.to_string()))?;
     let child = spawn_lx("--fork", &[raw(&me), raw(&ready_w)], state);
     syscall::views_inheritable(false); // the child has its copies of the shared-memory sections now
+    drop(spawning);
     let mut child = child.map_err(|e| fail(e.to_string()))?;
     drop((me, ready_w)); // if the child dies before reporting, `ready` hits EOF
     let mut byte = [0u8];
@@ -463,6 +470,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
     if !bytes.starts_with(b"\x7fELF") && !bytes.starts_with(b"#!") {
         return Err(ENOEXEC); // the shell then runs it as a script itself
     }
+    let spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner()); // see fork
     let mut state = fs::proc_state(false);
     state.push(PARENT.load(Relaxed).to_string()); // exec keeps the pid relationship
     state.push(pid().to_string()); // and the pid itself
@@ -470,7 +478,9 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
     state.push(argv.len().to_string());
     state.extend(argv);
     state.extend(env);
-    let mut child = spawn_lx("--exec", &[], state).map_err(|e| {
+    let child = spawn_lx("--exec", &[], state);
+    drop(spawning);
+    let mut child = child.map_err(|e| {
         eprintln!("[lx] execve: {e}");
         EAGAIN
     })?;
