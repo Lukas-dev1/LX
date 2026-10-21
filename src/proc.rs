@@ -67,11 +67,31 @@ fn raw(h: &OwnedHandle) -> String {
 
 /// Start `lx <mode> <state-handle> [extra...]` and send it `state` over an inherited pipe.
 /// Rust's Command passes bInheritHandles=TRUE: the child gets every handle currently inheritable.
+/// Retries pipe I/O that a signal's CancelSynchronousIo (signal.rs) aborted: fork's own pipe transfers
+/// must finish, and the signal is still delivered when the syscall returns.
+fn uncancelled<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match op() {
+            Err(e) if e.raw_os_error() == Some(995) => {} // ERROR_OPERATION_ABORTED
+            r => return r,
+        }
+    }
+}
+
 fn spawn_lx(mode: &str, extra: &[String], state: Vec<String>) -> std::io::Result<Child> {
     let (r, w) = inheritable_pipe()?;
     let child = std::process::Command::new(std::env::current_exe()?).arg(mode).arg(raw(&r)).args(extra).spawn()?;
     drop(r);
-    std::fs::File::from(w).write_all(state.join("\0").as_bytes())?; // closing it is the child's EOF
+    let (mut w, state) = (std::fs::File::from(w), state.join("\0"));
+    let mut rest = state.as_bytes();
+    while !rest.is_empty() {
+        let n = uncancelled(|| w.write(rest))?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        rest = &rest[n..];
+    }
+    drop(w); // closing it is the child's EOF
     Ok(child)
 }
 
@@ -113,7 +133,8 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     let mut child = child.map_err(|e| fail(e.to_string()))?;
     drop((me, ready_w)); // if the child dies before reporting, `ready` hits EOF
     let mut byte = [0u8];
-    if !matches!(std::fs::File::from(ready_r).read(&mut byte), Ok(1)) {
+    let mut ready_r = std::fs::File::from(ready_r);
+    if !matches!(uncancelled(|| ready_r.read(&mut byte)), Ok(1)) {
         let _ = child.kill();
         return Err(fail("child failed to rebuild the guest".into()));
     }
