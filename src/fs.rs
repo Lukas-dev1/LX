@@ -147,9 +147,21 @@ fn fd_alias(guest: &str) -> Option<u64> {
 }
 
 pub struct Fs {
+    /// The image (read-only when `upper` is set).
     root: PathBuf,
+    /// The container's writable layer: every change lands here, the image is never modified.
+    /// None for a plain `lx <rootfs> cmd`, which writes the rootfs directly.
+    upper: Option<PathBuf>,
     cwd: String,
     fds: Vec<Option<Slot>>,
+}
+
+// Whiteouts in the upper layer use the OCI layer format, so a container layer is a valid image layer.
+const WHITEOUT: &str = ".wh.";
+const OPAQUE: &str = ".wh..wh..opq";
+
+fn exists(p: &Path) -> bool {
+    fs::symlink_metadata(p).is_ok()
 }
 
 /// An fd owns its Windows handle (dup duplicates it), so closing the last fd of a pipe end really
@@ -166,7 +178,21 @@ pub fn init(root: PathBuf) {
         let owned = (h != 0 && h != -1).then(|| unsafe { BorrowedHandle::borrow_raw(h as _) }.try_clone_to_owned().ok());
         owned.flatten().map(|h| Slot { fd: Fd::Handle(h), cloexec: false })
     };
-    *FS.lock().unwrap() = Some(Fs { root, cwd: "/".into(), fds: vec![std(-10), std(-11), std(-12)] });
+    *FS.lock().unwrap() = Some(Fs { root, upper: None, cwd: "/".into(), fds: vec![std(-10), std(-11), std(-12)] });
+}
+
+/// Give the container a writable layer on top of the image (call right after init).
+pub fn set_upper(upper: PathBuf) {
+    with(|fs| fs.upper = Some(upper));
+}
+
+/// Write a file into the container (through the writable layer), e.g. /etc/resolv.conf.
+pub fn write_guest_file(guest: &str, data: &[u8]) -> Result<(), i64> {
+    let host = with(|fs| fs.writable(&split(guest).into_iter().collect::<Vec<_>>(), false))?;
+    if read_link(&host).is_some() {
+        let _ = fs::remove_file(&host); // replace a symlink, as Docker's bind-mounted files do
+    }
+    fs::write(host, data).map_err(errno)
 }
 
 fn with<T>(f: impl FnOnce(&mut Fs) -> T) -> T {
@@ -210,10 +236,120 @@ fn ino(host: &Path) -> u64 {
 }
 
 impl Fs {
+    /// Where `comps` lives now: the upper layer if it's there, else the image unless a whiteout or an
+    /// opaque directory hides it. A path that exists nowhere maps into the upper layer.
     fn host(&self, comps: &[String]) -> PathBuf {
-        let mut p = self.root.clone();
-        p.extend(comps);
-        p
+        let mut lower = self.root.clone();
+        lower.extend(comps);
+        let Some(up) = &self.upper else { return lower };
+        let mut upper = up.clone();
+        upper.extend(comps);
+        if exists(&upper) || self.hidden(comps) || !exists(&lower) {
+            upper
+        } else {
+            lower
+        }
+    }
+
+    /// Is the image's copy of `comps` deleted in the upper layer?
+    fn hidden(&self, comps: &[String]) -> bool {
+        let Some(up) = &self.upper else { return false };
+        let mut dir = up.clone();
+        for (i, c) in comps.iter().enumerate() {
+            if exists(&dir.join(format!("{WHITEOUT}{c}"))) || (i > 0 && exists(&dir.join(OPAQUE))) {
+                return true;
+            }
+            dir.push(c);
+        }
+        false
+    }
+
+    fn in_lower(&self, comps: &[String]) -> bool {
+        let mut lower = self.root.clone();
+        lower.extend(comps);
+        self.upper.is_some() && !self.hidden(comps) && exists(&lower)
+    }
+
+    /// The upper-layer path for changing `comps`: parent directories are created in the upper layer, a
+    /// whiteout for the name is cleared, and with `copy` an image file is copied up first.
+    fn writable(&self, comps: &[String], copy: bool) -> Result<PathBuf, i64> {
+        let Some(up) = &self.upper else { return Ok(self.host(comps)) };
+        let mut upper = up.clone();
+        upper.extend(comps);
+        if exists(&upper) {
+            return Ok(upper);
+        }
+        let parent = upper.parent().unwrap_or(up);
+        fs::create_dir_all(parent).map_err(errno)?;
+        if let Some(name) = comps.last() {
+            let _ = fs::remove_file(parent.join(format!("{WHITEOUT}{name}")));
+        }
+        if copy && self.in_lower(comps) {
+            let mut lower = self.root.clone();
+            lower.extend(comps);
+            copy_up(&lower, &upper).map_err(errno)?;
+        }
+        Ok(upper)
+    }
+
+    /// Delete `comps` from the container: remove the upper copy, and whiteout the image's copy.
+    fn remove(&self, comps: &[String], dir: bool) -> Result<(), i64> {
+        let lower = self.in_lower(comps);
+        if let Some(up) = &self.upper {
+            let mut upper = up.clone();
+            upper.extend(comps);
+            if exists(&upper) {
+                if dir { fs::remove_dir_all(&upper) } else { fs::remove_file(&upper) }.map_err(errno)?;
+            }
+            if lower {
+                let parent = upper.parent().unwrap_or(up);
+                fs::create_dir_all(parent).map_err(errno)?;
+                fs::write(parent.join(format!("{WHITEOUT}{}", comps.last().unwrap())), b"").map_err(errno)?;
+            }
+            return Ok(());
+        }
+        let host = self.host(comps);
+        if dir { fs::remove_dir(host) } else { fs::remove_file(host) }.map_err(errno)
+    }
+
+    /// Directory entries of `comps` across both layers (names, is-dir), whiteouts applied.
+    fn list(&self, comps: &[String]) -> Result<Vec<(String, bool)>, i64> {
+        let mut out: Vec<(String, bool)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut hide = std::collections::HashSet::new();
+        let mut found = false;
+        let mut opaque = false;
+        if let Some(up) = &self.upper {
+            let mut upper = up.clone();
+            upper.extend(comps);
+            if let Ok(rd) = fs::read_dir(&upper) {
+                found = true;
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name == OPAQUE {
+                        opaque = true;
+                    } else if let Some(h) = name.strip_prefix(WHITEOUT) {
+                        hide.insert(h.to_string());
+                    } else if seen.insert(name.clone()) {
+                        out.push((name, e.file_type().is_ok_and(|t| t.is_dir())));
+                    }
+                }
+            }
+        }
+        if !opaque && (self.upper.is_none() || self.in_lower(comps)) {
+            let mut lower = self.root.clone();
+            lower.extend(comps);
+            if let Ok(rd) = fs::read_dir(&lower) {
+                found = true;
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if !hide.contains(&name) && seen.insert(name.clone()) {
+                        out.push((name, e.file_type().is_ok_and(|t| t.is_dir())));
+                    }
+                }
+            }
+        }
+        if found { Ok(out) } else { Err(ENOENT) }
     }
 
     /// Guest path -> (normalized guest path, host path). Symlinks are followed by us, `..` stops at the
@@ -232,6 +368,8 @@ impl Fs {
                 "." => continue,
                 ".." => { comps.pop(); continue }
                 _ if c.contains(['\\', ':', '\0']) => return Err(ENOENT),
+                // Layer bookkeeping names are ours; the guest can't see or forge whiteouts.
+                _ if c.starts_with(WHITEOUT) && self.upper.is_some() => return Err(ENOENT),
                 _ => comps.push(c),
             }
             if !todo.is_empty() || follow {
@@ -323,7 +461,8 @@ pub fn proc_state(fork: bool) -> Vec<String> {
                 unsafe { crate::win::SetHandleInformation(h, 1, (fork || !s.cloexec) as u32) };
             }
         }
-        let mut v = vec![fs.root.to_string_lossy().into_owned(), fs.cwd.clone(), String::new()];
+        let upper = fs.upper.as_ref().map(|u| u.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut v = vec![fs.root.to_string_lossy().into_owned(), upper, fs.cwd.clone(), String::new()];
         let mut n = 0;
         for (i, s) in fs.fds.iter().enumerate() {
             let Some(s) = s.as_ref().filter(|s| fork || !s.cloexec) else { continue };
@@ -341,7 +480,7 @@ pub fn proc_state(fork: bool) -> Vec<String> {
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
             n += 1;
         }
-        v[2] = n.to_string();
+        v[3] = n.to_string();
         v
     })
 }
@@ -349,7 +488,7 @@ pub fn proc_state(fork: bool) -> Vec<String> {
 /// Rebuild the fd table from `proc_state` fields (in the new lx). Returns the unparsed rest.
 pub fn init_from(fields: &[String]) -> Result<&[String], String> {
     let bad = || "malformed process state".to_string();
-    let [root, cwd, n, rest @ ..] = fields else { return Err(bad()) };
+    let [root, upper, cwd, n, rest @ ..] = fields else { return Err(bad()) };
     let mut fds: Vec<Option<Slot>> = Vec::new();
     let mut rest = rest;
     for _ in 0..n.parse::<usize>().map_err(|_| bad())? {
@@ -372,7 +511,8 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
         fds[fd] = Some(Slot { fd: fd_, cloexec: cloexec == "1" });
         rest = more;
     }
-    *FS.lock().unwrap() = Some(Fs { root: PathBuf::from(root), cwd: cwd.clone(), fds });
+    let upper = (!upper.is_empty()).then(|| PathBuf::from(upper));
+    *FS.lock().unwrap() = Some(Fs { root: PathBuf::from(root), upper, cwd: cwd.clone(), fds });
     Ok(rest)
 }
 
@@ -664,9 +804,14 @@ pub fn openat(dirfd: u64, path: u64, flags: u64) -> R {
         if let Some(d) = Dev::of(&guest) {
             return Ok(fs.add(Fd::Dev(d), 0, cloexec));
         }
-        let (guest, host) = fs.at(dirfd, path, flags & O_NOFOLLOW == 0)?;
+        let (guest, mut host) = fs.at(dirfd, path, flags & O_NOFOLLOW == 0)?;
         let meta = fs::metadata(&host);
         let acc = flags & 3;
+        let changes = acc != 0 || flags & (O_CREAT | O_TRUNC) != 0;
+        if changes && !meta.as_ref().is_ok_and(|m| m.is_dir()) {
+            // Copy the image's file up unless it's about to be truncated anyway.
+            host = fs.writable(&split(&guest).into_iter().collect::<Vec<_>>(), flags & O_TRUNC == 0)?;
+        }
         let fd = if meta.as_ref().is_ok_and(|m| m.is_dir()) {
             if acc != 0 { return Err(EISDIR) }
             Fd::Dir { guest, pos: 0 }
@@ -846,10 +991,6 @@ pub fn fstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> R {
     put_stat(buf, stat_of(&host)?)
 }
 
-/// Run a resolution under the lock and hand back the host path.
-fn with_path(f: impl FnOnce(&Fs) -> Result<(String, PathBuf), i64>) -> Result<PathBuf, i64> {
-    with(|fs| f(fs).map(|r| r.1))
-}
 
 pub fn faccessat(dirfd: u64, path: u64) -> R {
     let (guest, host) = with(|fs| fs.at(dirfd, path, true))?;
@@ -883,7 +1024,7 @@ fn proc_link(guest: &str) -> Option<String> {
                 Fd::Dir { guest, .. } => Some(guest.clone()),
                 Fd::Dev(d) => Some(format!("/dev/{}", d.tag())),
                 Fd::File { host, .. } => {
-                    let rel = host.strip_prefix(&fs.root).ok()?;
+                    let rel = fs.upper.as_ref().and_then(|u| host.strip_prefix(u).ok()).or_else(|| host.strip_prefix(&fs.root).ok())?;
                     Some(format!("/{}", rel.to_string_lossy().replace('\\', "/")))
                 }
                 Fd::Handle(_) => Some("pipe:[0]".into()),
@@ -903,36 +1044,91 @@ pub fn readlinkat(dirfd: u64, path: u64, buf: u64, size: u64) -> R {
     Ok(n as i64)
 }
 
+fn comps_of(guest: &str) -> Vec<String> {
+    split(guest).into_iter().collect()
+}
+
 pub fn mkdirat(dirfd: u64, path: u64) -> R {
-    let host = with_path(|fs| fs.at(dirfd, path, false))?;
-    fs::create_dir(host).map(|_| 0).map_err(errno)
+    with(|fs| {
+        let (guest, host) = fs.at(dirfd, path, false)?;
+        if exists(&host) {
+            return Err(EEXIST);
+        }
+        let c = comps_of(&guest);
+        let was_hidden = fs.upper.is_some() && fs.hidden(&c);
+        let up = fs.writable(&c, false)?;
+        fs::create_dir(&up).map_err(errno)?;
+        if was_hidden {
+            // Recreated over a deleted image dir: it must not show the old contents (overlayfs: opaque).
+            fs::write(up.join(OPAQUE), b"").map_err(errno)?;
+        }
+        Ok(0)
+    })
 }
 
 pub fn unlinkat(dirfd: u64, path: u64, flags: u64) -> R {
-    let host = with_path(|fs| fs.at(dirfd, path, false))?;
-    let is_dir = fs::symlink_metadata(&host).map_err(errno)?.is_dir();
-    match (flags & AT_REMOVEDIR != 0, is_dir) {
-        (true, true) => fs::remove_dir(host).map(|_| 0).map_err(errno),
-        (true, false) => Err(ENOTDIR),
-        (false, true) => Err(EISDIR),
-        // ponytail: NT refuses to delete open files; POSIX-delete via FILE_DISPOSITION_POSIX_SEMANTICS later.
-        (false, false) => fs::remove_file(host).map(|_| 0).map_err(errno),
-    }
+    with(|fs| {
+        let (guest, host) = fs.at(dirfd, path, false)?;
+        let c = comps_of(&guest);
+        let is_dir = fs::symlink_metadata(&host).map_err(errno)?.is_dir();
+        match (flags & AT_REMOVEDIR != 0, is_dir) {
+            (true, true) if !fs.list(&c)?.is_empty() => Err(ENOTEMPTY),
+            (true, true) => fs.remove(&c, true).map(|_| 0),
+            (true, false) => Err(ENOTDIR),
+            (false, true) => Err(EISDIR),
+            // ponytail: NT refuses to delete open files; POSIX-delete via FILE_DISPOSITION_POSIX_SEMANTICS later.
+            (false, false) => fs.remove(&c, false).map(|_| 0),
+        }
+    })
 }
 
 pub fn renameat(olddir: u64, old: u64, newdir: u64, new: u64) -> R {
-    let from = with_path(|fs| fs.at(olddir, old, false))?;
-    let to = with_path(|fs| fs.at(newdir, new, false))?;
-    fs::rename(from, to).map(|_| 0).map_err(errno)
+    with(|fs| {
+        let (from_guest, from) = fs.at(olddir, old, false)?;
+        let (to_guest, _) = fs.at(newdir, new, false)?;
+        let (fc, tc) = (comps_of(&from_guest), comps_of(&to_guest));
+        let is_dir = fs::symlink_metadata(&from).map_err(errno)?.is_dir();
+        // Bring the source into the upper layer (whole tree for an image directory), then move it there.
+        let src = fs.writable(&fc, true)?;
+        let dst = fs.writable(&tc, false)?;
+        if exists(&dst) && !is_dir {
+            let _ = fs::remove_file(&dst);
+        }
+        fs::rename(&src, &dst).map_err(errno)?;
+        if fs.upper.is_some() && fs.in_lower(&fc) {
+            fs.remove(&fc, is_dir)?; // the image's copy must stay hidden at the old name
+        }
+        Ok(0)
+    })
 }
 
 pub fn symlinkat(target: u64, dirfd: u64, path: u64) -> R {
     let target = cstr(target)?;
-    let host = with_path(|fs| fs.at(dirfd, path, false))?;
-    if fs::symlink_metadata(&host).is_ok() {
-        return Err(EEXIST);
-    }
-    write_link(&host, &target).map(|_| 0).map_err(errno)
+    with(|fs| {
+        let (guest, host) = fs.at(dirfd, path, false)?;
+        if exists(&host) {
+            return Err(EEXIST);
+        }
+        let up = fs.writable(&comps_of(&guest), false)?;
+        write_link(&up, &target).map(|_| 0).map_err(errno)
+    })
+}
+
+/// truncate(path) / ftruncate(fd).
+pub fn truncate(dirfd: u64, path: u64, fd: Option<u64>, len: u64) -> R {
+    with(|fs| {
+        let f = match fd {
+            Some(fd) => match fs.fd(fd)? {
+                Fd::File { f, .. } => return f.set_len(len).map(|_| 0).map_err(errno),
+                _ => return Err(EINVAL),
+            },
+            None => {
+                let (guest, _) = fs.at(dirfd, path, true)?;
+                fs.writable(&comps_of(&guest), true)?
+            }
+        };
+        OpenOptions::new().write(true).open(f).and_then(|f| f.set_len(len)).map(|_| 0).map_err(errno)
+    })
 }
 
 pub fn getcwd(buf: u64, size: u64) -> R {
@@ -980,11 +1176,10 @@ pub fn getdents64(fd: u64, buf: u64, count: u64) -> R {
     with(|fs| {
         let Fd::Dir { guest, pos } = fs.fd(fd)? else { return Err(ENOTDIR) };
         let (guest, start) = (guest.clone(), *pos);
-        let host = fs.resolve("/", &guest, true)?.1;
+        let (guest, host) = fs.resolve("/", &guest, true)?;
         let mut names: Vec<(String, u8)> = vec![(".".into(), 4), ("..".into(), 4)];
-        for e in fs::read_dir(&host).map_err(errno)?.flatten() {
-            let dt = if e.file_type().is_ok_and(|t| t.is_dir()) { 4 } else { 0 }; // DT_DIR / DT_UNKNOWN
-            names.push((e.file_name().to_string_lossy().into_owned(), dt));
+        for (name, dir) in fs.list(&comps_of(&guest))? {
+            names.push((name, if dir { 4 } else { 0 })); // DT_DIR / DT_UNKNOWN
         }
         let out = unsafe { guest_mut(buf, count as usize) };
         let (mut n, mut i) = (0, start);
@@ -1102,6 +1297,20 @@ pub fn unpack(layer: &Path, dest: &Path) -> Result<(u32, u32), String> {
     Ok((done, skipped))
 }
 
+/// Copy an image entry into the upper layer: a file, a symlink marker, or a whole directory tree.
+fn copy_up(from: &Path, to: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(from)?.is_dir() {
+        fs::create_dir_all(to)?;
+        for e in fs::read_dir(from)? {
+            let e = e?;
+            copy_up(&e.path(), &to.join(e.file_name()))?;
+        }
+        Ok(())
+    } else {
+        fs::copy(from, to).map(|_| ())
+    }
+}
+
 fn remove_any(p: &Path) {
     let _ = if p.is_dir() { fs::remove_dir_all(p) } else { fs::remove_file(p) };
 }
@@ -1113,7 +1322,7 @@ fn resolve_stays_inside_rootfs() {
     write_link(&root.join("bin/sh"), "busybox").unwrap();
     write_link(&root.join("up"), "../../../..").unwrap();
     write_link(&root.join("loop"), "loop").unwrap();
-    let fs_ = Fs { root: root.clone(), cwd: "/".into(), fds: vec![] };
+    let fs_ = Fs { root: root.clone(), upper: None, cwd: "/".into(), fds: vec![] };
     let r = |p: &str| fs_.resolve("/bin", p, true).map(|x| x.0);
     assert_eq!(r("sh"), Ok("/bin/busybox".into()));
     assert_eq!(r("/up/etc/passwd"), Ok("/etc/passwd".into()));
@@ -1122,4 +1331,44 @@ fn resolve_stays_inside_rootfs() {
     assert_eq!(r("..\\..\\x"), Err(ENOENT));
     assert_eq!(fs_.resolve("/", "/bin/sh", false).unwrap().0, "/bin/sh");
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn layer_never_touches_the_image() {
+    let base = std::env::temp_dir().join(format!("lx-layer-{}", std::process::id()));
+    let (lower, upper) = (base.join("lower"), base.join("upper"));
+    fs::create_dir_all(lower.join("etc/conf.d")).unwrap();
+    fs::write(lower.join("etc/a.conf"), "image").unwrap();
+    fs::write(lower.join("etc/conf.d/x"), "x").unwrap();
+    fs::create_dir_all(&upper).unwrap();
+    let f = Fs { root: lower.clone(), upper: Some(upper.clone()), cwd: "/".into(), fds: vec![] };
+    let c = |p: &str| comps_of(p);
+    let names = |p: &str| { let mut v: Vec<String> = f.list(&c(p)).unwrap().into_iter().map(|e| e.0).collect(); v.sort(); v };
+
+    // Reads come from the image; a write copies up and leaves the image alone.
+    assert_eq!(f.host(&c("/etc/a.conf")), lower.join("etc/a.conf"));
+    let w = f.writable(&c("/etc/a.conf"), true).unwrap();
+    fs::write(&w, "container").unwrap();
+    assert_eq!(fs::read_to_string(f.host(&c("/etc/a.conf"))).unwrap(), "container");
+    assert_eq!(fs::read_to_string(lower.join("etc/a.conf")).unwrap(), "image");
+
+    // New files land in the upper layer; listings merge both layers.
+    fs::write(f.writable(&c("/etc/new"), false).unwrap(), "n").unwrap();
+    assert_eq!(names("/etc"), ["a.conf", "conf.d", "new"]);
+    assert!(!lower.join("etc/new").exists());
+
+    // Deleting an image entry is a whiteout: hidden in the container, still in the image.
+    f.remove(&c("/etc/conf.d"), true).unwrap();
+    assert!(!exists(&f.host(&c("/etc/conf.d/x"))));
+    assert_eq!(names("/etc"), ["a.conf", "new"]);
+    assert!(lower.join("etc/conf.d/x").exists());
+
+    // Recreating the deleted directory starts empty (opaque), not with the image's old contents.
+    let d = f.writable(&c("/etc/conf.d"), false).unwrap();
+    fs::create_dir(&d).unwrap();
+    fs::write(d.join(OPAQUE), b"").unwrap();
+    assert_eq!(names("/etc/conf.d"), Vec::<String>::new());
+    assert!(!exists(&f.host(&c("/etc/conf.d/x"))));
+
+    fs::remove_dir_all(base).unwrap();
 }

@@ -290,6 +290,33 @@ pub fn register_container(desc: &str) {
 }
 static CONTAINER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// ---- per-container writable layers ----
+
+const LAYERS: &str = "rootfs/layers";
+static LAYER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// A fresh layer directory for this container, named after our pid (so `gc_layers` can tell whether
+/// its container still runs). Removed when the container exits.
+pub fn new_layer() -> std::io::Result<std::path::PathBuf> {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let dir = std::path::Path::new(LAYERS).join(format!("{}-{nanos}", unsafe { GetCurrentProcessId() }));
+    std::fs::create_dir_all(dir.join("upper"))?;
+    let dir = std::fs::canonicalize(dir)?; // same verbatim form as the image root
+    *LAYER.lock().unwrap() = Some(dir.clone());
+    Ok(dir)
+}
+
+/// Remove layers whose container is gone (killed before it could clean up).
+pub fn gc_layers() {
+    for e in std::fs::read_dir(LAYERS).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let pid = name.split('-').next().and_then(|p| p.parse::<u32>().ok());
+        if pid.is_some_and(|p| send(p, 0).is_err()) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 pub fn ps() -> Vec<(u32, String)> {
     let mut v = Vec::new();
     for e in std::fs::read_dir(RUNNING).into_iter().flatten().flatten() {
@@ -318,6 +345,9 @@ pub fn exit(code: u64) -> ! {
     }
     if CONTAINER.load(Relaxed) {
         let _ = std::fs::remove_file(format!("{RUNNING}/{}", unsafe { GetCurrentProcessId() }));
+    }
+    if let Ok(g) = LAYER.try_lock() && let Some(dir) = g.as_ref() {
+        let _ = std::fs::remove_dir_all(dir); // the container's changes go with it (docker run --rm)
     }
     if debug() {
         eprintln!("[lx] pid {} exit {}", unsafe { GetCurrentProcessId() }, code as u8);

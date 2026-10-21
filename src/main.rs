@@ -235,17 +235,17 @@ fn run() -> Result<(), String> {
         let r = image::Ref::parse(image);
         let dir = if r.dir().join("config.json").exists() { r.dir() } else { image::pull(&r)? };
         let c = image::run_config(&dir, rest)?;
-        // ponytail: the container writes straight into the pulled image; a per-container
-        // copy-on-write layer (DESIGN.md §6) is still to come.
         let root = std::fs::canonicalize(dir.join("rootfs")).map_err(|e| e.to_string())?;
+        // The container gets its own writable layer; the pulled image is never modified.
+        // ponytail: removed when the container exits (like `docker run --rm`); no named, restartable containers yet.
+        proc::gc_layers();
+        let layer = proc::new_layer().map_err(|e| format!("creating the container layer: {e}"))?;
+        fs::init(root);
+        fs::set_upper(layer.join("upper"));
         // Like Docker: the container resolves names through the host's DNS servers.
         let (resolv, hosts) = net::dns_files();
-        let etc = root.join("etc");
-        let _ = std::fs::create_dir_all(&etc);
-        let _ = std::fs::remove_file(etc.join("resolv.conf")); // may be a symlink marker
-        let _ = std::fs::write(etc.join("resolv.conf"), resolv);
-        let _ = std::fs::write(etc.join("hosts"), hosts);
-        fs::init(root);
+        let _ = fs::write_guest_file("/etc/resolv.conf", resolv.as_bytes());
+        let _ = fs::write_guest_file("/etc/hosts", hosts.as_bytes());
         fs::set_cwd(&c.workdir).map_err(|_| format!("WorkingDir {} not found in image", c.workdir))?;
         proc::register_container(&format!("{image}  {}", c.argv.join(" ")));
         return start(&c.argv[0], c.argv.clone(), c.env);

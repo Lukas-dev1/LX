@@ -874,6 +874,8 @@ fn dispatch(c: &mut Context) -> i64 {
         83 => fs::mkdirat(CWD, a[0]),
         84 => fs::unlinkat(CWD, a[0], 0x200),
         87 => fs::unlinkat(CWD, a[0], 0),
+        76 => fs::truncate(CWD, a[0], None, a[1]),
+        77 => fs::truncate(0, 0, Some(a[0]), a[1]),
         88 => fs::symlinkat(a[0], CWD, a[1]),
         89 => fs::readlinkat(CWD, a[0], a[1], a[2]),
         95 => Ok(0o022),               // umask
