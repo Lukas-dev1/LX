@@ -173,13 +173,16 @@ else
 fi
 
 stop_test() { # stop_test <mode> <expected exit> [text]
-  $LX run -v "$GUEST" alpine sh /t/sigtest.sh "$1" < /dev/null > "$OUT/stop" 2>&1 &
+  # The tag (an argument sigtest.sh ignores) finds this container in `lx ps`, among any others running.
+  tag=stoptest-$$-$1
+  $LX run -v "$GUEST" alpine sh /t/sigtest.sh "$1" "$tag" < /dev/null > "$OUT/stop" 2>&1 &
   job=$!
   # Wait until the container is registered (a busy machine can take longer than any fixed sleep), then
   # give the script a moment to install its trap.
-  for _ in $(seq 100); do [ -n "$($LX ps | awk 'NR==2 {print $1}')" ] && break; sleep 0.1; done
+  mine() { $LX ps | awk -v t="$tag" 'index($0, t) {print $1; exit}'; }
+  for _ in $(seq 100); do [ -n "$(mine)" ] && break; sleep 0.1; done
   sleep 1
-  $LX stop "$($LX ps | awk 'NR==2 {print $1}')" > /dev/null
+  $LX stop "$(mine)" > /dev/null
   wait $job
   code=$?
   if [ $code = "$2" ] && { [ -z "${3:-}" ] || grep -qF -- "$3" "$OUT/stop"; }; then ok "lx stop: $1 -> $code"; else bad "lx stop: $1 -> $code (want $2)"; fi
