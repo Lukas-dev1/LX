@@ -336,28 +336,13 @@ static ALLOCS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 const WINDOW: (u64, u64) = (0x2000_0000_0000, 0x6000_0000_0000);
 static NEXT: AtomicU64 = AtomicU64::new(WINDOW.0);
 
-/// The guest stack, grown on demand like a Win32 thread stack: reserve `len`, commit the top
-/// 256K, and put a guard page under it. With the TEB bounds set (`enter`), NT itself commits further
-/// pages as the stack grows, so a process doesn't pay for 8 MB it never touches.
+/// The main guest stack, committed whole. Linux grows a main stack for any access within RLIMIT_STACK,
+/// so binaries built without stack probes make frames of hundreds of KB that jump straight past a guard
+/// page (numpy's OpenBLAS does); NT only grows a stack page by page through its guard page, and a fault
+/// with no committed memory under rsp can't even be dispatched. Committing costs commit charge only:
+/// untouched pages never enter the working set, so this uses no RAM until the program touches it.
 pub fn alloc_stack(len: u64) -> Option<u64> {
-    const COMMIT: u64 = 256 << 10;
-    let len = len.next_multiple_of(0x10000);
-    let base = loop {
-        let a = NEXT.fetch_add(len, Relaxed);
-        if a + len > WINDOW.1 {
-            return None;
-        }
-        if unsafe { VirtualAlloc(a as *mut _, len as usize, MEM_RESERVE, PAGE_READWRITE) } as u64 == a {
-            break a;
-        }
-    };
-    let top = base + len - COMMIT;
-    unsafe {
-        VirtualAlloc(top as *mut _, COMMIT as usize, MEM_COMMIT, PAGE_READWRITE);
-        VirtualAlloc((top - PAGE) as *mut _, PAGE as usize, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
-    }
-    ALLOCS.lock().unwrap().push((base, len));
-    Some(base)
+    alloc(None, len)
 }
 
 /// Reserve+commit RW guest memory, at `fixed` or anywhere in the guest window.
