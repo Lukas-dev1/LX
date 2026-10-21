@@ -601,7 +601,7 @@ impl Fs {
                 _ => comps.push(c),
             }
             if !todo.is_empty() || follow {
-                if let Some(target) = read_link(&self.host(&comps)) {
+                if let Some(target) = self.proc_self_link(&comps).or_else(|| read_link(&self.host(&comps))) {
                     hops += 1;
                     if hops > 40 {
                         return Err(ELOOP);
@@ -617,6 +617,21 @@ impl Fs {
             }
         }
         Ok((format!("/{}", comps.join("/")), self.host(&comps)))
+    }
+
+    /// `/proc/{self,<pid>}/{exe,cwd,root}` as symlinks while resolving, so stat and open follow them
+    /// (gosu stats /proc/self/exe). Only paths of exactly those three components are looked at.
+    fn proc_self_link(&self, comps: &[String]) -> Option<String> {
+        let [p, who, what] = comps else { return None };
+        if p != "proc" || (who != "self" && who.parse::<u32>().ok()? != crate::proc::pid()) {
+            return None;
+        }
+        match what.as_str() {
+            "exe" => Some(EXE.lock().unwrap().clone()),
+            "cwd" => Some(self.cwd.clone()),
+            "root" => Some("/".into()),
+            _ => None,
+        }
     }
 
     fn dir_of(&self, dirfd: u64) -> Result<String, i64> {
