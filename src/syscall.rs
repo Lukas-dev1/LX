@@ -789,9 +789,23 @@ fn guest_crash(rec: &ExceptionRecord, c: &Context) -> ! {
 }
 
 /// The dispatch table. Linux ABI: nr in rax, args rdi rsi rdx r10 r8 r9, result (or -errno) in rax.
+/// The syscall the guest is in right now (nr + 1, 0 = none) and its first three arguments, for
+/// LX_SIGLOG: when a signal arrives, it shows what the guest was doing. ponytail: the last thread to
+/// enter wins; per-thread slots if multithreaded hangs need it.
+pub static IN_SYSCALL: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
 fn dispatch(c: &mut Context) -> i64 {
-    use fs::{AT_FDCWD as CWD, AT_SYMLINK_NOFOLLOW};
     let a = [c.rdi, c.rsi, c.rdx, c.r10, c.r8, c.r9];
+    for (slot, v) in IN_SYSCALL.iter().zip([c.rax + 1, a[0], a[1], a[2]]) {
+        slot.store(v, Relaxed);
+    }
+    let r = dispatch_nr(c, a);
+    IN_SYSCALL[0].store(0, Relaxed);
+    r
+}
+
+fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
+    use fs::{AT_FDCWD as CWD, AT_SYMLINK_NOFOLLOW};
     let r = match c.rax {
         0 => fs::read(a[0], a[1], a[2]),
         1 => fs::write(a[0], a[1], a[2]),
