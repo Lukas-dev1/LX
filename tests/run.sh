@@ -89,6 +89,8 @@ expect "dlopen while threads run" 0 " OK"                -- rootfs/alpine /dltes
 expect "debian: python3 -c"         0 "hi"               -- run python:3.12 python3 -c "print('hi')"
 expect "debian: python3 /script.py" 0 "script ran: 3.12" -- run -v "$GUEST" python:3.12 python3 /t/hello.py
 expect "debian: AF_UNIX echo (path + abstract)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/unixtest.py
+expect "AF_UNIX datagrams"         0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/dgramtest.py
+expect "debian: AF_UNIX datagrams" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/dgramtest.py
 
 # ---- volumes: data written in one container run is there in the next; the image stays untouched ----
 VOL="$ROOT/rootfs/voltest-suite"

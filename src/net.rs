@@ -36,6 +36,8 @@ unsafe extern "system" {
     fn getsockopt(s: usize, level: i32, name: i32, val: *mut u8, len: *mut i32) -> i32;
     fn ioctlsocket(s: usize, cmd: i32, arg: *mut u32) -> i32;
     fn WSAPoll(fds: *mut WsaPollFd, n: u32, timeout: i32) -> i32;
+    fn WSAIoctl(s: usize, code: u32, inb: *const u8, inlen: u32, outb: *mut u8, outlen: u32, got: *mut u32,
+        ov: *mut u8, done: *mut u8) -> i32;
 }
 
 #[link(name = "mswsock")]
@@ -130,6 +132,8 @@ pub struct Sock {
     /// AF_UNIX: the guest's own address (bound) and the peer's (connected), as the guest wrote them.
     unix: Mutex<Option<Vec<u8>>>,
     peer: Mutex<Option<Vec<u8>>>,
+    /// AF_UNIX SOCK_DGRAM: a loopback UDP socket underneath (see unix_dgram).
+    udgram: bool,
 }
 
 impl Drop for Sock {
@@ -142,13 +146,20 @@ impl Sock {
     fn new(s: usize, nonblock: bool) -> Sock {
         let mut on = 1u32;
         unsafe { ioctlsocket(s, FIONBIO, &mut on) }; // always non-blocking underneath
-        Sock { s, nonblock: AtomicBool::new(nonblock), eagain: AtomicU32::new(0), unix: Mutex::new(None), peer: Mutex::new(None) }
+        Sock { s, nonblock: AtomicBool::new(nonblock), eagain: AtomicU32::new(0), unix: Mutex::new(None), peer: Mutex::new(None), udgram: false }
     }
 
-    /// A socket handle inherited from the parent lx (fork/exec).
-    pub fn inherited(s: usize, nonblock: bool) -> Sock {
+    /// A socket handle inherited from the parent lx (fork/exec); `tag` is what inherit_tag() gave.
+    pub fn inherited(s: usize, tag: &str) -> Sock {
         init();
-        Sock::new(s, nonblock)
+        let mut k = Sock::new(s, tag.starts_with('1'));
+        k.udgram = tag.ends_with('u');
+        k
+    }
+
+    /// What a child lx needs to rebuild this socket: "1"/"0" (non-blocking), "u" for AF_UNIX datagrams.
+    pub fn inherit_tag(&self) -> String {
+        format!("{}{}", self.nonblocking() as u8, if self.udgram { "u" } else { "" })
     }
 
     pub fn nonblocking(&self) -> bool {
@@ -408,7 +419,13 @@ fn local_addr(s: usize, a: &mut [u8]) {
 // project dir, every lx process's cwd); the hash covers the container's layer + the guest path, so
 // processes of one container meet and containers don't collide. The guest path gets a marker file so
 // it shows up as a socket. Abstract names (leading NUL) hash the same way, without a marker.
-// ponytail: no SCM_RIGHTS / credentials; datagram AF_UNIX (e.g. /dev/log) is EPROTONOSUPPORT.
+// ponytail: no SCM_RIGHTS / credentials.
+//
+// Datagram AF_UNIX (/dev/log, sd_notify): Windows has none, so it's a UDP socket bound to 127.0.0.1.
+// The host file of a bound address holds the port; s\<container>\u<port> holds the guest address
+// back, so recvfrom can name the sender (no file: unnamed).
+// ponytail: those files stay after close (a later bind overwrites them); sending to a dead address
+// succeeds silently where Linux says ECONNREFUSED.
 
 const SOCK_DIR: &str = "rootfs\\s";
 
@@ -443,6 +460,60 @@ fn unix_addr(p: u64, len: u64) -> Result<UnixAddr, i64> {
     Ok(UnixAddr { win, guest, path, exists })
 }
 
+impl UnixAddr {
+    /// The host path (rootfs\s\<container>\<hash>).
+    fn host(&self) -> String {
+        let end = self.win.iter().skip(2).position(|&b| b == 0).map_or(110, |i| i + 2);
+        String::from_utf8_lossy(&self.win[2..end]).into_owned()
+    }
+}
+
+fn loopback(port: u16) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    a[0] = AF_INET as u8;
+    a[2..4].copy_from_slice(&port.to_be_bytes());
+    a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    a
+}
+
+fn unix_dgram(nonblock: bool) -> Result<Sock, i64> {
+    let s = unsafe { socket(2, 2, 0) };
+    if s == INVALID_SOCKET {
+        return Err(last_err());
+    }
+    let mut sock = Sock::new(s, nonblock); // closes `s` on error
+    sock.udgram = true;
+    let a = loopback(0);
+    if unsafe { bind(s, a.as_ptr(), 16) } != 0 {
+        return Err(last_err());
+    }
+    // A send to a closed port must not fail the next recvfrom with ECONNRESET (Windows' default).
+    let (off, mut got) = (0u32, 0u32);
+    const SIO_UDP_CONNRESET: u32 = 0x9800000C;
+    unsafe { WSAIoctl(s, SIO_UDP_CONNRESET, (&off as *const u32).cast(), 4, std::ptr::null_mut(), 0, &mut got, std::ptr::null_mut(), std::ptr::null_mut()) };
+    Ok(sock)
+}
+
+fn udgram_port(s: &Sock) -> u16 {
+    let (mut a, mut len) = ([0u8; 16], 16i32);
+    unsafe { getsockname(s.s, a.as_mut_ptr(), &mut len) };
+    u16::from_be_bytes([a[2], a[3]])
+}
+
+fn udgram_names(port: u16) -> String {
+    format!("{SOCK_DIR}\\{}\\u{port}", fs::container())
+}
+
+/// The loopback address a datagram AF_UNIX destination lives at.
+fn udgram_dest(p: u64, len: u64) -> Result<(UnixAddr, [u8; 16]), i64> {
+    let a = unix_addr(p, len)?;
+    if a.path.is_some() && !a.exists {
+        return Err(crate::syscall::ENOENT);
+    }
+    let port = std::fs::read_to_string(a.host()).ok().and_then(|v| v.trim().parse().ok()).ok_or(111)?; // ECONNREFUSED
+    Ok((a, loopback(port)))
+}
+
 fn is_unix_addr(p: u64, len: u64) -> bool {
     p != 0 && len >= 2 && unsafe { *(p as *const u16) } == AF_UNIX
 }
@@ -452,12 +523,16 @@ fn unix_bind(s: &Sock, p: u64, len: u64) -> R {
     if a.exists {
         return Err(98); // EADDRINUSE: Linux needs the path to be free (servers unlink it first)
     }
-    let host = String::from_utf8_lossy(&a.win[2..a.win.iter().skip(2).position(|&b| b == 0).map_or(110, |i| i + 2)]).into_owned();
+    let host = a.host();
     if let Some(d) = std::path::Path::new(&host).parent() {
         let _ = std::fs::create_dir_all(d);
     }
     let _ = std::fs::remove_file(&host); // a stale socket file from an earlier run
-    if unsafe { bind(s.s, a.win.as_ptr(), a.win.len() as i32) } != 0 {
+    if s.udgram {
+        let port = udgram_port(s);
+        std::fs::write(&host, port.to_string()).map_err(|_| crate::syscall::EACCES)?;
+        std::fs::write(udgram_names(port), &a.guest).map_err(|_| crate::syscall::EACCES)?;
+    } else if unsafe { bind(s.s, a.win.as_ptr(), a.win.len() as i32) } != 0 {
         return Err(last_err());
     }
     if let Some(g) = &a.path {
@@ -468,6 +543,14 @@ fn unix_bind(s: &Sock, p: u64, len: u64) -> R {
 }
 
 fn unix_connect(s: &Sock, p: u64, len: u64) -> R {
+    if s.udgram {
+        let (a, dest) = udgram_dest(p, len)?;
+        if unsafe { connect(s.s, dest.as_ptr(), 16) } != 0 {
+            return Err(last_err());
+        }
+        *s.peer.lock().unwrap() = Some(a.guest);
+        return Ok(0);
+    }
     let a = unix_addr(p, len)?;
     if a.path.is_some() && !a.exists {
         return Err(crate::syscall::ENOENT);
@@ -515,6 +598,10 @@ pub fn sys_socket(domain: u64, ty: u64, proto: u64) -> R {
     init();
     let af = family(domain)?;
     let base = (ty & 0xf) as i32; // SOCK_STREAM 1, SOCK_DGRAM 2, SOCK_RAW 3: same numbers
+    if af == 1 && base == 2 {
+        let sock = unix_dgram(ty & SOCK_NONBLOCK != 0)?;
+        return Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0));
+    }
     if af == 1 && base != 1 {
         return Err(93); // EPROTONOSUPPORT: Windows has stream AF_UNIX sockets only
     }
@@ -696,7 +783,11 @@ pub fn sys_sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, alen: u64)
     if addr == 0 {
         return s.send(buf, len, flags);
     }
-    let mut a = addr_in(addr, alen)?;
+    let mut a = if s.udgram && is_unix_addr(addr, alen) {
+        udgram_dest(addr, alen)?.1.to_vec()
+    } else {
+        addr_in(addr, alen)?
+    };
     dest_addr(s.s, &mut a);
     let len = len.min(i32::MAX as u64) as i32;
     s.op(POLLOUT, flags & MSG_DONTWAIT != 0, || {
@@ -715,7 +806,9 @@ pub fn sys_recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, lenp: u6
         let n = unsafe { recvfrom(s.s, buf as *mut u8, len, msg_flags(flags), a.as_mut_ptr(), &mut alen) };
         if n < 0 { Err(last_err()) } else { Ok(n as i64) }
     })?;
-    if alen > 0 {
+    if s.udgram && alen >= 4 {
+        unix_out(std::fs::read(udgram_names(u16::from_be_bytes([a[2], a[3]]))).ok(), addr, lenp);
+    } else if alen > 0 {
         addr_out(&a[..alen as usize], addr, lenp);
     } else if lenp != 0 {
         unsafe { *(lenp as *mut u32) = 0 }; // connected stream: no address
@@ -801,7 +894,7 @@ pub fn sys_getsockname(fd: u64, addr: u64, lenp: u64, peer: bool) -> R {
     if r != 0 {
         return Err(last_err());
     }
-    if u16::from_le_bytes([a[0], a[1]]) == AF_UNIX {
+    if s.udgram || u16::from_le_bytes([a[0], a[1]]) == AF_UNIX {
         let saved = if peer { s.peer.lock().unwrap().clone() } else { s.unix.lock().unwrap().clone() };
         unix_out(saved, addr, lenp);
         return Ok(0);
