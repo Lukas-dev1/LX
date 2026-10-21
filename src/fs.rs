@@ -17,6 +17,8 @@ use std::time::UNIX_EPOCH;
 use crate::net::{Epoll, Sock};
 
 const LINK_MAGIC: &[u8] = b"\0lxlink\0";
+/// Marker at a bound AF_UNIX path (the real socket file lives at a short hashed host path, see net.rs).
+const SOCK_MAGIC: &[u8] = b"\0lxsock\0";
 pub const AT_FDCWD: u64 = -100i64 as u64;
 pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_EMPTY_PATH: u64 = 0x1000;
@@ -184,6 +186,32 @@ pub fn init(root: PathBuf) {
 /// Give the container a writable layer on top of the image (call right after init).
 pub fn set_upper(upper: PathBuf) {
     with(|fs| fs.upper = Some(upper));
+}
+
+/// An AF_UNIX socket path as the container sees it: (normalized guest path, does it exist, the
+/// container's name for its socket folder: its layer's directory name, so the sockets go with the layer).
+pub fn unix_path(path: &str) -> Result<(String, bool, String), i64> {
+    with(|fs| {
+        let (guest, host) = fs.resolve(&fs.cwd.clone(), path, true)?;
+        Ok((guest, exists(&host), container_name(fs)))
+    })
+}
+
+fn container_name(fs: &Fs) -> String {
+    match fs.upper.as_ref().and_then(|u| u.parent()).and_then(|l| l.file_name()) {
+        Some(n) => n.to_string_lossy().into_owned(),
+        None => format!("root-{:08x}", ino(&fs.root) as u32), // plain `lx <rootfs> cmd`: one per rootfs
+    }
+}
+
+/// The container's name for abstract AF_UNIX sockets (no path).
+pub fn container() -> String {
+    with(|fs| container_name(fs))
+}
+
+/// Leave the socket marker at a bound AF_UNIX path, so ls/stat show a socket there.
+pub fn mark_socket(guest: &str) -> Result<(), i64> {
+    write_guest_file(guest, SOCK_MAGIC)
 }
 
 /// Write a file into the container (through the writable layer), e.g. /etc/resolv.conf.
@@ -926,8 +954,10 @@ fn stat_of(host: &Path) -> Result<[u64; 18], i64> {
     let m = fs::symlink_metadata(host).map_err(errno)?;
     let link = if m.is_file() { read_link(host) } else { None };
     // ponytail: no stored modes/owners yet, so files are 0755 root:root. Keep real modes in an ADS (DESIGN.md §6).
+    let sock = m.len() == SOCK_MAGIC.len() as u64 && fs::read(host).is_ok_and(|d| d == SOCK_MAGIC);
     let (mode, size, nlink) = match &link {
         _ if m.is_dir() => (0o040755, 4096, 2),
+        _ if sock => (0o140755, 0, 1), // S_IFSOCK
         Some(t) => (0o120777, t.len() as u64, 1),
         None => (0o100755, m.len(), 1),
     };

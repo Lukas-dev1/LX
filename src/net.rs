@@ -106,6 +106,9 @@ pub struct Sock {
     nonblock: AtomicBool,
     /// epoll edge-trigger re-arm: POLLIN/POLLOUT bits that hit EAGAIN since epoll last looked.
     eagain: AtomicU32,
+    /// AF_UNIX: the guest's own address (bound) and the peer's (connected), as the guest wrote them.
+    unix: Mutex<Option<Vec<u8>>>,
+    peer: Mutex<Option<Vec<u8>>>,
 }
 
 impl Drop for Sock {
@@ -118,7 +121,7 @@ impl Sock {
     fn new(s: usize, nonblock: bool) -> Sock {
         let mut on = 1u32;
         unsafe { ioctlsocket(s, FIONBIO, &mut on) }; // always non-blocking underneath
-        Sock { s, nonblock: AtomicBool::new(nonblock), eagain: AtomicU32::new(0) }
+        Sock { s, nonblock: AtomicBool::new(nonblock), eagain: AtomicU32::new(0), unix: Mutex::new(None), peer: Mutex::new(None) }
     }
 
     /// A socket handle inherited from the parent lx (fork/exec).
@@ -209,6 +212,7 @@ fn msg_flags(f: u64) -> i32 {
 
 // ---- addresses: same layout as Linux except AF_INET6 = 10 (Linux) vs 23 (Windows) ----
 
+const AF_UNIX: u16 = 1;
 const AF_INET: u16 = 2;
 const AF_INET6_LINUX: u16 = 10;
 const AF_INET6_WIN: u16 = 23;
@@ -376,8 +380,107 @@ fn local_addr(s: usize, a: &mut [u8]) {
     }
 }
 
+// ---- AF_UNIX ----
+//
+// Windows 10+ has AF_UNIX stream sockets backed by a file (no datagram ones). sun_path is limited to 108
+// bytes and container paths are long, so the real socket file is `rootfs\s\<hash>` (relative to the
+// project dir, every lx process's cwd); the hash covers the container's layer + the guest path, so
+// processes of one container meet and containers don't collide. The guest path gets a marker file so
+// it shows up as a socket. Abstract names (leading NUL) hash the same way, without a marker.
+// ponytail: no SCM_RIGHTS / credentials; datagram AF_UNIX (e.g. /dev/log) is EPROTONOSUPPORT.
+
+const SOCK_DIR: &str = "rootfs\\s";
+
+struct UnixAddr {
+    win: Vec<u8>,          // struct sockaddr_un for Winsock (family 1, short host path)
+    guest: Vec<u8>,        // what the guest passed, for getsockname/getpeername
+    path: Option<String>,  // normalized guest path; None for abstract names
+    exists: bool,
+}
+
+fn unix_addr(p: u64, len: u64) -> Result<UnixAddr, i64> {
+    if p == 0 || !(3..=110).contains(&len) {
+        return Err(EINVAL);
+    }
+    let guest = unsafe { std::slice::from_raw_parts(p as *const u8, len as usize) }.to_vec();
+    let raw = &guest[2..];
+    let (key, path, exists, dir) = if raw[0] == 0 {
+        (format!("@{}", String::from_utf8_lossy(&raw[1..])), None, false, fs::container())
+    } else {
+        let s = String::from_utf8_lossy(&raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]).into_owned();
+        let (g, exists, dir) = fs::unix_path(&s)?;
+        (g.clone(), Some(g), exists, dir)
+    };
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new(); // fixed keys: every lx process computes the same name
+    key.hash(&mut h);
+    // rootfs\s\<container>\<hash>: well under sun_path's 108 bytes, and removed with the container.
+    let host = format!("{SOCK_DIR}\\{dir}\\{:016x}", h.finish());
+    let mut win = vec![0u8; 110];
+    win[0] = AF_UNIX as u8;
+    win[2..2 + host.len()].copy_from_slice(host.as_bytes());
+    Ok(UnixAddr { win, guest, path, exists })
+}
+
+fn is_unix_addr(p: u64, len: u64) -> bool {
+    p != 0 && len >= 2 && unsafe { *(p as *const u16) } == AF_UNIX
+}
+
+fn unix_bind(s: &Sock, p: u64, len: u64) -> R {
+    let a = unix_addr(p, len)?;
+    if a.exists {
+        return Err(98); // EADDRINUSE: Linux needs the path to be free (servers unlink it first)
+    }
+    let host = String::from_utf8_lossy(&a.win[2..a.win.iter().skip(2).position(|&b| b == 0).map_or(110, |i| i + 2)]).into_owned();
+    if let Some(d) = std::path::Path::new(&host).parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::remove_file(&host); // a stale socket file from an earlier run
+    if unsafe { bind(s.s, a.win.as_ptr(), a.win.len() as i32) } != 0 {
+        return Err(last_err());
+    }
+    if let Some(g) = &a.path {
+        fs::mark_socket(g)?;
+    }
+    *s.unix.lock().unwrap() = Some(a.guest);
+    Ok(0)
+}
+
+fn unix_connect(s: &Sock, p: u64, len: u64) -> R {
+    let a = unix_addr(p, len)?;
+    if a.path.is_some() && !a.exists {
+        return Err(crate::syscall::ENOENT);
+    }
+    *s.peer.lock().unwrap() = Some(a.guest);
+    if unsafe { connect(s.s, a.win.as_ptr(), a.win.len() as i32) } == 0 {
+        return Ok(0);
+    }
+    match last_err() {
+        EAGAIN if s.nonblocking() => Err(115),
+        EAGAIN => {
+            s.wait(POLLOUT)?;
+            match so_error(s.s) { 0 => Ok(0), e => Err(e) }
+        }
+        e => Err(e),
+    }
+}
+
+/// An AF_UNIX address for the guest: the stored path, or "unnamed" (just the family).
+fn unix_out(saved: Option<Vec<u8>>, p: u64, lenp: u64) {
+    let a = saved.unwrap_or_else(|| vec![AF_UNIX as u8, 0]);
+    if p == 0 || lenp == 0 {
+        return;
+    }
+    let room = unsafe { *(lenp as *const u32) } as usize;
+    unsafe {
+        std::ptr::copy_nonoverlapping(a.as_ptr(), p as *mut u8, room.min(a.len()));
+        *(lenp as *mut u32) = a.len() as u32;
+    }
+}
+
 fn family(domain: u64) -> Result<i32, i64> {
     match domain as u16 {
+        AF_UNIX => Ok(1),
         AF_INET => Ok(2),
         AF_INET6_LINUX => Ok(AF_INET6_WIN as i32),
         _ => Err(EAFNOSUPPORT),
@@ -391,6 +494,9 @@ pub fn sys_socket(domain: u64, ty: u64, proto: u64) -> R {
     init();
     let af = family(domain)?;
     let base = (ty & 0xf) as i32; // SOCK_STREAM 1, SOCK_DGRAM 2, SOCK_RAW 3: same numbers
+    if af == 1 && base != 1 {
+        return Err(93); // EPROTONOSUPPORT: Windows has stream AF_UNIX sockets only
+    }
     let s = unsafe { socket(af, base, proto as i32) };
     if s == INVALID_SOCKET {
         return Err(last_err());
@@ -441,6 +547,9 @@ pub fn sys_socketpair(_domain: u64, ty: u64, _proto: u64, out: u64) -> R {
 
 pub fn sys_bind(fd: u64, addr: u64, len: u64) -> R {
     let s = fs::sock(fd)?;
+    if is_unix_addr(addr, len) {
+        return unix_bind(&s, addr, len);
+    }
     let mut a = addr_in(addr, len)?;
     bind_addr(s.s, &mut a);
     if unsafe { bind(s.s, a.as_ptr(), a.len() as i32) } != 0 { Err(last_err()) } else { Ok(0) }
@@ -459,7 +568,11 @@ pub fn sys_accept(fd: u64, addr: u64, lenp: u64, flags: u64) -> R {
         let n = unsafe { accept(s.s, a.as_mut_ptr(), &mut alen) };
         if n == INVALID_SOCKET { Err(last_err()) } else { Ok((n, alen as usize)) }
     })?;
-    addr_out(&a[..new.1], addr, lenp);
+    if u16::from_le_bytes([a[0], a[1]]) == AF_UNIX {
+        unix_out(None, addr, lenp); // the connecting side is unnamed
+    } else {
+        addr_out(&a[..new.1], addr, lenp);
+    }
     let sock = Sock::new(new.0, flags & SOCK_NONBLOCK != 0);
     Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), flags & SOCK_CLOEXEC != 0))
 }
@@ -472,6 +585,9 @@ fn so_error(s: usize) -> i64 {
 
 pub fn sys_connect(fd: u64, addr: u64, len: u64) -> R {
     let s = fs::sock(fd)?;
+    if is_unix_addr(addr, len) {
+        return unix_connect(&s, addr, len);
+    }
     let mut a = addr_in(addr, len)?;
     dest_addr(s.s, &mut a);
     if unsafe { connect(s.s, a.as_ptr(), a.len() as i32) } == 0 {
@@ -584,6 +700,11 @@ pub fn sys_getsockname(fd: u64, addr: u64, lenp: u64, peer: bool) -> R {
     let r = unsafe { if peer { getpeername(s.s, a.as_mut_ptr(), &mut alen) } else { getsockname(s.s, a.as_mut_ptr(), &mut alen) } };
     if r != 0 {
         return Err(last_err());
+    }
+    if u16::from_le_bytes([a[0], a[1]]) == AF_UNIX {
+        let saved = if peer { s.peer.lock().unwrap().clone() } else { s.unix.lock().unwrap().clone() };
+        unix_out(saved, addr, lenp);
+        return Ok(0);
     }
     if !peer {
         local_addr(s.s, &mut a[..alen as usize]);
