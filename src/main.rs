@@ -110,6 +110,7 @@ pub mod win {
         pub fn CreateFileW(name: *const u16, access: u32, share: u32, attr: *mut c_void, disposition: u32, flags: u32, template: isize) -> isize;
         pub fn GetOverlappedResult(h: isize, ov: *mut c_void, done: *mut u32, wait: i32) -> i32;
         pub fn CancelIoEx(h: isize, ov: *mut c_void) -> i32;
+        pub fn GetPhysicallyInstalledSystemMemory(kb: *mut u64) -> i32;
         pub fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
         pub fn CreateFileMappingW(file: isize, attr: *mut c_void, prot: u32, hi: u32, lo: u32, name: *const u16) -> isize;
         pub fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> isize;
@@ -175,12 +176,41 @@ struct JobLimits {
 const _: () = assert!(size_of::<JobLimits>() == 144);
 
 /// Self-confinement: memory cap, and everything we spawn dies with us.
+/// Per-process memory cap (commit charge): `lx run -m`, carried to every lx process of the container in
+/// LX_MEMORY; by default the machine's physical RAM. NT commits on mmap where Linux overcommits (OpenBLAS
+/// reserves 32 MB per CPU up front), so a cap much below RAM breaks ordinary programs; RAM still keeps a
+/// runaway container from taking more than the machine has.
+fn memory_limit() -> usize {
+    if let Some(v) = env::var("LX_MEMORY").ok().and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    let mut kb = 0u64;
+    let ram = if unsafe { win::GetPhysicallyInstalledSystemMemory(&mut kb) } != 0 { kb << 10 } else { 4 << 30 };
+    ram as usize
+}
+
+/// `-m 512m`, `2g`, `1073741824`: bytes (k/m/g suffixes, base 1024).
+fn parse_memory(v: &str) -> Result<String, String> {
+    let v = v.to_ascii_lowercase();
+    let (num, mult) = match v.chars().last() {
+        Some('k') => (&v[..v.len() - 1], 1u64 << 10),
+        Some('m') => (&v[..v.len() - 1], 1 << 20),
+        Some('g') => (&v[..v.len() - 1], 1 << 30),
+        _ => (&v[..], 1),
+    };
+    let n: u64 = num.parse().map_err(|_| format!("bad -m {v:?}: want e.g. 512m or 2g"))?;
+    if n * mult < 64 << 20 {
+        return Err("-m: at least 64m".into());
+    }
+    Ok((n * mult).to_string())
+}
+
 fn enter_job() -> Result<(), String> {
     const LIMIT_PROCESS_MEMORY: u32 = 0x100;
     const KILL_ON_JOB_CLOSE: u32 = 0x2000;
     let limits = JobLimits {
         flags: LIMIT_PROCESS_MEMORY | KILL_ON_JOB_CLOSE,
-        process_memory: 512 << 20,
+        process_memory: memory_limit(),
         ..Default::default()
     };
     unsafe {
@@ -198,6 +228,7 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
                                              runs the image's entrypoint/cmd, or the given command;
                                              -p publishes a container port (others stay on localhost)
                                              -v C:\\data:/data[:ro] mounts a host folder (repeatable)
+                                             -m 2g caps each process's memory (default: the machine's RAM)
        lx ps                                 running containers
        lx stop <pid>                         SIGTERM, then SIGKILL after 10s
        lx kill <pid> [SIGNAL]                default TERM
@@ -274,6 +305,7 @@ fn run() -> Result<(), String> {
             match flag.as_str() {
                 "-p" | "--publish" => ports.push(net::parse_publish(value)?),
                 "-v" | "--volume" => volumes.push(parse_volume(value)?),
+                "-m" | "--memory" => unsafe { env::set_var("LX_MEMORY", parse_memory(value)?) },
                 _ => break,
             }
             rest = more;

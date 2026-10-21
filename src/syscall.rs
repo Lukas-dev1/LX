@@ -336,28 +336,13 @@ static ALLOCS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 const WINDOW: (u64, u64) = (0x2000_0000_0000, 0x6000_0000_0000);
 static NEXT: AtomicU64 = AtomicU64::new(WINDOW.0);
 
-/// The guest stack, grown on demand like a Win32 thread stack: reserve `len`, commit the top
-/// 256K, and put a guard page under it. With the TEB bounds set (`enter`), NT itself commits further
-/// pages as the stack grows, so a process doesn't pay for 8 MB it never touches.
+/// The main guest stack, committed whole. Linux grows a main stack for any access within RLIMIT_STACK,
+/// so binaries built without stack probes make frames of hundreds of KB that jump straight past a guard
+/// page (numpy's OpenBLAS does); NT only grows a stack page by page through its guard page, and a fault
+/// with no committed memory under rsp can't even be dispatched. Committing costs commit charge only:
+/// untouched pages never enter the working set, so this uses no RAM until the program touches it.
 pub fn alloc_stack(len: u64) -> Option<u64> {
-    const COMMIT: u64 = 256 << 10;
-    let len = len.next_multiple_of(0x10000);
-    let base = loop {
-        let a = NEXT.fetch_add(len, Relaxed);
-        if a + len > WINDOW.1 {
-            return None;
-        }
-        if unsafe { VirtualAlloc(a as *mut _, len as usize, MEM_RESERVE, PAGE_READWRITE) } as u64 == a {
-            break a;
-        }
-    };
-    let top = base + len - COMMIT;
-    unsafe {
-        VirtualAlloc(top as *mut _, COMMIT as usize, MEM_COMMIT, PAGE_READWRITE);
-        VirtualAlloc((top - PAGE) as *mut _, PAGE as usize, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
-    }
-    ALLOCS.lock().unwrap().push((base, len));
-    Some(base)
+    alloc(None, len)
 }
 
 /// Reserve+commit RW guest memory, at `fixed` or anywhere in the guest window.
@@ -845,6 +830,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         14 => signal::sigprocmask(a[0], a[1], a[2]),
         131 => signal::sigaltstack(a[0], a[1], c.rsp),
         7 => fs::poll(a[0], a[1], a[2] as i32 as i64),
+        23 => fs::select(a[0], a[1], a[2], a[3], timeval_ms(a[4])),   // ponytail: the timeout isn't updated
+        270 => fs::select(a[0], a[1], a[2], a[3], timespec_ms(a[4])), // pselect6: signal mask ignored
         271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
         34 => signal::sigsuspend(0),   // pause
         130 => signal::sigsuspend(a[0]),
@@ -945,6 +932,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         229 => clock_getres(a[1]),
         201 => time(a[0]),
         221 => Ok(0),                  // fadvise64: advice only
+        237 | 238 => Ok(0),            // mbind, set_mempolicy: NUMA placement has no meaning here; accept it
+        239 => Err(ENOSYS),            // get_mempolicy: callers treat this as "no NUMA" 
         188..=199 => Err(95),          // *xattr: EOPNOTSUPP, like a filesystem without extended attributes
         436 => fs::close_range(a[0], a[1], a[2]),
         86 => fs::linkat(CWD, a[0], CWD, a[1], 0),
@@ -1123,7 +1112,17 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
         fs::read_at(fd, unsafe { guest_mut(p, len as usize) }, off)?;
     }
     if prot & 4 != 0 {
-        patch_code(p, len as usize);
+        // A file mapping: patch only its executable sections (see elf::exec_ranges); anonymous: all of it.
+        let ranges = (flags & MAP_ANONYMOUS == 0)
+            .then(|| {
+                let mut read = |o: u64, buf: &mut [u8]| fs::read_at(fd, buf, o).is_ok_and(|n| n as usize == buf.len());
+                crate::elf::exec_ranges(&mut read, off, len)
+            })
+            .flatten()
+            .unwrap_or(vec![(off, len)]);
+        for (o, n) in ranges {
+            patch_code(p + (o - off), n as usize);
+        }
     }
     protect(p, len, page_prot(prot));
     Ok(p as i64)
@@ -1456,6 +1455,15 @@ fn clock_nanosleep(clock: u64, flags: u64, req: u64) -> R {
     };
     std::thread::sleep(wait);
     Ok(0)
+}
+
+/// A `struct timeval *` timeout in ms; NULL means wait forever (-1).
+fn timeval_ms(tv: u64) -> i64 {
+    if tv == 0 {
+        return -1;
+    }
+    let [s, us] = unsafe { *(tv as *const [i64; 2]) };
+    s.saturating_mul(1000).saturating_add(us / 1000)
 }
 
 /// A `struct timespec *` timeout in ms; NULL means wait forever (-1).

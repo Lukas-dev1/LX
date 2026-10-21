@@ -213,7 +213,12 @@ impl Pipe {
             0 | 995 => Ok(done as i64),
             ERROR_BROKEN_PIPE if !write => Ok(0), // EOF
             ERROR_BROKEN_PIPE | ERROR_NO_DATA => Err(crate::syscall::EPIPE),
-            _ => Err(EIO),
+            e => {
+                if crate::syscall::debug() {
+                    crate::syscall::dlog(format_args!("pipe {} on handle {:#x} failed: Windows error {e}", if write { "write" } else { "read" }, self.raw()));
+                }
+                Err(EIO)
+            }
         }
     }
 
@@ -924,6 +929,44 @@ pub fn poll(fds: u64, n: u64, timeout_ms: i64) -> R {
     }
 }
 
+/// select / pselect6 on top of poll: fd_sets (bit arrays of u64) in, pollfds through `poll`, fd_sets out.
+/// Returns the number of set bits, like Linux.
+pub fn select(n: u64, rd: u64, wr: u64, ex: u64, timeout_ms: i64) -> R {
+    const POLLPRI: i16 = 2;
+    const POLLERR: i16 = 8;
+    if n > 1024 {
+        return Err(EINVAL);
+    }
+    let bit = |set: u64, fd: u64| set != 0 && (unsafe { *((set + fd / 64 * 8) as *const u64) } >> (fd % 64)) & 1 != 0;
+    let (mut fds, mut pfds) = (Vec::new(), Vec::<[i16; 4]>::new()); // struct pollfd { int fd; short events, revents }
+    for fd in 0..n {
+        let ev = if bit(rd, fd) { POLLIN } else { 0 } | if bit(wr, fd) { POLLOUT } else { 0 } | if bit(ex, fd) { POLLPRI } else { 0 };
+        if ev != 0 {
+            fds.push(fd);
+            pfds.push([fd as i16, (fd >> 16) as i16, ev, 0]);
+        }
+    }
+    poll(pfds.as_mut_ptr() as u64, pfds.len() as u64, timeout_ms)?;
+    for set in [rd, wr, ex].into_iter().filter(|&s| s != 0) {
+        unsafe { std::ptr::write_bytes(set as *mut u64, 0, n.div_ceil(64) as usize) };
+    }
+    let mut count = 0;
+    let mut mark = |set: u64, fd: u64| {
+        unsafe { *((set + fd / 64 * 8) as *mut u64) |= 1 << (fd % 64) };
+        count += 1;
+    };
+    for (fd, p) in fds.into_iter().zip(&pfds) {
+        let r = p[3];
+        if r & POLLNVAL != 0 {
+            return Err(EBADF);
+        }
+        if rd != 0 && p[2] & POLLIN != 0 && r & (POLLIN | POLLHUP | POLLERR) != 0 { mark(rd, fd) }
+        if wr != 0 && p[2] & POLLOUT != 0 && r & (POLLOUT | POLLERR) != 0 { mark(wr, fd) }
+        if ex != 0 && p[2] & POLLPRI != 0 && r & POLLPRI != 0 { mark(ex, fd) }
+    }
+    Ok(count)
+}
+
 /// sendfile: from the file position (cat), or from `*off` leaving the position alone and advancing
 /// `*off` instead (nginx). ponytail: a bounce buffer, up to 64K per call; TransmitFile would be zero-copy.
 pub fn sendfile(out: u64, inp: u64, off: u64, count: u64) -> R {
@@ -1485,7 +1528,18 @@ fn put_stat(buf: u64, s: [u64; 18]) -> R {
 
 pub fn fstat(fd: u64, buf: u64) -> R {
     let s = with(|fs| match fs.fd(fd)? {
-        Fd::File { host, .. } => stat_of(host),
+        // From the open handle, not the path: the file may have been renamed or deleted since (apt does
+        // both to its temp files), and Linux's fstat still answers.
+        Fd::File { f, host } => {
+            let m = f.metadata().map_err(errno)?;
+            let t = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).unwrap_or_default();
+            let mut s = [0u64; 18];
+            (s[0], s[1], s[2], s[3], s[6], s[7], s[8]) = (0x803, ino(host), 1, 0o100755, m.len(), 4096, m.len().div_ceil(512));
+            for i in [9, 11, 13] {
+                (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
+            }
+            Ok(s)
+        }
         Fd::Dir { guest, .. } => {
             let guest = guest.clone();
             stat_of(&fs.resolve("/", &guest, true)?.1)
