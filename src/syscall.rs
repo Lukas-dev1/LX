@@ -862,6 +862,10 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         9 => mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
         10 => mprotect(a[0], a[1], a[2]),
         11 => munmap(a[0], a[1], c.rsp),
+        29 => shmget(a[0], a[1], a[2]),
+        30 => shmat(a[0], a[1], a[2]),
+        67 => shmdt(a[0], c.rsp),
+        31 => shmctl(a[0], a[1], a[2]),
         25 => mremap(a[0], a[1], a[2], a[3]),
         26 => msync(a[0], a[1]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
@@ -878,6 +882,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         17 => fs::pread(a[0], a[1], a[2], a[3], false),
         18 => fs::pread(a[0], a[1], a[2], a[3], true),
         19 => fs::readv(a[0], a[1], a[2]),
+        295 | 327 => fs::preadv(a[0], a[1], a[2], a[3], false), // preadv, preadv2 (flags ignored)
+        296 | 328 => fs::preadv(a[0], a[1], a[2], a[3], true),  // pwritev, pwritev2
+        285 => fs::fallocate(a[0], a[1], a[2], a[3]),
         37 => { signal::set_alarm(a[0] * 1000, 0); Ok(0) } // alarm
         38 => setitimer(a[0], a[1], a[2]),
         90 => fs::chmeta_at(CWD, a[0], true, Some(a[1]), None),                     // chmod
@@ -975,6 +982,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         324 => thread::membarrier(a[0]),
         284 => fs::eventfd(a[0], 0),
         290 => fs::eventfd(a[0], a[1]),
+        282 => fs::signalfd(a[0], a[1], a[2], 0),
+        289 => fs::signalfd(a[0], a[1], a[2], a[3]),
         218 => { ts().clear_tid = a[0]; thread::gettid() } // set_tid_address
         230 => clock_nanosleep(a[0], a[1], a[2]),
         228 => clock_gettime(a[0], a[1]),
@@ -1351,6 +1360,62 @@ fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
     protect(new, new_len.next_multiple_of(PAGE), m.protect);
     munmap(old, old_len, 0)?;
     Ok(new as i64)
+}
+
+// ---- System V shared memory ----
+//
+// Postgres keeps a small segment beside its mmap'd shared memory. An attached segment is anonymous
+// MAP_SHARED memory (a section view, so forked children share it). ponytail: the key table is per lx
+// process, so unrelated processes don't find each other's segments, and attaching one segment twice in
+// a process gives two separate copies. Neither happens in postgres (it attaches once, children fork).
+
+struct Shm {
+    key: u64,
+    size: u64,
+}
+static SHMS: Mutex<Vec<Shm>> = Mutex::new(Vec::new());
+static SHM_AT: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new()); // attached (address, size)
+
+fn shmget(key: u64, size: u64, flags: u64) -> R {
+    const IPC_CREAT: u64 = 0o1000;
+    const IPC_EXCL: u64 = 0o2000;
+    let mut t = SHMS.lock().unwrap();
+    if key != 0 && let Some(i) = t.iter().position(|s| s.key == key) {
+        return if flags & (IPC_CREAT | IPC_EXCL) == IPC_CREAT | IPC_EXCL { Err(EEXIST) } else { Ok(i as i64 + 1) };
+    }
+    if key != 0 && flags & IPC_CREAT == 0 {
+        return Err(ENOENT);
+    }
+    t.push(Shm { key, size });
+    Ok(t.len() as i64)
+}
+
+fn shmat(id: u64, addr: u64, flags: u64) -> R {
+    const SHM_RDONLY: u64 = 0o10000;
+    let size = SHMS.lock().unwrap().get((id as usize).wrapping_sub(1)).ok_or(EINVAL)?.size;
+    let prot = if flags & SHM_RDONLY != 0 { 1 } else { 3 };
+    let p = mmap(addr, size, prot, 0x21 | if addr != 0 { 0x10 } else { 0 }, u64::MAX, 0)? as u64; // MAP_SHARED|ANONYMOUS
+    SHM_AT.lock().unwrap().push((p, size));
+    Ok(p as i64)
+}
+
+fn shmdt(addr: u64, rsp: u64) -> R {
+    let mut at = SHM_AT.lock().unwrap();
+    let i = at.iter().position(|&(a, _)| a == addr).ok_or(EINVAL)?;
+    let (a, size) = at.remove(i);
+    drop(at);
+    munmap(a, size, rsp)
+}
+
+/// IPC_RMID and IPC_SET are accepted; IPC_STAT reports the size and one attachment.
+fn shmctl(id: u64, cmd: u64, buf: u64) -> R {
+    let size = SHMS.lock().unwrap().get((id as usize).wrapping_sub(1)).ok_or(EINVAL)?.size;
+    if cmd == 2 && buf != 0 {
+        let mut ds = [0u64; 14]; // struct shmid_ds: ipc_perm (48 bytes), then shm_segsz, times, pids, shm_nattch
+        (ds[6], ds[11]) = (size, 1);
+        unsafe { *(buf as *mut [u64; 14]) = ds };
+    }
+    Ok(0)
 }
 
 fn munmap(addr: u64, len: u64, rsp: u64) -> R {

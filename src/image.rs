@@ -203,6 +203,31 @@ pub struct RunConfig {
     pub argv: Vec<String>,
     pub env: Vec<String>,
     pub workdir: String,
+    /// The image's USER: "name", "uid", "name:group" or "uid:gid"; empty = root.
+    pub user: String,
+}
+
+/// Resolve a USER spec against the image's /etc/passwd and /etc/group: (uid, gid, home), like Docker
+/// (a bare uid not in passwd is fine; its gid is then 0 and HOME is /).
+pub fn resolve_user(rootfs: &Path, spec: &str) -> Result<(u32, u32, String), String> {
+    let read = |f: &str| std::fs::read_to_string(rootfs.join(f)).unwrap_or_default();
+    let (passwd, group) = (read("etc/passwd"), read("etc/group"));
+    let spec = if spec.is_empty() { "0" } else { spec };
+    let (u, g) = spec.split_once(':').map_or((spec, None), |(u, g)| (u, Some(g)));
+    let entry = passwd.lines().map(|l| l.split(':').collect::<Vec<_>>()).find(|f| f.len() >= 6 && (f[0] == u || f[2] == u));
+    let (uid, mut gid, home) = match (&entry, u.parse::<u32>()) {
+        (Some(f), _) => (f[2].parse().unwrap_or(0), f[3].parse().unwrap_or(0), f[5].to_string()),
+        (None, Ok(uid)) => (uid, 0, "/".to_string()),
+        (None, Err(_)) => return Err(format!("unable to find user {u}: no matching entries in passwd file")),
+    };
+    if let Some(g) = g {
+        gid = match g.parse() {
+            Ok(n) => n,
+            Err(_) => group.lines().map(|l| l.split(':').collect::<Vec<_>>()).find(|f| f.len() >= 3 && f[0] == g)
+                .and_then(|f| f[2].parse().ok()).ok_or(format!("unable to find group {g}"))?,
+        };
+    }
+    Ok((uid, gid, home))
 }
 
 /// Entrypoint + (user command, else image Cmd), like `docker run`.
@@ -222,7 +247,8 @@ pub fn run_config(dir: &Path, cmd: &[String]) -> Result<RunConfig, String> {
     }
     env.push("HOSTNAME=lx".into());
     let workdir = c["WorkingDir"].as_str().filter(|w| !w.is_empty()).unwrap_or("/").to_string();
-    Ok(RunConfig { argv, env, workdir })
+    let user = c["User"].as_str().unwrap_or("").to_string();
+    Ok(RunConfig { argv, env, workdir, user })
 }
 
 #[test]

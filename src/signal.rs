@@ -3,9 +3,10 @@
 //! ponytail: no asynchronous delivery into a running guest and no cross-process signals yet (kill() on
 //! another process terminates it). Those need a per-process signal channel; see DESIGN.md §5.
 use crate::proc;
-use crate::syscall::{R, EINTR, EINVAL};
+use crate::syscall::{R, EAGAIN, EINTR, EINVAL};
 use crate::win::Context;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 pub const SIGCHLD: u64 = 17;
 const SA_NODEFER: u64 = 0x4000_0000;
@@ -121,6 +122,54 @@ pub fn deliverable() -> bool {
     S.lock().unwrap().pending & !mask() != 0
 }
 
+// ---- signalfd ----
+
+/// signalfd: readable while one of `mask`'s signals is pending; a read takes it. The program keeps those
+/// signals blocked (postgres 18 waits on one with epoll instead of using handlers), so ordinary delivery
+/// leaves them pending for us.
+pub struct SignalFd {
+    pub mask: AtomicU64,
+    pub nonblock: AtomicBool,
+}
+
+impl SignalFd {
+    fn take(&self) -> Option<u64> {
+        let mut s = S.lock().unwrap();
+        let hit = s.pending & self.mask.load(Relaxed);
+        let sig = (hit != 0).then(|| hit.trailing_zeros() as u64 + 1)?;
+        s.pending &= !bit(sig);
+        Some(sig)
+    }
+
+    /// Fills whole struct signalfd_siginfo (128 bytes); only ssi_signo is set.
+    pub fn read(&self, buf: u64, len: u64) -> R {
+        if len < 128 {
+            return Err(EINVAL);
+        }
+        let mut n = 0;
+        while n < len / 128 {
+            match self.take() {
+                Some(sig) => {
+                    let mut info = [0u8; 128];
+                    info[..4].copy_from_slice(&(sig as u32).to_le_bytes());
+                    unsafe { std::ptr::copy_nonoverlapping(info.as_ptr(), (buf + n * 128) as *mut u8, 128) };
+                    n += 1;
+                }
+                None if n > 0 => break,
+                None if self.nonblock.load(Relaxed) => return Err(EAGAIN),
+                None if deliverable() => return Err(EINTR),
+                None => std::thread::sleep(std::time::Duration::from_millis(10)), // ponytail: polled, like eventfd
+            }
+        }
+        Ok((n * 128) as i64)
+    }
+
+    pub fn ready(&self, events: i16) -> i16 {
+        let s = S.lock().unwrap();
+        if s.pending & self.mask.load(Relaxed) != 0 { events & 1 } else { 0 } // POLLIN
+    }
+}
+
 // ---- signals from other processes (kill, lx kill/stop) and from the console (Ctrl-C) ----
 //
 // Each lx process owns a mailbox: shared memory `Local\lx-sig-<pid>` holding a pending bitmask, plus
@@ -224,6 +273,17 @@ fn arrive(sig: u64) {
     unsafe {
         crate::win::SetEvent(INTR.load(SeqCst));
         crate::win::CancelSynchronousIo(GUEST_THREAD.load(SeqCst));
+    }
+}
+
+/// Break a blocking wait for a signal raised from another thread of ours, if the guest has a handler for
+/// it (an ignored SIGCHLD needn't interrupt anything).
+pub fn wake_if_handled(sig: u64) {
+    if S.lock().unwrap().actions[sig as usize].handler > 1 { // not SIG_DFL (0) or SIG_IGN (1)
+        unsafe {
+            crate::win::SetEvent(INTR.load(SeqCst));
+            crate::win::CancelSynchronousIo(GUEST_THREAD.load(SeqCst));
+        }
     }
 }
 

@@ -209,7 +209,15 @@ fn parse_memory(v: &str) -> Result<String, String> {
     Ok((n * mult).to_string())
 }
 
+/// The container's job: the first lx process of a container makes it, every later one (fork, exec)
+/// starts inside it and stays there. It caps each process's memory and dies with that first process,
+/// taking the whole container along, like PID 1. Only one per container: a job per lx process killed
+/// a daemon (fork, then the parent exits: redis --daemonize, pg_ctl start) along with its parent.
 fn enter_job() -> Result<(), String> {
+    if env::var_os("LX_IN_JOB").is_some() {
+        return Ok(());
+    }
+    unsafe { env::set_var("LX_IN_JOB", "1") }; // inherited by every later lx process
     const LIMIT_PROCESS_MEMORY: u32 = 0x100;
     const KILL_ON_JOB_CLOSE: u32 = 0x2000;
     let limits = JobLimits {
@@ -233,6 +241,9 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
                                              -p publishes a container port (others stay on localhost)
                                              -v C:\\data:/data[:ro] mounts a host folder (repeatable)
                                              -m 2g caps each process's memory (default: the machine's RAM)
+                                             -e NAME=value (or -e NAME: the host's) sets an env var
+                                             -w /dir sets the working directory
+                                             -u user[:group] runs as that user (default: the image's USER)
        lx ps                                 running containers
        lx stop <pid>                         SIGTERM, then SIGKILL after 10s
        lx kill <pid> [SIGNAL]                default TERM
@@ -264,6 +275,7 @@ fn parse_volume(spec: &str) -> Result<(std::path::PathBuf, String, bool), String
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
+    proc::load_ids(); // a forked or exec'd lx: the guest's uid, gid and umask so far
     if let [cmd, tgz, dest] = args.as_slice() && cmd == "unpack" {
         let (n, skipped) = fs::unpack(Path::new(tgz), Path::new(dest))?;
         eprintln!("[lx] unpacked {n} entries ({skipped} skipped) into {dest}");
@@ -304,9 +316,14 @@ fn run() -> Result<(), String> {
     if let [cmd, rest @ ..] = args.as_slice() && cmd == "run" {
         // Flags before the image: -p/--publish [hostip:]hostport:containerport[/udp], repeatable.
         let (mut rest, mut ports) = (rest, Vec::new());
-        let mut volumes = Vec::new();
+        let (mut volumes, mut envs, mut workdir, mut user) = (Vec::new(), Vec::new(), None, None);
         while let [flag, value, more @ ..] = rest {
             match flag.as_str() {
+                "-u" | "--user" => user = Some(value.clone()),
+                // -e NAME=value, or -e NAME for the host's value (left out if the host has none), like Docker.
+                "-e" | "--env" if value.contains('=') => envs.push(value.clone()),
+                "-e" | "--env" => envs.extend(env::var(value).ok().map(|v| format!("{value}={v}"))),
+                "-w" | "--workdir" => workdir = Some(value.clone()),
                 "-p" | "--publish" => ports.push(net::parse_publish(value)?),
                 "-v" | "--volume" => volumes.push(parse_volume(value)?),
                 "-m" | "--memory" => unsafe { env::set_var("LX_MEMORY", parse_memory(value)?) },
@@ -319,8 +336,21 @@ fn run() -> Result<(), String> {
         unsafe { env::set_var("LX_PORTS", ports.join(",")) };
         let r = image::Ref::parse(image);
         let dir = if r.dir().join("config.json").exists() { r.dir() } else { image::pull(&r)? };
-        let c = image::run_config(&dir, rest)?;
+        let mut c = image::run_config(&dir, rest)?;
+        for e in envs {
+            let name = e.split('=').next().unwrap_or_default().to_string();
+            c.env.retain(|x| x.split('=').next() != Some(name.as_str()));
+            c.env.push(e);
+        }
+        c.workdir = workdir.unwrap_or(c.workdir);
         let root = std::fs::canonicalize(dir.join("rootfs")).map_err(|e| e.to_string())?;
+        // USER (or -u): the ids the container starts with, and HOME from passwd unless the env has one.
+        let (uid, gid, home) = image::resolve_user(&root, user.as_deref().unwrap_or(&c.user))?;
+        (proc::UID.store(uid, std::sync::atomic::Ordering::Relaxed), proc::GID.store(gid, std::sync::atomic::Ordering::Relaxed));
+        proc::save_ids();
+        if !c.env.iter().any(|e| e.starts_with("HOME=")) {
+            c.env.push(format!("HOME={}", if uid == 0 && home == "/" { "/root" } else { &home }));
+        }
         // The container gets its own writable layer; the pulled image is never modified.
         // ponytail: removed when the container exits (like `docker run --rm`); no named, restartable containers yet.
         proc::gc_layers();

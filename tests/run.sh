@@ -49,6 +49,7 @@ cc_static 2 rootfs/hello guest/hello.c
 cc_static 1 rootfs/stress guest/stress.c
 cc_static 2 rootfs/threads guest/threads.c
 cc_static 2 rootfs/stacktest guest/stacktest.c
+cc_static 2 rootfs/sigfdtest guest/sigfdtest.c
 cc_static 2 rootfs/sysbench guest/sysbench.c
 cc_static 1 rootfs/alpine/deepstack guest/deepstack.c
 cc_dynamic rootfs/alpine/threads-dyn guest/threads.c
@@ -62,7 +63,7 @@ if [ -x $GO ]; then
 fi
 
 # ---- images: pull what's missing; guest scripts reach containers through a read-only volume ----
-for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine; do
+for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine; do
   dir=$STORE/library_${img%%:*}/${img#*:}/rootfs
   # Pulled before lx kept file modes, every file reads 0755 (no real image has /etc/passwd so): re-pull.
   if [ -d "$dir" ] && [ "$($LX run "$img" stat -c %a /etc/passwd 2> /dev/null < /dev/null)" = 755 ]; then
@@ -85,6 +86,7 @@ expect() { # expect <name> <exit code> <text in output> -- <lx args...>
 expect "hello"            7   "tls=42"                   -- rootfs /hello
 expect "stress (TLS under preemption)" 0 "sum=79999999800000000" -- rootfs /stress
 expect "crash -> SIGSEGV" 139 "guest fault"              -- rootfs /stress crash
+expect "signalfd in epoll, woken by a child's signal" 0 "OK" -- rootfs /sigfdtest
 expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regress.sh
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
 expect "deep stack + fork" 0  "child exit 3"             -- rootfs/alpine /deepstack
@@ -103,6 +105,12 @@ expect "/proc/self/fd lists open fds" 0 "0 1 2 3" -- run alpine sh -c 'ls /proc/
 expect "SIGSEGV reaches the guest's handler" 139 "Fatal Python error: Segmentation fault" -- run python:3.12 python3 -X faulthandler -c "import ctypes; ctypes.string_at(0)"
 expect "httpd: config check (ErrorLog /proc/self/fd/2)" 0 "Syntax OK" -- run httpd:alpine httpd -t
 expect "java -version (HotSpot's SIGSEGV use)" 0 "OpenJDK 64-Bit Server VM" -- run eclipse-temurin:21-jre-alpine java -version
+# -e adds and overrides the image's env (PYTHON_VERSION is set by the image), -w sets the directory.
+expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERSION=9 -w /usr python:3.12-alpine sh -c 'echo A=$A V=$PYTHON_VERSION $(pwd)'
+expect "run -u / USER + HOME"      0 "65534:65533 HOME=/." -- run -u nobody:nogroup alpine sh -c 'echo $(id -u):$(id -g) HOME=$HOME.'
+# A daemon outlives the process that started it (redis --daemonize forks; its parent exits at once).
+expect "redis: daemonized server"  0 "PONG" -- run redis:alpine sh -c 'redis-server --port 6390 --daemonize yes > /dev/null; sleep 2; redis-cli -p 6390 ping; redis-cli -p 6390 shutdown nosave'
+expect "postgres: initdb, pg_ctl start, query, stop" 0 "answer 42" -- run -v "$GUEST" postgres:alpine sh /t/pgtest.sh
 
 # ---- volumes: data written in one container run is there in the next; the image stays untouched ----
 VOL="$ROOT/rootfs/voltest-suite"

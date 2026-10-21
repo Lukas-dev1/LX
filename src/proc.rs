@@ -24,16 +24,31 @@ static CHILDREN: Mutex<Vec<Kid>> = Mutex::new(Vec::new());
 static PARENT: AtomicU32 = AtomicU32::new(0);
 
 /// Linux user/group ids, as the guest sees them. Containers start as root (0).
-/// ponytail: tracked, not enforced (on Windows the whole container runs as the host user), and not
-/// carried across fork/exec yet; servers drop privileges in the process that keeps running.
+/// ponytail: tracked, not enforced (on Windows the whole container runs as the host user).
 pub static UID: AtomicU32 = AtomicU32::new(0);
 pub static GID: AtomicU32 = AtomicU32::new(0);
 
 pub fn set_id(id: &AtomicU32, v: u64) -> R {
     if v as u32 != u32::MAX {
         id.store(v as u32, Relaxed); // -1 means "unchanged"
+        save_ids();
     }
     Ok(0)
+}
+
+/// uid, gid and umask go to every later lx process of this one (fork and exec start new ones) in the
+/// host environment, which the guest never sees: `su postgres -c pg_ctl` must exec pg_ctl as postgres.
+pub fn save_ids() {
+    let v = format!("{} {} {}", UID.load(Relaxed), GID.load(Relaxed), fs::UMASK.load(Relaxed));
+    unsafe { std::env::set_var("LX_IDS", v) };
+}
+
+pub fn load_ids() {
+    let Ok(v) = std::env::var("LX_IDS") else { return };
+    let n: Vec<u32> = v.split(' ').filter_map(|x| x.parse().ok()).collect();
+    if let [uid, gid, mask] = n[..] {
+        (UID.store(uid, Relaxed), GID.store(gid, Relaxed), fs::UMASK.store(mask, Relaxed));
+    }
 }
 
 pub fn get_res(id: &AtomicU32, out: [u64; 3]) -> R {
@@ -43,8 +58,20 @@ pub fn get_res(id: &AtomicU32, out: [u64; 3]) -> R {
     Ok(0)
 }
 
+/// The pid the guest sees. Linux keeps it across execve; here an exec'd program runs in a new lx process,
+/// so that one takes its predecessor's pid (which stays behind as a proxy passing signals on, so a kill
+/// of the pid still arrives). pg_ctl waits for the pid it forked to show up in postmaster.pid.
+static PID: AtomicU32 = AtomicU32::new(0);
+
+pub fn pid() -> u32 {
+    match PID.load(Relaxed) {
+        0 => unsafe { GetCurrentProcessId() },
+        p => p,
+    }
+}
+
 pub fn getpid() -> R {
-    Ok(unsafe { GetCurrentProcessId() } as i64)
+    Ok(pid() as i64)
 }
 
 pub fn getppid() -> R {
@@ -116,7 +143,7 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     state.extend(signal::snapshot());
     state.extend(crate::jump::snapshot());
     state.extend(regs.iter().map(|r| r.to_string()));
-    state.push(unsafe { GetCurrentProcessId() }.to_string());
+    state.push(pid().to_string()); // the child's parent pid
 
     // The child copies our memory, so it gets a read-only handle to us; it reports back on `ready`.
     let mut me = 0isize;
@@ -140,6 +167,17 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     }
     let pid = child.id();
     CHILDREN.lock().unwrap().push(Kid { pid, process: OwnedHandle::from(child), notified: false });
+    // A parent blocked in epoll_wait/poll/read hears of the exit at once, not at its next syscall return
+    // (postgres's postmaster sleeps up to 60 s waiting for its startup process to exit).
+    std::thread::spawn(move || {
+        let h = unsafe { OpenProcess(0x0010_0000, 0, pid) }; // SYNCHRONIZE
+        if h != 0 {
+            unsafe { WaitForMultipleObjects(1, &h, 0, u32::MAX) };
+            unsafe { CloseHandle(h) };
+            notice_child_exits();
+            signal::wake_if_handled(signal::SIGCHLD);
+        }
+    });
     Ok(pid as i64)
 }
 
@@ -257,7 +295,7 @@ pub fn wait_for_child_exit() {
 }
 
 pub fn kill(pid: i64, sig: u64) -> R {
-    let me = unsafe { GetCurrentProcessId() } as i64;
+    let me = self::pid() as i64;
     if pid == me {
         return if sig == 0 { Ok(0) } else { signal::raise(sig) }; // delivered when this syscall returns
     }
@@ -272,16 +310,19 @@ pub fn kill(pid: i64, sig: u64) -> R {
     send(pid as u32, sig)
 }
 
-/// Signal any lx guest process by pid (the mailbox), SIGKILL by terminating it outright.
+/// Signal any lx guest process by pid (the mailbox). SIGKILL goes the same way (the watcher thread exits,
+/// or passes it on to an exec'd successor); a process without a mailbox is terminated outright.
 pub fn send(pid: u32, sig: u64) -> R {
-    if sig == 9 {
+    if sig == 9 && signal::send(pid, 9).is_err() {
         let h = unsafe { OpenProcess(0x0001 | 0x0010_0000, 0, pid) }; // PROCESS_TERMINATE | SYNCHRONIZE
         if h == 0 {
             return Err(ESRCH);
         }
-        // Its job object goes with it, taking any exec'd successor and its children along.
         unsafe { TerminateProcess(h, 128 + 9) };
         unsafe { CloseHandle(h) };
+        return Ok(0);
+    }
+    if sig == 9 {
         return Ok(0);
     }
     if sig == 0 {
@@ -424,6 +465,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
     }
     let mut state = fs::proc_state(false);
     state.push(PARENT.load(Relaxed).to_string()); // exec keeps the pid relationship
+    state.push(pid().to_string()); // and the pid itself
     state.push(exe);
     state.push(argv.len().to_string());
     state.extend(argv);
@@ -444,8 +486,9 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
 pub fn receive_exec(state: &str) -> Result<(String, Vec<String>, Vec<String>), String> {
     let fields = read_state(state)?;
     let rest = fs::init_from(&fields)?;
-    let [ppid, exe, argc, rest @ ..] = rest else { return Err("malformed exec state".into()) };
+    let [ppid, pid, exe, argc, rest @ ..] = rest else { return Err("malformed exec state".into()) };
     PARENT.store(ppid.parse().map_err(|_| "malformed exec state")?, Relaxed);
+    PID.store(pid.parse().map_err(|_| "malformed exec state")?, Relaxed);
     let argc: usize = argc.parse().map_err(|_| "malformed exec state")?;
     if rest.len() < argc {
         return Err("malformed exec state".into());
