@@ -176,6 +176,7 @@ else
   online "wget (DNS + HTTP out)" "<title>Example Domain</title>" run alpine wget -qO- http://example.com
   online "python3 /script.py: sockets + threaded server" "20/20 responses" run -v "$GUEST" python:3.12-alpine python3 /t/nettest.py
   online "debian: sockets + threaded server" "20/20 responses" run -v "$GUEST" python:3.12 python3 /t/nettest.py
+  online "debian: apt-get install jq" "jq says 6" run python:3.12 sh -c 'apt-get update -qq && apt-get install -qqy --no-install-recommends jq && echo "jq says $(echo "{\"lx\": [1, 2, 3]}" | jq ".lx | add")"'
   # glibc should stay off the trap path too: no fallback traps, no FS faults in a full threaded run.
   LX_PATCHLOG=1 timeout 120 $LX run -v "$GUEST" python:3.12 python3 /t/nettest.py < /dev/null > "$OUT/deb" 2>&1
   if grep -q " 0 fallback traps;.* 0 FS-base faults" "$OUT/deb"; then ok "debian: no trap fallbacks"; else bad "debian: trap fallbacks taken"; grep "exit:" "$OUT/deb"; fi
