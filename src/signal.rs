@@ -119,7 +119,34 @@ pub fn raise(sig: u64) -> R {
 }
 
 pub fn deliverable() -> bool {
-    S.lock().unwrap().pending & !mask() != 0
+    let s = S.lock().unwrap();
+    (s.pending | crate::syscall::ts().tpending.load(SeqCst)) & !mask() != 0
+}
+
+/// tkill/tgkill: a signal for one thread of ours (`tid` as gettid says it: the main thread is the pid).
+/// It's woken if parked in a futex; Go's AllThreadsSyscall (setuid in gosu) waits for every thread.
+pub fn send_thread(tid: u64, sig: u64) -> R {
+    if sig > 64 {
+        return Err(EINVAL);
+    }
+    let main = crate::thread::MAIN_TID.load(Relaxed);
+    let wtid = if tid as u32 == proc::pid() { main } else { tid as u32 };
+    let t = crate::syscall::ts_of(wtid).ok_or(crate::syscall::ESRCH)?;
+    if sig == 0 {
+        return Ok(0);
+    }
+    {
+        let _s = S.lock().unwrap(); // deliver() takes it from under the same lock
+        t.tpending.fetch_or(bit(sig), SeqCst);
+    }
+    let addr = t.futex_addr.load(SeqCst);
+    if addr != 0 {
+        unsafe { crate::win::WakeByAddressAll(addr as *const _) };
+    }
+    if wtid == main {
+        unsafe { crate::win::SetEvent(INTR.load(SeqCst)) }; // the main thread's sleeps and waits use it
+    }
+    Ok(0)
 }
 
 // ---- signalfd ----
@@ -325,6 +352,35 @@ pub fn interruptible_sleep(ms: u32) -> R {
     }
 }
 
+/// rt_sigtimedwait (sigwait, sigwaitinfo): take a pending signal from `set` without running its
+/// handler; daemons block their signals and wait for them in one thread. `timeout_ms` < 0: forever.
+pub fn sigtimedwait(set: u64, info: u64, timeout_ms: i64) -> R {
+    let want = unsafe { *(set as *const u64) } & !UNBLOCKABLE;
+    let start = std::time::Instant::now();
+    loop {
+        {
+            let mut s = S.lock().unwrap();
+            let mine = &crate::syscall::ts().tpending;
+            let ready = (mine.load(SeqCst) | s.pending) & want;
+            if ready != 0 {
+                let sig = ready.trailing_zeros() as u64 + 1;
+                if mine.load(SeqCst) & bit(sig) != 0 { mine.fetch_and(!bit(sig), SeqCst); } else { s.pending &= !bit(sig); }
+                if info != 0 {
+                    unsafe { std::ptr::write_bytes(info as *mut u8, 0, 128) };
+                    unsafe { *(info as *mut u32) = sig as u32 }; // si_signo; si_code 0 = SI_USER
+                }
+                return Ok(sig as i64);
+            }
+        }
+        let left = if timeout_ms < 0 { 10 } else { timeout_ms - start.elapsed().as_millis() as i64 };
+        if left <= 0 {
+            return Err(crate::syscall::EAGAIN);
+        }
+        // ponytail: re-checks every 10 ms; a signal from outside or a handled one cuts the sleep short.
+        interruptible_sleep(left.min(10) as u32)?;
+    }
+}
+
 /// setitimer(ITIMER_REAL) / alarm: SIGALRM after `value_ms`, then every `interval_ms` (0 = once).
 /// Each call replaces the previous timer. ponytail: the old timer's remaining time reads as 0, and
 /// ITIMER_VIRTUAL/PROF (CPU-time timers) aren't supported.
@@ -399,13 +455,19 @@ pub const FRAME_MAX: usize = (8 + UC_SIZE + SI_SIZE + 32) as usize;
 pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
     proc::notice_child_exits();
     let mut s = S.lock().unwrap();
+    let mine = &crate::syscall::ts().tpending;
     loop {
-        let ready = s.pending & !mask();
+        let own = mine.load(SeqCst) & !mask(); // this thread's own signals go first
+        let ready = own | s.pending & !mask();
         if ready == 0 {
             return None;
         }
         let sig = ready.trailing_zeros() as u64 + 1;
-        s.pending &= !bit(sig);
+        if own & bit(sig) != 0 {
+            mine.fetch_and(!bit(sig), SeqCst);
+        } else {
+            s.pending &= !bit(sig);
+        }
         let a = s.actions[sig as usize];
         match a.handler {
             0 if default_ignores(sig) => continue,

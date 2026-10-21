@@ -98,6 +98,7 @@ pub fn exit(code: u64) -> ! {
         crate::proc::exit(code);
     }
     let me = unsafe { GetCurrentThreadId() };
+    syscall::forget_ts(); // no more signals for this tid
     THREADS.lock().unwrap().retain(|&(tid, h)| {
         if tid == me {
             unsafe { CloseHandle(h) };
@@ -168,8 +169,22 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
                     }
                 }
             }
+            // A signal for this thread (tkill) wakes us through futex_addr: publish it, then re-check.
+            let t = syscall::ts();
+            t.futex_addr.store(uaddr, std::sync::atomic::Ordering::SeqCst);
+            if crate::signal::deliverable() {
+                t.futex_addr.store(0, std::sync::atomic::Ordering::SeqCst);
+                return Err(crate::syscall::EINTR);
+            }
             let woke = unsafe { WaitOnAddress(uaddr as *const _, &expect as *const u32 as *const _, 4, ms) };
-            if woke == 0 && unsafe { GetLastError() } == 1460 { Err(ETIMEDOUT) } else { Ok(0) } // ERROR_TIMEOUT
+            t.futex_addr.store(0, std::sync::atomic::Ordering::SeqCst);
+            if woke == 0 && unsafe { GetLastError() } == 1460 {
+                Err(ETIMEDOUT) // ERROR_TIMEOUT
+            } else if crate::signal::deliverable() {
+                Err(crate::syscall::EINTR)
+            } else {
+                Ok(0)
+            }
         }
         1 | 10 => {
             // FUTEX_WAKE, FUTEX_WAKE_BITSET. Waking more than asked is a spurious wakeup, which is allowed.
