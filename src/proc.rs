@@ -24,16 +24,31 @@ static CHILDREN: Mutex<Vec<Kid>> = Mutex::new(Vec::new());
 static PARENT: AtomicU32 = AtomicU32::new(0);
 
 /// Linux user/group ids, as the guest sees them. Containers start as root (0).
-/// ponytail: tracked, not enforced (on Windows the whole container runs as the host user), and not
-/// carried across fork/exec yet; servers drop privileges in the process that keeps running.
+/// ponytail: tracked, not enforced (on Windows the whole container runs as the host user).
 pub static UID: AtomicU32 = AtomicU32::new(0);
 pub static GID: AtomicU32 = AtomicU32::new(0);
 
 pub fn set_id(id: &AtomicU32, v: u64) -> R {
     if v as u32 != u32::MAX {
         id.store(v as u32, Relaxed); // -1 means "unchanged"
+        save_ids();
     }
     Ok(0)
+}
+
+/// uid, gid and umask go to every later lx process of this one (fork and exec start new ones) in the
+/// host environment, which the guest never sees: `su postgres -c pg_ctl` must exec pg_ctl as postgres.
+pub fn save_ids() {
+    let v = format!("{} {} {}", UID.load(Relaxed), GID.load(Relaxed), fs::UMASK.load(Relaxed));
+    unsafe { std::env::set_var("LX_IDS", v) };
+}
+
+pub fn load_ids() {
+    let Ok(v) = std::env::var("LX_IDS") else { return };
+    let n: Vec<u32> = v.split(' ').filter_map(|x| x.parse().ok()).collect();
+    if let [uid, gid, mask] = n[..] {
+        (UID.store(uid, Relaxed), GID.store(gid, Relaxed), fs::UMASK.store(mask, Relaxed));
+    }
 }
 
 pub fn get_res(id: &AtomicU32, out: [u64; 3]) -> R {

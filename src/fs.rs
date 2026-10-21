@@ -1568,9 +1568,11 @@ fn new_meta(mode: u64) -> [u32; 3] {
     [mode as u32 & 0o7777 & !UMASK.load(Relaxed), crate::proc::UID.load(Relaxed), crate::proc::GID.load(Relaxed)]
 }
 
-/// umask(mask): returns the old one. ponytail: not carried across exec (a new lx starts at 022).
+/// umask(mask): returns the old one; later lx processes (fork, exec) get the new one (proc::save_ids).
 pub fn umask(mask: u64) -> R {
-    Ok(UMASK.swap(mask as u32 & 0o777, Relaxed) as i64)
+    let old = UMASK.swap(mask as u32 & 0o777, Relaxed);
+    crate::proc::save_ids();
+    Ok(old as i64)
 }
 
 /// Fill st_mode's permission bits, st_uid and st_gid from the stored metadata.
