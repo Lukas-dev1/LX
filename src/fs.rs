@@ -461,6 +461,8 @@ impl Fs {
         if exists(&upper) {
             return Ok(upper);
         }
+        // Ask before clearing the whiteout: a deleted image file must not come back as a copy.
+        let copy = copy && self.in_lower(comps);
         let parent = upper.parent().unwrap_or(up);
         if !exists(parent) {
             fs::create_dir_all(parent).map_err(errno)?;
@@ -476,7 +478,7 @@ impl Fs {
         if let Some(name) = comps.last() {
             let _ = fs::remove_file(parent.join(format!("{WHITEOUT}{}", enc(name))));
         }
-        if copy && self.in_lower(comps) {
+        if copy {
             let mut lower = self.root.clone();
             lower.extend(comps.iter().map(|c| enc(c)));
             copy_up(&lower, &upper).map_err(errno)?;
@@ -2141,6 +2143,10 @@ fn layer_never_touches_the_image() {
     fs::write(d.join(OPAQUE), b"").unwrap();
     assert_eq!(names("/etc/conf.d"), Vec::<String>::new());
     assert!(!exists(&f.host(&c("/etc/conf.d/x"))));
+
+    // A deleted image file opened for writing again (copy-up asked) is new, not the image's copy.
+    f.remove(&c("/etc/a.conf"), false).unwrap();
+    assert!(!exists(&f.writable(&c("/etc/a.conf"), true).unwrap()));
 
     fs::remove_dir_all(base).unwrap();
 }
