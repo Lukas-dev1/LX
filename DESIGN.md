@@ -23,7 +23,8 @@
 | `wrfsbase` works in user mode | `probe/fsbase2.c` | Linux TLS (`%fs:`) can point at guest memory with no kernel help. |
 | NT resets FS base to 0 on context switches and kernel transitions | `probe/fsbase2.c`, `probe/fsbase3.c` (~100 losses/s/thread) | We can't set FS base once. It must be restored lazily (§4). |
 | A raw `syscall` goes to the **NT** kernel with Linux numbers | — | Every `syscall` must be found and rewritten before it runs (§3). |
-| The NT exception path writes below `rsp` | — | Exception-based traps can clobber the SysV 128-byte red zone (§7, risk). |
+| The NT exception path writes below `rsp` | — | Exception-based traps can clobber the SysV 128-byte red zone (§7, risk). It also means the `CONTEXT` being edited, and the handler's own frames, sit exactly where a signal frame goes, so signal frames are copied in by a trampoline after `NtContinue` (§5). |
+| `RtlCloneUserProcess` gives a working copy-on-write child… | `probe/clone.c` | …but that child crashes in `CreateProcessW` (`probe/clone2.c`), and a forked shell child must exec. `fork` is spawn-and-copy instead (§5). |
 
 ## 2. ELF loader (`src/elf.rs`)
 
@@ -60,12 +61,12 @@ This is exact, not a heuristic. A timing-based version failed under 16-way CPU c
 |---|---|---|---|
 | Process bootstrap | `arch_prctl`, `set_tid_address`, `exit`, `exit_group` | FS emulation, `ExitProcess` | ✅ |
 | stdio | `read`, `write`, `writev`, `ioctl(TCGETS/TIOCGWINSZ)` | `ReadFile`/`WriteFile` on std handles; `-ENOTTY` | ✅ (no tty yet) |
-| Memory | `mmap`, `munmap`, `mprotect`, `brk`, `madvise` | `NtAllocateVirtualMemory` / `VirtualProtect`; brk = reserved region | next |
-| Files | `openat`, `close`, `fstat`/`newfstatat`/`statx`, `getdents64`, `lseek`, `readlinkat` | `NtCreateFile` **rooted at the rootfs handle** (`OBJECT_ATTRIBUTES.RootDirectory`), fd table → HANDLE | next |
-| Time | `clock_gettime`, `nanosleep`, `clock_nanosleep` | `QueryPerformanceCounter`, `NtDelayExecution`, vDSO | next |
+| Memory | `mmap`, `munmap`, `mprotect`, `brk`, `madvise` | `VirtualAlloc`/`VirtualProtect`. Guest memory lives in a dedicated window (`0x2000_0000_0000`+) and every allocation is registered, so fork can recreate it. `brk` always fails, and libc falls back to `mmap` | ✅ |
+| Files | `openat`, `close`, `fstat`/`newfstatat`, `getdents64`, `lseek`, `readlinkat`, `sendfile`, … | std file APIs on paths resolved by `lx`. fd table → owned HANDLEs with CLOEXEC. `/dev/null`/`zero`/`urandom`/`std*`/`fd/N` emulated | ✅ (`statx`, `pread` next) |
+| Time | `clock_gettime`, `nanosleep`, `clock_nanosleep` | `QueryPerformanceCounter`, `NtDelayExecution`, vDSO | partly (no `clock_nanosleep`) |
 | Threads | `clone(CLONE_VM\|CLONE_THREAD)`, `futex`, `set_robust_list`, `rseq` → `-ENOSYS` | `CreateThread` + per-thread TEB TLS slots; `futex` → `WaitOnAddress` / `WakeByAddress*` | Go and multithreaded C need it |
-| Processes | `fork`, `vfork`, `execve`, `wait4` | `vfork`+`execve` → new `lx.exe` with the fd table inherited; real `fork` → `RtlCloneUserProcess`/`NtCreateUserProcess` with clone flags (fragile: the child can't touch most Win32) | `posix_spawn` path first; true fork later |
-| Signals | `rt_sigaction`, `rt_sigprocmask`, `kill`, `tgkill`, `sigaltstack` | Store handlers; deliver synchronously at syscall return or by thread hijack (`SuspendThread` + `SetThreadContext`); SIGSEGV from the VEH | after threads |
+| Processes | `fork`, `vfork`, `clone` (no threads), `execve`, `wait4`, `pipe2` | **fork** = start `lx --fork`. The child re-reserves every registered guest allocation at the same address and copies the paused parent's memory (`ReadProcessMemory`), along with registers, FS base, syscall-site registry, signal state and fds (handles inherited at the same values), then resumes after the syscall with `rax = 0`. Same idea as Cygwin. **execve** = start `lx --exec` with fds/cwd/argv/env; the old process waits and forwards the exit code. `#!` scripts are handled by the loader. **pipes** = anonymous pipes; EOF works because each fd owns its handle and CLOEXEC handles aren't inherited | ✅ ~23 ms per fork+exec. Faster later: exec in place (one process, not two), and skip the copy when a vfork child execs immediately |
+| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigsuspend`, `rt_sigreturn`, `kill`/`tkill`/`tgkill` | Real dispositions and mask. Delivery happens at syscall return, with a Linux-layout frame (`siginfo` + `ucontext`) placed by `lx_sig_tramp` after `NtContinue`. Handlers return via `rt_sigreturn`. SIGCHLD is raised when a child exits; default actions terminate (exit 128+n) or ignore | ✅ in-process. **Next:** cross-process `kill` (`docker stop` → SIGTERM to pid 1) needs a per-process signal channel; async delivery into a busy loop needs thread hijack (`SuspendThread`/`SetThreadContext`) |
 | I/O multiplexing | `epoll_*`, `poll`, `ppoll`, `eventfd`, `pipe2` | AFD (`\Device\Afd`, `IOCTL_AFD_POLL`) for sockets, the way wepoll and libuv do it; pipes via named-pipe pairs | needed by every server |
 | Sockets | `socket`, `bind`, `listen`, `accept4`, `connect`, `sendto`/`recvfrom`, `setsockopt` | Winsock, with flag and struct translation | with epoll |
 | Identity | `getpid`, `getuid` and the rest, `uname`, `getrandom` | constants per container; `BCryptGenRandom` | trivial |
@@ -102,7 +103,7 @@ The translation layer is **not** a security boundary. Guest code runs natively i
 2. ✅ Unmodified **official Alpine image** binaries: `PT_INTERP` (ld-musl), file-backed `mmap` with syscall patching of libraries loaded at runtime, ~50 syscalls (files, dirs, symlinks, stat, cwd). `ls -la`, `cat`, `grep`, `awk`, `sed`, `find`, `uname`, `sh` builtins, and `apk --version` (libcrypto, libz) all work.
 3. Lazy translation (replaces linear sweep and the exception round trip).
 4. Threads and `futex`: static Go binaries (`hello`, then `net/http` once epoll exists).
-5. **Next:** `fork`/`vfork`/`execve`/`wait4`/`pipe2`: `/bin/sh` scripts, i.e. most `ENTRYPOINT`s. This is the current wall: `sh -c 'a | b'` and `$(...)` fail with ENOSYS.
+5. ✅ Process model: `fork`/`execve`/`wait4`/pipes/signals. Shell entrypoints work, with pipelines, `$(...)`, background jobs + `wait`, `trap`, `#!` scripts and a final `exec` (`guest/entrypoint.sh`).
 6. AFD epoll and Winsock: an Alpine nginx or node image serves HTTP.
 7. OCI pull/unpack and a `docker run`-shaped CLI.
 
@@ -115,6 +116,8 @@ tools/rust/cargo/bin/cargo build --release
 tools/zig-x86_64-windows-0.15.2/zig.exe cc -target x86_64-linux-musl -static -O2 -o rootfs/hello guest/hello.c
 target/release/lx.exe unpack alpine-minirootfs-x86_64.tar.gz rootfs/alpine   # an image layer
 target/release/lx.exe rootfs/alpine ls -la /                               # PATH lookup inside the image
+cp guest/entrypoint.sh rootfs/alpine/ && target/release/lx.exe rootfs/alpine /entrypoint.sh   # shell entrypoint
+LX_DEBUG=1 target/release/lx.exe ...                                       # verbose [lx] diagnostics
 target/release/lx.exe rootfs /hello        # → "hello from linux ... tls=42", exit 7
 target/release/lx.exe rootfs /stress       # TLS under preemption; with "crash" arg → exit 139
 ```

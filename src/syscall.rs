@@ -4,7 +4,7 @@
 //! - NT resets FS base to 0 on context switches, so a guest `%fs:` access faults (low/kernel address).
 //!   We bounce through `fs_tramp`, which reloads FS base in user mode and resumes the faulting instruction.
 //!   Every return to the guest goes through the trampoline, because NtContinue also loses FS base.
-use crate::fs;
+use crate::{fs, proc, signal};
 use crate::win::*;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -12,7 +12,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Ok(value) or Err(positive errno); the guest sees -errno.
 pub type R = Result<i64, i64>;
+pub const ESRCH: i64 = 3;
+pub const EINTR: i64 = 4;
+pub const ENXIO: i64 = 6;
 pub const EIO: i64 = 5;
+pub const E2BIG: i64 = 7;
+pub const ENOEXEC: i64 = 8;
+pub const ECHILD: i64 = 10;
+pub const EAGAIN: i64 = 11;
+pub const EPIPE: i64 = 32;
 pub const EBADF: i64 = 9;
 pub const ENOMEM: i64 = 12;
 pub const EACCES: i64 = 13;
@@ -36,7 +44,6 @@ pub const ENOENT: i64 = 2;
 static LX_GUEST_FS: AtomicU64 = AtomicU64::new(0);
 #[unsafe(no_mangle)]
 static LX_RESUME_RIP: AtomicU64 = AtomicU64::new(0);
-static FS_RELOADS: AtomicU64 = AtomicU64::new(0);
 static START: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Guest code ranges and the patched syscall sites inside them (sorted).
@@ -59,14 +66,167 @@ std::arch::global_asm!(
     "lea rsp, [rsp + 128]",
     "jmp qword ptr [rip + LX_RESUME_RIP]",
 );
+// Enter or resume the guest with a full register set: [rax rcx rdx rbx rsp rbp rsi rdi r8..r15 rip rflags].
+// Flags are restored first (on our stack), then plain movs (which leave flags alone), and the jump goes
+// through lx_fs_tramp so FS base is set on the way in.
+std::arch::global_asm!(
+    ".globl lx_resume",
+    "lx_resume:",
+    "push qword ptr [rcx + 17*8]",
+    "popfq",
+    "mov rax, qword ptr [rcx + 16*8]",
+    "mov qword ptr [rip + LX_RESUME_RIP], rax",
+    "mov rax, qword ptr [rcx + 0*8]",
+    "mov rdx, qword ptr [rcx + 2*8]",
+    "mov rbx, qword ptr [rcx + 3*8]",
+    "mov rsp, qword ptr [rcx + 4*8]",
+    "mov rbp, qword ptr [rcx + 5*8]",
+    "mov rsi, qword ptr [rcx + 6*8]",
+    "mov rdi, qword ptr [rcx + 7*8]",
+    "mov r8, qword ptr [rcx + 8*8]",
+    "mov r9, qword ptr [rcx + 9*8]",
+    "mov r10, qword ptr [rcx + 10*8]",
+    "mov r11, qword ptr [rcx + 11*8]",
+    "mov r12, qword ptr [rcx + 12*8]",
+    "mov r13, qword ptr [rcx + 13*8]",
+    "mov r14, qword ptr [rcx + 14*8]",
+    "mov r15, qword ptr [rcx + 15*8]",
+    "mov rcx, qword ptr [rcx + 1*8]",
+    "jmp lx_fs_tramp",
+);
 unsafe extern "C" {
     fn lx_fs_tramp();
+    fn lx_resume(regs: *const [u64; 18]) -> !;
+}
+
+/// Guest stack bounds, published in the TEB because our handler code runs on the guest stack
+/// (big frames, e.g. __chkstk inside CreateProcess, probe against them). Forked children reuse them.
+static STACK: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+/// Jump into guest code. Never returns: the guest ends the process with exit_group.
+pub fn enter(regs: [u64; 18], stack_lo: u64, stack_hi: u64) -> ! {
+    *STACK.lock().unwrap() = (stack_lo, stack_hi);
+    let regs = Box::leak(Box::new(regs));
+    unsafe {
+        std::arch::asm!("mov qword ptr gs:[0x08], {hi}", "mov qword ptr gs:[0x10], {lo}", // NT_TIB StackBase/Limit
+            hi = in(reg) stack_hi, lo = in(reg) stack_lo);
+        lx_resume(regs)
+    }
+}
+
+// ---- guest address space registry (what fork has to recreate) ----
+
+/// Every guest allocation (base, size).
+static ALLOCS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// Non-fixed guest memory comes from a window far from where NT puts host heaps, stacks and DLLs, so
+/// a forked lx can re-reserve the same addresses. ponytail: bump pointer, freed space is never reused.
+const WINDOW: (u64, u64) = (0x2000_0000_0000, 0x6000_0000_0000);
+static NEXT: AtomicU64 = AtomicU64::new(WINDOW.0);
+
+/// Reserve+commit RW guest memory, at `fixed` or anywhere in the guest window.
+pub fn alloc(fixed: Option<u64>, len: u64) -> Option<u64> {
+    let len = len.next_multiple_of(PAGE);
+    let at = |a: u64| unsafe { VirtualAlloc(a as *mut _, len as usize, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
+    let p = match fixed {
+        Some(a) => Some(a).filter(|&a| at(a) == a)?,
+        None => loop {
+            let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
+            if a + len > WINDOW.1 {
+                return None;
+            }
+            if at(a) == a {
+                break a;
+            }
+        },
+    };
+    ALLOCS.lock().unwrap().push((p, len));
+    Some(p)
+}
+
+/// Serialize everything a forked child needs to rebuild the guest's address space and runtime state.
+/// Committed sub-ranges carry their protection; the child copies their contents from us.
+pub fn snapshot() -> Vec<String> {
+    let mut v: Vec<u64> = Vec::new();
+    let allocs = ALLOCS.lock().unwrap().clone();
+    v.push(allocs.len() as u64);
+    let mut committed = Vec::new();
+    for &(base, len) in &allocs {
+        v.extend([base, len]);
+        let mut p = base;
+        while p < base + len {
+            let mut m = MemoryBasicInformation::default();
+            if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 {
+                break;
+            }
+            let end = (m.base as u64 + m.region_size as u64).min(base + len);
+            if m.state == MEM_COMMIT {
+                committed.extend([p, end - p, m.protect as u64]);
+            }
+            p = end;
+        }
+    }
+    v.push(committed.len() as u64 / 3);
+    v.extend(committed);
+    let code = CODE.lock().unwrap();
+    v.push(code.regions.len() as u64);
+    v.extend(code.regions.iter().flat_map(|&(a, b)| [a, b]));
+    v.push(code.sites.len() as u64);
+    v.extend(&code.sites);
+    let stack = *STACK.lock().unwrap();
+    v.extend([NEXT.load(Relaxed), LX_GUEST_FS.load(Relaxed), stack.0, stack.1]);
+    v.into_iter().map(|n| n.to_string()).collect()
+}
+
+/// Child side of fork: recreate the guest address space from `snapshot()` fields, copying memory
+/// out of the (paused) parent. Returns the guest stack bounds and the unparsed rest of the fields.
+pub fn restore<'a>(f: &'a [String], parent: isize) -> Result<((u64, u64), &'a [String]), String> {
+    let mut it = f.iter();
+    let mut next = || -> Result<u64, String> {
+        it.next().and_then(|s| s.parse().ok()).ok_or_else(|| "malformed fork state".to_string())
+    };
+    for _ in 0..next()? {
+        let (base, len) = (next()?, next()?);
+        if unsafe { VirtualAlloc(base as *mut _, len as usize, MEM_RESERVE, PAGE_READWRITE) } as u64 != base {
+            return Err(format!("guest range {base:#x}+{len:#x} is taken in the child"));
+        }
+        ALLOCS.lock().unwrap().push((base, len));
+    }
+    for _ in 0..next()? {
+        let (a, len, prot) = (next()?, next()?, next()? as u32);
+        unsafe { VirtualAlloc(a as *mut _, len as usize, MEM_COMMIT, PAGE_READWRITE) };
+        let mut done = 0;
+        // PAGE_NOACCESS ranges can't be read and don't need to be: their contents are unobservable.
+        if prot != 0x01 && unsafe { ReadProcessMemory(parent, a as *const _, a as *mut _, len as usize, &mut done) } == 0 {
+            return Err(format!("copying guest memory {a:#x}+{len:#x} failed ({})", unsafe { GetLastError() }));
+        }
+        let mut old = 0;
+        unsafe { VirtualProtect(a as *mut _, len as usize, prot, &mut old) };
+    }
+    let mut code = CODE.lock().unwrap();
+    for _ in 0..next()? {
+        code.regions.push((next()?, next()?));
+    }
+    for _ in 0..next()? {
+        code.sites.push(next()?);
+    }
+    drop(code);
+    NEXT.store(next()?, Relaxed);
+    LX_GUEST_FS.store(next()?, Relaxed);
+    let stack = (next()?, next()?);
+    let used = f.len() - it.len();
+    Ok((stack, &f[used..]))
 }
 
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+
+/// Verbose [lx] diagnostics, enabled by setting LX_DEBUG in the host environment.
+pub fn debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LX_DEBUG").is_some())
+}
 
 pub fn install() {
     START.lock().unwrap().get_or_insert_with(Instant::now);
@@ -78,7 +238,7 @@ pub fn patch_code(addr: u64, len: usize) -> usize {
     let code = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len) };
     let found = find_syscalls(code, addr);
     let raw = code.windows(2).filter(|w| w == b"\x0f\x05").count();
-    if raw != found.len() {
+    if raw != found.len() && debug() {
         eprintln!("[lx] {addr:#x}: {} of {raw} 0F05 byte pairs are not instructions, left alone", raw - found.len());
     }
     for &a in &found {
@@ -117,6 +277,48 @@ fn resume(c: &mut Context, rip: u64) -> i32 {
     EXCEPTION_CONTINUE_EXECUTION
 }
 
+/// A signal frame waiting to be placed at the guest's (new) rsp. It can't be written from the handler:
+/// NT keeps the CONTEXT we're editing, and our own call frames, right below the guest rsp, exactly
+/// where the frame goes. lx_sig_tramp copies it after NtContinue, when that area is dead.
+#[unsafe(no_mangle)]
+static mut LX_FRAME: [u8; signal::FRAME_MAX] = [0; signal::FRAME_MAX];
+#[unsafe(no_mangle)]
+static LX_FRAME_LEN: AtomicU64 = AtomicU64::new(0);
+
+std::arch::global_asm!(
+    ".globl lx_sig_tramp",
+    "lx_sig_tramp:", // rsp = frame start; rdi/rsi/rdx already hold the handler's arguments
+    "push rsi",
+    "push rdi",
+    "push rcx",
+    "lea rdi, [rsp + 24]",
+    "lea rsi, [rip + LX_FRAME]",
+    "mov rcx, qword ptr [rip + LX_FRAME_LEN]",
+    "cld",
+    "rep movsb",
+    "pop rcx",
+    "pop rdi",
+    "pop rsi",
+    "jmp lx_fs_tramp",
+);
+unsafe extern "C" {
+    fn lx_sig_tramp();
+}
+
+/// Resume, entering a signal handler first if `deliver` prepared a frame.
+fn resume_with_signals(c: &mut Context) -> i32 {
+    match signal::deliver(c) {
+        Some(frame) => {
+            unsafe { (&raw mut LX_FRAME).cast::<u8>().copy_from_nonoverlapping(frame.as_ptr(), frame.len()) };
+            LX_FRAME_LEN.store(frame.len() as u64, Relaxed);
+            LX_RESUME_RIP.store(c.rip, Relaxed);
+            c.rip = lx_sig_tramp as *const () as u64;
+            EXCEPTION_CONTINUE_EXECUTION
+        }
+        None => resume(c, c.rip),
+    }
+}
+
 unsafe extern "system" fn veh(ep: *mut ExceptionPointers) -> i32 {
     let (rec, c) = unsafe { (&*(*ep).record, &mut *(*ep).context) };
     let (region, is_site) = {
@@ -128,14 +330,17 @@ unsafe extern "system" fn veh(ep: *mut ExceptionPointers) -> i32 {
         return EXCEPTION_CONTINUE_SEARCH; // not guest code: our own bug, let it crash normally
     };
     match rec.code {
+        STATUS_ILLEGAL_INSTRUCTION if is_site && c.rax == 15 => {
+            signal::sigreturn(c); // rt_sigreturn: back to where the signal interrupted
+            resume_with_signals(c)
+        }
         STATUS_ILLEGAL_INSTRUCTION if is_site => {
             let ret = dispatch(c);
             let next = c.rip + 2;
-            (c.rax, c.rcx, c.r11) = (ret as u64, next, c.eflags as u64); // kernel ABI: rcx=rip, r11=rflags
-            resume(c, next)
+            (c.rax, c.rcx, c.r11, c.rip) = (ret as u64, next, c.eflags as u64, next); // kernel ABI: rcx=rip, r11=rflags
+            resume_with_signals(c)
         }
         STATUS_ACCESS_VIOLATION if LX_GUEST_FS.load(Relaxed) != 0 && lost_fs_base(c, rec.info[1] as u64, end) => {
-            FS_RELOADS.fetch_add(1, Relaxed);
             resume(c, c.rip)
         }
         _ => guest_crash(rec, c),
@@ -168,7 +373,7 @@ fn lost_fs_base(c: &Context, fault_addr: u64, code_end: u64) -> bool {
 
 fn guest_crash(rec: &ExceptionRecord, c: &Context) -> ! {
     eprintln!("[lx] guest fault {:#x} at rip {:#x} (addr {:#x})", rec.code, c.rip, rec.info[1]);
-    unsafe { ExitProcess(139) } // 128 + SIGSEGV, like a shell would report
+    proc::exit(139) // 128 + SIGSEGV, like a shell would report
 }
 
 /// The dispatch table. Linux ABI: nr in rax, args rdi rsi rdx r10 r8 r9, result (or -errno) in rax.
@@ -188,16 +393,29 @@ fn dispatch(c: &mut Context) -> i64 {
         10 => mprotect(a[0], a[1], a[2]),
         11 => munmap(a[0], a[1]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
-        13 | 14 | 131 => Ok(0),        // rt_sigaction, rt_sigprocmask, sigaltstack. ponytail: no signals yet
+        13 => signal::sigaction(a[0], a[1], a[2]),
+        14 => signal::sigprocmask(a[0], a[1], a[2]),
+        131 => Ok(0),                  // sigaltstack. ponytail: handlers always run on the current stack
+        7 => fs::poll(a[0], a[1], a[2] as i32 as i64),
+        271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
+        34 => signal::sigsuspend(0),   // pause
+        130 => signal::sigsuspend(a[0]),
         16 => Err(ENOTTY),             // ioctl: no terminals yet
         20 => fs::writev(a[0], a[1], a[2]),
+        22 => fs::pipe2(a[0], 0),
         21 => fs::faccessat(CWD, a[0]),
         28 => Ok(0),                   // madvise: advice only
-        32 => fs::dup(a[0], 0),
-        33 => fs::dup3(a[0], a[1]),
+        32 => fs::dup(a[0], 0, false),
+        33 => fs::dup3(a[0], a[1], 0),
         35 => nanosleep(a[0]),
-        39 | 186 => Ok(1),             // getpid, gettid: pid 1 in the container
-        60 | 231 => exit(a[0]),        // exit, exit_group (single thread)
+        39 | 186 => proc::getpid(),
+        40 => fs::sendfile(a[0], a[1], a[2], a[3]),    // getpid, gettid (single-threaded: tid == pid)
+        56 => proc::clone(c, a[0], a[1]),
+        57 | 58 => proc::fork(c, 0),   // fork, vfork
+        59 => proc::execve(a[0], a[1], a[2]),
+        60 | 231 => proc::exit(a[0]),  // exit, exit_group (single thread)
+        61 => proc::wait4(a[0] as i64, a[1], a[2]),
+        62 => proc::kill(a[0] as i64, a[1]),
         63 => uname(a[0]),
         72 => fs::fcntl(a[0], a[1], a[2]),
         79 => fs::getcwd(a[0], a[1]),
@@ -212,7 +430,9 @@ fn dispatch(c: &mut Context) -> i64 {
         95 => Ok(0o022),               // umask
         96 => gettimeofday(a[0]),
         102 | 104 | 107 | 108 => Ok(0), // getuid, getgid, geteuid, getegid: root in the container
-        110 => Ok(0),                  // getppid
+        109 => Ok(0),                  // setpgid. ponytail: no process groups / job control
+        110 => proc::getppid(),
+        111 | 112 | 121 => proc::getpid(), // getpgrp, setsid, getpgid
         158 if a[0] == 0x1002 => { LX_GUEST_FS.store(a[1], Relaxed); Ok(0) } // arch_prctl(ARCH_SET_FS)
         217 => fs::getdents64(a[0], a[1], a[2]),
         218 => Ok(1),                  // set_tid_address
@@ -226,11 +446,20 @@ fn dispatch(c: &mut Context) -> i64 {
         267 => fs::readlinkat(a[0], a[1], a[2], a[3]),
         269 | 439 => fs::faccessat(a[0], a[1]),
         273 => Ok(0),                  // set_robust_list
-        292 => fs::dup3(a[0], a[1]),
+        200 => proc::kill(proc::getpid().unwrap_or(0), a[1]), // tkill on ourselves (single thread)
+        234 => proc::kill(proc::getpid().unwrap_or(0), a[2]), // tgkill
+        292 => fs::dup3(a[0], a[1], a[2]),
+        293 => fs::pipe2(a[0], a[1]),
         318 => getrandom(a[0], a[1]),
         334 => Err(ENOSYS),            // rseq: optional, glibc copes
         nr => {
-            eprintln!("[lx] unimplemented syscall {nr} ({:#x}, {:#x}, {:#x})", a[0], a[1], a[2]);
+            // Once per syscall number: a program retrying in a loop mustn't flood the output.
+            static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap();
+            if !seen.contains(&nr) {
+                seen.push(nr);
+                eprintln!("[lx] unimplemented syscall {nr} ({:#x}, {:#x}, {:#x})", a[0], a[1], a[2]);
+            }
             Err(ENOSYS)
         }
     };
@@ -257,7 +486,11 @@ pub fn cstr(addr: u64) -> Result<String, i64> {
 pub fn write_handle(h: isize, buf: u64, len: u64) -> R {
     let mut done = 0u32;
     let len = len.min(u32::MAX as u64) as u32;
-    if unsafe { WriteFile(h, buf as *const u8, len, &mut done, std::ptr::null_mut()) } == 0 { Err(EIO) } else { Ok(done as i64) }
+    if unsafe { WriteFile(h, buf as *const u8, len, &mut done, std::ptr::null_mut()) } != 0 {
+        return Ok(done as i64);
+    }
+    // ERROR_NO_DATA / ERROR_BROKEN_PIPE: the reader is gone. ponytail: EPIPE without SIGPIPE.
+    if matches!(unsafe { GetLastError() }, 232 | 109) { Err(EPIPE) } else { Err(EIO) }
 }
 
 pub fn read_handle(h: isize, buf: u64, len: u64) -> R {
@@ -314,7 +547,7 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
         // ponytail: a fixed range spanning two reservations fails with ENOMEM.
         let mut p = unsafe { VirtualAlloc(addr as *mut _, len as usize, MEM_COMMIT, PAGE_READWRITE) } as u64;
         if p == 0 {
-            p = unsafe { VirtualAlloc(addr as *mut _, len as usize, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
+            p = alloc(Some(addr), len).unwrap_or(0);
         }
         if p != addr || !protect(addr, len, PAGE_READWRITE as u32) {
             return Err(ENOMEM);
@@ -323,9 +556,7 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
         p
     } else {
         // ponytail: address hints ignored; every mapping gets its own 64K-aligned reservation.
-        let p = unsafe { VirtualAlloc(std::ptr::null_mut(), len as usize, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
-        if p == 0 { return Err(ENOMEM) }
-        p
+        alloc(None, len).ok_or(ENOMEM)?
     };
     if flags & MAP_ANONYMOUS == 0 {
         // ponytail: file mappings are private copies; MAP_SHARED writes never reach the file.
@@ -355,11 +586,6 @@ fn munmap(addr: u64, len: u64) -> R {
 }
 
 // ---- process, time, misc ----
-
-fn exit(code: u64) -> R {
-    eprintln!("[lx] exit {}, {} fs-base reloads", code as u8, FS_RELOADS.load(Relaxed));
-    unsafe { ExitProcess(code as u32 & 0xff) }
-}
 
 fn uname(buf: u64) -> R {
     let out = unsafe { guest_mut(buf, 65 * 6) };
@@ -399,8 +625,18 @@ fn nanosleep(ts: u64) -> R {
     Ok(0)
 }
 
-fn getrandom(buf: u64, len: u64) -> R {
+/// A `struct timespec *` timeout in ms; NULL means wait forever (-1).
+fn timespec_ms(ts: u64) -> i64 {
+    if ts == 0 {
+        return -1;
+    }
+    let [s, ns] = unsafe { *(ts as *const [i64; 2]) };
+    s.saturating_mul(1000).saturating_add(ns / 1_000_000)
+}
+
+pub fn getrandom(buf: u64, len: u64) -> R {
     let len = len.min(u32::MAX as u64);
     unsafe { BCryptGenRandom(std::ptr::null_mut(), buf as *mut u8, len as u32, 2) };
     Ok(len as i64)
 }
+

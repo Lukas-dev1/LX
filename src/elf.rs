@@ -70,11 +70,9 @@ pub fn load(f: &[u8]) -> Result<Image, String> {
     // One reservation for the whole span. NT reservations are 64K-aligned.
     let lo = segs.iter().map(|s| s.vaddr).min().unwrap() & !0xffff;
     let hi = segs.iter().map(|s| s.vaddr + s.memsz).max().unwrap().next_multiple_of(PAGE);
-    let want = if ty == 2 { lo as *mut _ } else { ptr::null_mut() }; // ET_DYN (static-pie) goes anywhere
-    let base = unsafe { VirtualAlloc(want, (hi - lo) as usize, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
-    if base == 0 || (ty == 2 && base != lo) {
-        return Err(format!("cannot map image at {lo:#x}..{hi:#x} (address in use?)"));
-    }
+    let want = (ty == 2).then_some(lo); // ET_EXEC at its link address; ET_DYN (PIE, ld.so) anywhere
+    let base = crate::syscall::alloc(want, hi - lo)
+        .ok_or_else(|| format!("cannot map image at {lo:#x}..{hi:#x} (address in use?)"))?;
     let bias = base - lo;
 
     let mut sites = 0;
@@ -109,10 +107,10 @@ pub fn load(f: &[u8]) -> Result<Image, String> {
 }
 
 /// Initial process stack per the SysV x86-64 ABI: argc, argv[], 0, envp[], 0, auxv[], AT_NULL.
-pub fn build_stack(img: &Image, interp_base: u64, argv: &[&str], envp: &[&str]) -> Result<u64, String> {
+/// Returns (initial rsp, stack low, stack high).
+pub fn build_stack(img: &Image, interp_base: u64, argv: &[&str], envp: &[&str]) -> Result<(u64, u64, u64), String> {
     const SIZE: usize = 8 << 20;
-    let base = unsafe { VirtualAlloc(ptr::null_mut(), SIZE, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
-    if base == 0 { return Err("stack allocation failed".into()); }
+    let base = crate::syscall::alloc(None, SIZE as u64).ok_or("stack allocation failed")?;
     let mut sp = base + SIZE as u64;
     let mut push = |bytes: &[u8]| -> u64 {
         sp -= bytes.len() as u64;
@@ -144,5 +142,5 @@ pub fn build_stack(img: &Image, interp_base: u64, argv: &[&str], envp: &[&str]) 
     ]);
     let rsp = (sp - 8 * w.len() as u64) & !15; // rsp must be 16-aligned at _start
     unsafe { ptr::copy_nonoverlapping(w.as_ptr(), rsp as *mut u64, w.len()) };
-    Ok(rsp)
+    Ok((rsp, base, base + SIZE as u64))
 }
