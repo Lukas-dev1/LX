@@ -900,6 +900,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         72 => fs::fcntl(a[0], a[1], a[2]),
         73 => fs::flock(a[0], a[1]),
         74 | 75 => fs::fsync(a[0]),    // fsync, fdatasync
+        277 => fs::fsync(a[0]),        // sync_file_range: the whole file (dpkg flushes before renaming)
         162 | 306 => Ok(0),            // sync, syncfs: NT writes back on its own; fsync covers durability
         79 => fs::getcwd(a[0], a[1]),
         80 => fs::chdir(a[0]),
