@@ -89,6 +89,8 @@ expect "dlopen while threads run" 0 " OK"                -- rootfs/alpine /dltes
 expect "debian: python3 -c"         0 "hi"               -- run python:3.12 python3 -c "print('hi')"
 expect "debian: python3 /script.py" 0 "script ran: 3.12" -- run -v "$GUEST" python:3.12 python3 /t/hello.py
 expect "debian: AF_UNIX echo (path + abstract)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/unixtest.py
+expect "AF_UNIX datagrams"         0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/dgramtest.py
+expect "debian: AF_UNIX datagrams" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/dgramtest.py
 
 # ---- volumes: data written in one container run is there in the next; the image stays untouched ----
 VOL="$ROOT/rootfs/voltest-suite"
@@ -191,7 +193,9 @@ stop_test handler 7 "got TERM"
 stop_test busy 143
 stop_test exec 143
 
-left=$(tasklist //FI "IMAGENAME eq lx.exe" 2> /dev/null | grep -c lx.exe)
+# Only this checkout's lx.exe (every lx of a container runs it): another worktree's containers may run.
+exe=$(cygpath -w "$ROOT/target/release/lx.exe")
+left=$(powershell -NoProfile -Command "@(Get-CimInstance Win32_Process -Filter \"Name='lx.exe'\" | Where-Object ExecutablePath -eq '$exe').Count" | tr -d '\r')
 [ "$left" = 0 ] && ok "no lx processes left" || bad "$left lx processes left running"
 
 echo "---- $pass passed, $fail failed, $warn warnings"

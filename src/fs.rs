@@ -652,7 +652,7 @@ pub fn proc_state(fork: bool) -> Vec<String> {
                 Fd::File { f, host } => ("f", f.as_raw_handle() as usize, host.to_string_lossy().into_owned()),
                 Fd::Dir { guest, .. } => ("d", 0, guest.clone()),
                 Fd::Dev(d) => (d.tag(), 0, String::new()),
-                Fd::Socket(k) => ("s", k.s, (k.nonblocking() as u8).to_string()),
+                Fd::Socket(k) => ("s", k.s, k.inherit_tag()),
                 // ponytail: epoll instances aren't carried across fork/exec (servers make one per worker).
                 Fd::Epoll(_) => continue,
                 // ponytail: an eventfd shared across fork isn't carried either; each process starts without it.
@@ -691,7 +691,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
             "null" => Fd::Dev(Dev::Null),
             "zero" => Fd::Dev(Dev::Zero),
             "random" => Fd::Dev(Dev::Random),
-            "s" => Fd::Socket(Arc::new(Sock::inherited(h, path == "1"))),
+            "s" => Fd::Socket(Arc::new(Sock::inherited(h, path))),
             _ => return Err(bad()),
         };
         while fds.len() <= fd {
