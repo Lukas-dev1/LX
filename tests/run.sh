@@ -91,6 +91,7 @@ expect "debian: python3 /script.py" 0 "script ran: 3.12" -- run -v "$GUEST" pyth
 expect "debian: AF_UNIX echo (path + abstract)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/unixtest.py
 expect "AF_UNIX datagrams"         0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/dgramtest.py
 expect "debian: AF_UNIX datagrams" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/dgramtest.py
+expect "socketpair (stream, dgram, fork, mp.Pipe)" 0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/pairtest.py
 
 # ---- volumes: data written in one container run is there in the next; the image stays untouched ----
 VOL="$ROOT/rootfs/voltest-suite"

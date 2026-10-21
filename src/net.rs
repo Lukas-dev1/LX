@@ -617,40 +617,57 @@ pub fn sys_socket(domain: u64, ty: u64, proto: u64) -> R {
     Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0))
 }
 
-/// socketpair: Windows has no AF_UNIX pairs, so connect two loopback TCP sockets (CPython on
-/// Windows does the same). ponytail: no SCM_RIGHTS fd passing over it.
+/// socketpair: Windows has no AF_UNIX pairs. A stream pair is two native AF_UNIX sockets met through a
+/// listener at a throwaway path (getsockname says AF_UNIX, as on Linux); a datagram pair is two datagram
+/// sockets connected to each other's port, so message boundaries hold.
 pub fn sys_socketpair(_domain: u64, ty: u64, _proto: u64, out: u64) -> R {
     init();
-    unsafe {
-        let l = socket(2, 1, 0);
-        let mut a = [0u8; 16];
-        a[0] = 2;
-        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
-        let mut alen = 16i32;
-        if bind(l, a.as_ptr(), 16) != 0 || listen(l, 1) != 0 || getsockname(l, a.as_mut_ptr(), &mut alen) != 0 {
-            let e = last_err();
-            closesocket(l);
-            return Err(e);
-        }
-        let c = socket(2, 1, 0);
-        let ok = connect(c, a.as_ptr(), 16) == 0;
-        let s = if ok { accept(l, std::ptr::null_mut(), std::ptr::null_mut()) } else { INVALID_SOCKET };
-        closesocket(l);
-        if s == INVALID_SOCKET {
-            let e = last_err();
-            closesocket(c);
-            return Err(e);
-        }
-        let one = 1i32;
-        for x in [c, s] {
-            setsockopt(x, 6, 1, (&one as *const i32).cast(), 4); // TCP_NODELAY: behave like a local pipe
-        }
-        let (nb, cx) = (ty & SOCK_NONBLOCK != 0, ty & SOCK_CLOEXEC != 0);
-        let a = fs::add_fd(Fd::Socket(Arc::new(Sock::new(c, nb))), cx);
-        let b = fs::add_fd(Fd::Socket(Arc::new(Sock::new(s, nb))), cx);
-        *(out as *mut [i32; 2]) = [a as i32, b as i32];
-    }
+    let (nb, cx) = (ty & SOCK_NONBLOCK != 0, ty & SOCK_CLOEXEC != 0);
+    let (x, y) = if ty & 0xf == 2 { dgram_pair(nb)? } else { stream_pair(nb)? };
+    let a = fs::add_fd(Fd::Socket(Arc::new(x)), cx);
+    let b = fs::add_fd(Fd::Socket(Arc::new(y)), cx);
+    unsafe { *(out as *mut [i32; 2]) = [a as i32, b as i32] };
     Ok(0)
+}
+
+fn dgram_pair(nb: bool) -> Result<(Sock, Sock), i64> {
+    let (x, y) = (unix_dgram(nb)?, unix_dgram(nb)?);
+    for (from, to) in [(&x, &y), (&y, &x)] {
+        let a = loopback(udgram_port(to));
+        if unsafe { connect(from.s, a.as_ptr(), 16) } != 0 {
+            return Err(last_err());
+        }
+    }
+    Ok((x, y))
+}
+
+fn stream_pair(nb: bool) -> Result<(Sock, Sock), i64> {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = format!("{SOCK_DIR}\\{}", fs::container());
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{dir}\\pair-{}-{}", std::process::id(), N.fetch_add(1, Relaxed));
+    let mut a = vec![0u8; 110];
+    a[0] = AF_UNIX as u8;
+    a[2..2 + path.len()].copy_from_slice(path.as_bytes());
+    let sock = |s: usize| if s == INVALID_SOCKET { Err(last_err()) } else { Ok(s) };
+    let l = Sock::new(sock(unsafe { socket(1, 1, 0) })?, false); // closed (and its file removed) below
+    let r = (|| {
+        if unsafe { bind(l.s, a.as_ptr(), 110) } != 0 || unsafe { listen(l.s, 1) } != 0 {
+            return Err(last_err());
+        }
+        let c = Sock::new(sock(unsafe { socket(1, 1, 0) })?, nb);
+        if unsafe { connect(c.s, a.as_ptr(), 110) } != 0 && last_err() != EAGAIN {
+            return Err(last_err());
+        }
+        // The connect is already queued on the listener: accepting can't block for long.
+        let mut p = WsaPollFd { fd: l.s, events: WSA_POLLRDNORM, revents: 0 };
+        unsafe { WSAPoll(&mut p, 1, 5000) };
+        let s = Sock::new(sock(unsafe { accept(l.s, std::ptr::null_mut(), std::ptr::null_mut()) })?, nb);
+        Ok((c, s))
+    })();
+    drop(l);
+    let _ = std::fs::remove_file(&path);
+    r
 }
 
 pub fn sys_bind(fd: u64, addr: u64, len: u64) -> R {
