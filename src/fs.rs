@@ -226,6 +226,8 @@ impl Pipe {
     fn ready(&self, events: i16) -> i16 {
         // ponytail: write ends always report POLLOUT (a full pipe makes the write wait instead).
         match self.available() {
+            // A write end has no read access, so PeekNamedPipe is denied there: it's writable.
+            None if unsafe { crate::win::GetLastError() } == 5 => events & POLLOUT,
             None => POLLHUP | (events & POLLIN),
             Some(0) => events & POLLOUT,
             Some(_) => events & (POLLIN | POLLOUT),
