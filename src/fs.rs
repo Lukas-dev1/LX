@@ -374,7 +374,12 @@ fn errno(e: io::Error) -> i64 {
         Some(267) => ENOTDIR,
         Some(17) => 18, // ERROR_NOT_SAME_DEVICE -> EXDEV: rename across a volume boundary
         Some(123 | 87) => EINVAL,
-        _ => EIO,
+        _ => {
+            if crate::syscall::debug() {
+                crate::syscall::dlog(format_args!("Windows error {e} -> EIO"));
+            }
+            EIO
+        }
     }
 }
 
