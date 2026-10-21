@@ -243,6 +243,7 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
                                              -m 2g caps each process's memory (default: the machine's RAM)
                                              -e NAME=value (or -e NAME: the host's) sets an env var
                                              -w /dir sets the working directory
+                                             -u user[:group] runs as that user (default: the image's USER)
        lx ps                                 running containers
        lx stop <pid>                         SIGTERM, then SIGKILL after 10s
        lx kill <pid> [SIGNAL]                default TERM
@@ -315,9 +316,10 @@ fn run() -> Result<(), String> {
     if let [cmd, rest @ ..] = args.as_slice() && cmd == "run" {
         // Flags before the image: -p/--publish [hostip:]hostport:containerport[/udp], repeatable.
         let (mut rest, mut ports) = (rest, Vec::new());
-        let (mut volumes, mut envs, mut workdir) = (Vec::new(), Vec::new(), None);
+        let (mut volumes, mut envs, mut workdir, mut user) = (Vec::new(), Vec::new(), None, None);
         while let [flag, value, more @ ..] = rest {
             match flag.as_str() {
+                "-u" | "--user" => user = Some(value.clone()),
                 // -e NAME=value, or -e NAME for the host's value (left out if the host has none), like Docker.
                 "-e" | "--env" if value.contains('=') => envs.push(value.clone()),
                 "-e" | "--env" => envs.extend(env::var(value).ok().map(|v| format!("{value}={v}"))),
@@ -342,6 +344,13 @@ fn run() -> Result<(), String> {
         }
         c.workdir = workdir.unwrap_or(c.workdir);
         let root = std::fs::canonicalize(dir.join("rootfs")).map_err(|e| e.to_string())?;
+        // USER (or -u): the ids the container starts with, and HOME from passwd unless the env has one.
+        let (uid, gid, home) = image::resolve_user(&root, user.as_deref().unwrap_or(&c.user))?;
+        (proc::UID.store(uid, std::sync::atomic::Ordering::Relaxed), proc::GID.store(gid, std::sync::atomic::Ordering::Relaxed));
+        proc::save_ids();
+        if !c.env.iter().any(|e| e.starts_with("HOME=")) {
+            c.env.push(format!("HOME={}", if uid == 0 && home == "/" { "/root" } else { &home }));
+        }
         // The container gets its own writable layer; the pulled image is never modified.
         // ponytail: removed when the container exits (like `docker run --rm`); no named, restartable containers yet.
         proc::gc_layers();
