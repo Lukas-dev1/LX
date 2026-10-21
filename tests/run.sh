@@ -103,6 +103,8 @@ expect "/proc/self/fd lists open fds" 0 "0 1 2 3" -- run alpine sh -c 'ls /proc/
 expect "SIGSEGV reaches the guest's handler" 139 "Fatal Python error: Segmentation fault" -- run python:3.12 python3 -X faulthandler -c "import ctypes; ctypes.string_at(0)"
 expect "httpd: config check (ErrorLog /proc/self/fd/2)" 0 "Syntax OK" -- run httpd:alpine httpd -t
 expect "java -version (HotSpot's SIGSEGV use)" 0 "OpenJDK 64-Bit Server VM" -- run eclipse-temurin:21-jre-alpine java -version
+# -e adds and overrides the image's env (PYTHON_VERSION is set by the image), -w sets the directory.
+expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERSION=9 -w /usr python:3.12-alpine sh -c 'echo A=$A V=$PYTHON_VERSION $(pwd)'
 
 # ---- volumes: data written in one container run is there in the next; the image stays untouched ----
 VOL="$ROOT/rootfs/voltest-suite"
