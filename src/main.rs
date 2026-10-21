@@ -122,6 +122,8 @@ pub mod win {
         pub fn SetConsoleCtrlHandler(h: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
         pub fn GetCurrentThread() -> isize;
         pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        pub fn GlobalMemoryStatusEx(m: *mut [u64; 8]) -> i32;
+        pub fn GetTickCount64() -> u64;
         pub fn PeekNamedPipe(h: isize, buf: *mut c_void, len: u32, read: *mut u32, avail: *mut u32, left: *mut u32) -> i32;
         pub fn DuplicateHandle(sp: isize, h: isize, tp: isize, out: *mut isize, access: u32, inherit: i32, opts: u32) -> i32;
         pub fn ReadProcessMemory(p: isize, from: *const c_void, to: *mut c_void, len: usize, done: *mut usize) -> i32;

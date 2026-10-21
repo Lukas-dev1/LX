@@ -226,6 +226,8 @@ impl Pipe {
     fn ready(&self, events: i16) -> i16 {
         // ponytail: write ends always report POLLOUT (a full pipe makes the write wait instead).
         match self.available() {
+            // A write end has no read access, so PeekNamedPipe is denied there: it's writable.
+            None if unsafe { crate::win::GetLastError() } == 5 => events & POLLOUT,
             None => POLLHUP | (events & POLLIN),
             Some(0) => events & POLLOUT,
             Some(_) => events & (POLLIN | POLLOUT),
@@ -384,20 +386,35 @@ fn ino(host: &Path) -> u64 {
     h.finish() | 1
 }
 
+/// Guest characters NTFS can't store in a name live at U+F000+c on the host (like Cygwin), so
+/// `libc6:amd64.list` round-trips. ponytail: trailing dots/spaces aren't encoded.
+fn ntfs_bad(c: char) -> bool {
+    c < ' ' || ":\\*?\"<>|".contains(c)
+}
+
+fn enc(name: &str) -> String {
+    name.chars().map(|c| if ntfs_bad(c) { char::from_u32(0xF000 + c as u32).unwrap() } else { c }).collect()
+}
+
+fn dec(name: &str) -> String {
+    let back = |c: char| char::from_u32((c as u32).wrapping_sub(0xF000)).filter(|&o| ntfs_bad(o));
+    name.chars().map(|c| back(c).unwrap_or(c)).collect()
+}
+
 impl Fs {
     /// Where `comps` lives now: the upper layer if it's there, else the image unless a whiteout or an
     /// opaque directory hides it. A path that exists nowhere maps into the upper layer.
     fn host(&self, comps: &[String]) -> PathBuf {
         if let Some((m, rest)) = self.mount_of(comps) {
             let mut p = m.host.clone();
-            p.extend(rest);
+            p.extend(rest.iter().map(|c| enc(c)));
             return p;
         }
         let mut lower = self.root.clone();
-        lower.extend(comps);
+        lower.extend(comps.iter().map(|c| enc(c)));
         let Some(up) = &self.upper else { return lower };
         let mut upper = up.clone();
-        upper.extend(comps);
+        upper.extend(comps.iter().map(|c| enc(c)));
         if exists(&upper) || self.hidden(comps) || !exists(&lower) {
             upper
         } else {
@@ -415,10 +432,10 @@ impl Fs {
         let Some(up) = &self.upper else { return false };
         let mut dir = up.clone();
         for (i, c) in comps.iter().enumerate() {
-            if exists(&dir.join(format!("{WHITEOUT}{c}"))) || (i > 0 && exists(&dir.join(OPAQUE))) {
+            if exists(&dir.join(format!("{WHITEOUT}{}", enc(c)))) || (i > 0 && exists(&dir.join(OPAQUE))) {
                 return true;
             }
-            dir.push(c);
+            dir.push(enc(c));
         }
         false
     }
@@ -428,7 +445,7 @@ impl Fs {
             return false; // a volume hides what the image had there
         }
         let mut lower = self.root.clone();
-        lower.extend(comps);
+        lower.extend(comps.iter().map(|c| enc(c)));
         self.upper.is_some() && !self.hidden(comps) && exists(&lower)
     }
 
@@ -440,28 +457,30 @@ impl Fs {
         }
         let Some(up) = &self.upper else { return Ok(self.host(comps)) };
         let mut upper = up.clone();
-        upper.extend(comps);
+        upper.extend(comps.iter().map(|c| enc(c)));
         if exists(&upper) {
             return Ok(upper);
         }
+        // Ask before clearing the whiteout: a deleted image file must not come back as a copy.
+        let copy = copy && self.in_lower(comps);
         let parent = upper.parent().unwrap_or(up);
         if !exists(parent) {
             fs::create_dir_all(parent).map_err(errno)?;
             // Directories made here stand for the image's: give them its modes and owners.
             let (mut u, mut l) = (up.clone(), self.root.clone());
             for name in &comps[..comps.len().saturating_sub(1)] {
-                (u.push(name), l.push(name));
+                (u.push(enc(name)), l.push(enc(name)));
                 if get_meta(&u).is_none() && let Some(m) = get_meta(&l) {
                     let _ = set_meta(&u, m);
                 }
             }
         }
         if let Some(name) = comps.last() {
-            let _ = fs::remove_file(parent.join(format!("{WHITEOUT}{name}")));
+            let _ = fs::remove_file(parent.join(format!("{WHITEOUT}{}", enc(name))));
         }
-        if copy && self.in_lower(comps) {
+        if copy {
             let mut lower = self.root.clone();
-            lower.extend(comps);
+            lower.extend(comps.iter().map(|c| enc(c)));
             copy_up(&lower, &upper).map_err(errno)?;
         }
         Ok(upper)
@@ -482,14 +501,14 @@ impl Fs {
         let lower = self.in_lower(comps);
         if let Some(up) = &self.upper {
             let mut upper = up.clone();
-            upper.extend(comps);
+            upper.extend(comps.iter().map(|c| enc(c)));
             if exists(&upper) {
                 if dir { fs::remove_dir_all(&upper) } else { fs::remove_file(&upper) }.map_err(errno)?;
             }
             if lower {
                 let parent = upper.parent().unwrap_or(up);
                 fs::create_dir_all(parent).map_err(errno)?;
-                fs::write(parent.join(format!("{WHITEOUT}{}", comps.last().unwrap())), b"").map_err(errno)?;
+                fs::write(parent.join(format!("{WHITEOUT}{}", enc(comps.last().unwrap()))), b"").map_err(errno)?;
             }
             return Ok(());
         }
@@ -501,7 +520,7 @@ impl Fs {
     fn list(&self, comps: &[String]) -> Result<Vec<(String, bool)>, i64> {
         if self.mount_of(comps).is_some() {
             let rd = fs::read_dir(self.host(comps)).map_err(errno)?;
-            return Ok(rd.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().is_ok_and(|t| t.is_dir()))).collect());
+            return Ok(rd.flatten().map(|e| (dec(&e.file_name().to_string_lossy()), e.file_type().is_ok_and(|t| t.is_dir()))).collect());
         }
         let mut out: Vec<(String, bool)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -510,11 +529,11 @@ impl Fs {
         let mut opaque = false;
         if let Some(up) = &self.upper {
             let mut upper = up.clone();
-            upper.extend(comps);
+            upper.extend(comps.iter().map(|c| enc(c)));
             if let Ok(rd) = fs::read_dir(&upper) {
                 found = true;
                 for e in rd.flatten() {
-                    let name = e.file_name().to_string_lossy().into_owned();
+                    let name = dec(&e.file_name().to_string_lossy());
                     if name == OPAQUE {
                         opaque = true;
                     } else if let Some(h) = name.strip_prefix(WHITEOUT) {
@@ -527,11 +546,11 @@ impl Fs {
         }
         if !opaque && (self.upper.is_none() || self.in_lower(comps)) {
             let mut lower = self.root.clone();
-            lower.extend(comps);
+            lower.extend(comps.iter().map(|c| enc(c)));
             if let Ok(rd) = fs::read_dir(&lower) {
                 found = true;
                 for e in rd.flatten() {
-                    let name = e.file_name().to_string_lossy().into_owned();
+                    let name = dec(&e.file_name().to_string_lossy());
                     if !hide.contains(&name) && seen.insert(name.clone()) {
                         out.push((name, e.file_type().is_ok_and(|t| t.is_dir())));
                     }
@@ -556,7 +575,7 @@ impl Fs {
             match c.as_str() {
                 "." => continue,
                 ".." => { comps.pop(); continue }
-                _ if c.contains(['\\', ':', '\0']) => return Err(ENOENT),
+                _ if c.contains('\0') => return Err(ENOENT), // `:` and `\` are fine: enc() maps them
                 // Layer bookkeeping names are ours; the guest can't see or forge whiteouts.
                 _ if c.starts_with(WHITEOUT) && self.upper.is_some() => return Err(ENOENT),
                 _ => comps.push(c),
@@ -645,9 +664,15 @@ fn handle_any(fd: &Fd) -> Result<isize, i64> {
 pub fn proc_state(fork: bool) -> Vec<String> {
     with(|fs| {
         // Only handles the new process keeps may reach it; a leaked pipe end would block EOF forever.
+        // Pipes and sockets share one handle between dup'd fds, so a handle is inherited if ANY fd that
+        // survives keeps it (dup2(p, 1) plus the original p left CLOEXEC: fd 1 must still get it).
+        let keep: std::collections::HashSet<isize> = fs.fds.iter().flatten()
+            .filter(|s| fork || !s.cloexec)
+            .filter_map(|s| handle_any(&s.fd).ok())
+            .collect();
         for s in fs.fds.iter().flatten() {
             if let Ok(h) = handle_any(&s.fd) {
-                unsafe { crate::win::SetHandleInformation(h, 1, (fork || !s.cloexec) as u32) };
+                unsafe { crate::win::SetHandleInformation(h, 1, keep.contains(&h) as u32) };
             }
         }
         let upper = fs.upper.as_ref().map(|u| u.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1758,7 +1783,7 @@ fn proc_link(guest: &str) -> Option<String> {
                 Fd::Dev(d) => Some(format!("/dev/{}", d.tag())),
                 Fd::File { host, .. } => {
                     let rel = fs.upper.as_ref().and_then(|u| host.strip_prefix(u).ok()).or_else(|| host.strip_prefix(&fs.root).ok())?;
-                    Some(format!("/{}", rel.to_string_lossy().replace('\\', "/")))
+                    Some(rel.iter().map(|c| format!("/{}", dec(&c.to_string_lossy()))).collect())
                 }
                 Fd::Handle(_) => Some("pipe:[0]".into()),
                 Fd::Pipe(p) => Some(format!("pipe:[{}]", p.raw())),
@@ -1975,7 +2000,7 @@ pub fn unpack(layer: &Path, dest: &Path) -> Result<(u32, u32), String> {
         let mut out = PathBuf::new();
         for c in p.components() {
             match c {
-                Component::Normal(n) if !n.to_string_lossy().contains([':', '\\']) => out.push(n),
+                Component::Normal(n) => out.push(enc(&n.to_string_lossy())),
                 Component::CurDir | Component::RootDir => {}
                 _ => return None,
             }
@@ -2073,7 +2098,11 @@ fn resolve_stays_inside_rootfs() {
     assert_eq!(r("/up/etc/passwd"), Ok("/etc/passwd".into()));
     assert_eq!(r("../../../x"), Ok("/x".into()));
     assert_eq!(r("/loop"), Err(ELOOP));
-    assert_eq!(r("..\\..\\x"), Err(ENOENT));
+    // `\` and `:` are plain name characters: one encoded host name, never a separator or a stream.
+    let (g, h) = fs_.resolve("/", "/..\\..\\x:y", true).unwrap();
+    assert_eq!(g, "/..\\..\\x:y");
+    assert_eq!(h, root.join("..\u{f05c}..\u{f05c}x\u{f03a}y"));
+    assert_eq!(dec("..\u{f05c}..\u{f05c}x\u{f03a}y\u{f041}"), "..\\..\\x:y\u{f041}");
     assert_eq!(fs_.resolve("/", "/bin/sh", false).unwrap().0, "/bin/sh");
     fs::remove_dir_all(root).unwrap();
 }
@@ -2114,6 +2143,10 @@ fn layer_never_touches_the_image() {
     fs::write(d.join(OPAQUE), b"").unwrap();
     assert_eq!(names("/etc/conf.d"), Vec::<String>::new());
     assert!(!exists(&f.host(&c("/etc/conf.d/x"))));
+
+    // A deleted image file opened for writing again (copy-up asked) is new, not the image's copy.
+    f.remove(&c("/etc/a.conf"), false).unwrap();
+    assert!(!exists(&f.writable(&c("/etc/a.conf"), true).unwrap()));
 
     fs::remove_dir_all(base).unwrap();
 }
