@@ -953,6 +953,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         257 => fs::openat(a[0], a[1], a[2], a[3]),
         258 => fs::mkdirat(a[0], a[1], a[2]),
         262 => fs::fstatat(a[0], a[1], a[2], a[3]),
+        332 => fs::statx(a[0], a[1], a[2], a[4]),
         263 => fs::unlinkat(a[0], a[1], a[2]),
         264 | 316 => fs::renameat(a[0], a[1], a[2], a[3]),
         266 => fs::symlinkat(a[0], a[1], a[2]),

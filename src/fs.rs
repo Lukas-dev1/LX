@@ -1696,6 +1696,35 @@ pub fn fstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> R {
     put_stat(buf, stat_of(&host)?)
 }
 
+/// statx(dirfd, path, flags, mask, buf): newer coreutils and glibc's stat use it. Filled from the same
+/// struct stat as fstatat (flags: AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW; the sync bits don't matter here).
+pub fn statx(dirfd: u64, path: u64, flags: u64, buf: u64) -> R {
+    let mut s = [0u64; 18];
+    fstatat(dirfd, path, s.as_mut_ptr() as u64, flags & (AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW))?;
+    let mut x = [0u8; 256];
+    let mut put = |off: usize, v: &[u8]| x[off..off + v.len()].copy_from_slice(v);
+    put(0, &0x7ffu32.to_le_bytes()); // STATX_BASIC_STATS
+    put(4, &(s[7] as u32).to_le_bytes()); // blksize
+    put(16, &(s[2] as u32).to_le_bytes()); // nlink
+    put(20, &((s[3] >> 32) as u32).to_le_bytes()); // uid
+    put(24, &(s[4] as u32).to_le_bytes()); // gid
+    put(28, &(s[3] as u16).to_le_bytes()); // mode
+    put(32, &s[1].to_le_bytes()); // ino
+    put(40, &s[6].to_le_bytes()); // size
+    put(48, &s[8].to_le_bytes()); // blocks
+    for (off, i) in [(64, 9), (96, 13), (112, 11)] { // atime, ctime, mtime: { i64 sec; u32 nsec; }
+        put(off, &s[i].to_le_bytes());
+        put(off + 8, &(s[i + 1] as u32).to_le_bytes());
+    }
+    put(128, &((s[5] >> 8) as u32 & 0xfff).to_le_bytes()); // rdev major, minor
+    put(132, &(s[5] as u32 & 0xff).to_le_bytes());
+    put(136, &((s[0] >> 8) as u32 & 0xfff).to_le_bytes()); // dev major, minor
+    put(140, &(s[0] as u32 & 0xff).to_le_bytes());
+    unsafe { std::ptr::copy_nonoverlapping(x.as_ptr(), buf as *mut u8, 256) };
+    Ok(0)
+}
+
+
 pub fn faccessat(dirfd: u64, path: u64) -> R {
     let (guest, host) = with(|fs| fs.at(dirfd, path, true))?;
     if Dev::of(&guest).is_some() || fd_alias(&guest).is_some() {
