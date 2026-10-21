@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 const ETIMEDOUT: i64 = 110;
 
 /// Windows id of the thread that started the guest: Linux makes the main thread's tid equal the pid.
-static MAIN_TID: AtomicU32 = AtomicU32::new(0);
+pub static MAIN_TID: AtomicU32 = AtomicU32::new(0);
 /// Running guest threads; the last one out ends the process.
 static LIVE: AtomicU64 = AtomicU64::new(1);
 /// Other guest threads (tid, handle), so execve can stop them like Linux does.
@@ -28,6 +28,7 @@ struct Init {
     regs: [u64; 18],
     fs: u64,
     clear_tid: u64,
+    sigmask: u64,
 }
 
 /// clone(CLONE_VM | CLONE_THREAD | ...): run the child on a new Windows thread with the parent's
@@ -48,6 +49,7 @@ pub fn clone_thread(c: &Context, flags: u64, stack: u64, ptid: u64, ctid: u64, t
         regs,
         fs: if flags & CLONE_SETTLS != 0 { tls } else { syscall::ts().fs },
         clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
+        sigmask: syscall::ts().sigmask, // a new thread starts with its creator's mask, like Linux
     });
     let mut tid = 0u32;
     // Small host stack: the thread switches to the guest's stack right away.
@@ -78,6 +80,7 @@ unsafe extern "system" fn thread_main(p: *mut std::ffi::c_void) -> u32 {
     let t = syscall::ts();
     t.fs = init.fs;
     t.clear_tid = init.clear_tid;
+    t.sigmask = init.sigmask;
     let (lo, hi) = syscall::alloc_containing(init.regs[4] - 1).unwrap_or((init.regs[4] - (1 << 20), init.regs[4]));
     syscall::enter(init.regs, lo, hi)
 }
