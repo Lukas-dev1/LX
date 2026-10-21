@@ -46,8 +46,6 @@ unsafe extern "system" {
 }
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn CancelIoEx(h: isize, ov: *mut Overlapped) -> i32;
-    fn GetOverlappedResult(h: isize, ov: *mut Overlapped, got: *mut u32, wait: i32) -> i32;
     fn WaitForSingleObject(h: isize, ms: u32) -> u32;
 }
 
@@ -616,10 +614,10 @@ fn accept_nowait(ls: usize) -> Result<(usize, Vec<u8>), i64> {
             return Err(e);
         } else {
             if WaitForSingleObject(ev, 10) != 0 {
-                CancelIoEx(ls as isize, &mut ov);
+                crate::win::CancelIoEx(ls as isize, (&raw mut ov).cast());
             }
             // After a cancel the result still says whether a connection got in first.
-            GetOverlappedResult(ls as isize, &mut ov, &mut got, 1) != 0
+            crate::win::GetOverlappedResult(ls as isize, (&raw mut ov).cast(), &mut got, 1) != 0
         }
     };
     unsafe { crate::win::CloseHandle(ev) };
