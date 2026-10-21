@@ -1,0 +1,95 @@
+//! Synthetic /proc and /proc/sys files: what images read at startup (cgroup, mounts, meminfo, cpuinfo,
+//! a few sysctls). Contents are made when the file is opened, like the kernel does.
+//! ponytail: a fixed list; /proc/<pid> of other processes, self/stat, self/status and maps aren't here.
+
+/// The contents of synthetic file `guest`, if it is one.
+pub fn file(guest: &str) -> Option<String> {
+    if let Some(rest) = self_rest(guest) {
+        return match rest {
+            "cgroup" => Some("0::/\n".into()), // cgroup v2, the container's root, like Docker
+            "mounts" => Some(mounts()),
+            "mountinfo" => Some(MOUNTINFO.into()),
+            _ => None,
+        };
+    }
+    Some(match guest {
+        "/proc/mounts" => mounts(),
+        "/proc/meminfo" => meminfo(),
+        "/proc/cpuinfo" => cpuinfo(),
+        "/proc/uptime" => {
+            let s = unsafe { crate::win::GetTickCount64() } as f64 / 1000.0;
+            format!("{s:.2} {s:.2}\n")
+        }
+        "/proc/loadavg" => format!("0.00 0.00 0.00 1/1 {}\n", unsafe { crate::win::GetCurrentProcessId() }),
+        "/proc/version" => "Linux version 6.6.0-lx (lx) #1 SMP lx\n".into(),
+        "/proc/sys/kernel/hostname" => "lx\n".into(),
+        "/proc/sys/kernel/osrelease" => "6.6.0-lx\n".into(),
+        "/proc/sys/kernel/pid_max" => "4194304\n".into(),
+        "/proc/sys/kernel/threads-max" => "1000000\n".into(),
+        "/proc/sys/vm/overcommit_memory" => "1\n".into(), // NT commits on mmap; don't make redis warn
+        "/proc/sys/vm/max_map_count" => "1048576\n".into(),
+        "/proc/sys/net/core/somaxconn" => "4096\n".into(),
+        "/proc/sys/fs/file-max" => "1048576\n".into(),
+        "/proc/sys/fs/nr_open" => "1048576\n".into(),
+        _ => return None,
+    })
+}
+
+/// "/proc/self/<rest>" or "/proc/<our pid>/<rest>" -> rest.
+fn self_rest(guest: &str) -> Option<&str> {
+    let r = guest.strip_prefix("/proc/")?;
+    let (pid, rest) = r.split_once('/')?;
+    (pid == "self" || pid.parse::<u32>().ok()? == unsafe { crate::win::GetCurrentProcessId() }).then_some(rest)
+}
+
+fn mounts() -> String {
+    "overlay / overlay rw,relatime 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
+     tmpfs /dev tmpfs rw,nosuid 0 0\nshm /dev/shm tmpfs rw,nosuid,nodev,noexec 0 0\n".into()
+}
+
+fn meminfo() -> String {
+    let mut m = [0u64; 8]; // MEMORYSTATUSEX: dwLength + dwMemoryLoad, ullTotalPhys, ullAvailPhys, page file ...
+    m[0] = 64;
+    unsafe { crate::win::GlobalMemoryStatusEx(&mut m) };
+    let kb = |b: u64| b >> 10;
+    let (total, free) = (kb(m[1]), kb(m[2]));
+    let (swap, swap_free) = (kb(m[3].saturating_sub(m[1])), kb(m[4].saturating_sub(m[2])));
+    format!("MemTotal:       {total:8} kB\nMemFree:        {free:8} kB\nMemAvailable:   {free:8} kB\n\
+             Buffers:               0 kB\nCached:                0 kB\nSwapCached:            0 kB\n\
+             SwapTotal:      {swap:8} kB\nSwapFree:       {swap_free:8} kB\nShmem:                 0 kB\n\
+             HugePages_Total:       0\nHugePages_Free:        0\nHugepagesize:       2048 kB\n")
+}
+
+fn cpuinfo() -> String {
+    use std::arch::x86_64::{__cpuid, __cpuid_count};
+    let words = |r: [u32; 4]| r.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+    let l0 = __cpuid(0);
+    let vendor = String::from_utf8_lossy(&words([l0.ebx, l0.edx, l0.ecx, 0])[..12]).into_owned();
+    let model: String = (0x8000_0002..=0x8000_0004u32)
+        .flat_map(|leaf| { let r = __cpuid(leaf); words([r.eax, r.ebx, r.ecx, r.edx]) })
+        .map(|b| b as char).collect::<String>().trim_matches(|c: char| c == '\0' || c == ' ').to_string();
+    let l1 = __cpuid(1);
+    let l7 = __cpuid_count(7, 0);
+    let has = |reg: u32, bit: u32| reg >> bit & 1 != 0;
+    // The flags programs probe for (glibc tunables, numpy, JITs read these names).
+    let flags: Vec<&str> = [
+        (has(l1.edx, 0), "fpu"), (has(l1.edx, 4), "tsc"), (has(l1.edx, 8), "cx8"), (has(l1.edx, 15), "cmov"),
+        (has(l1.edx, 23), "mmx"), (has(l1.edx, 24), "fxsr"), (has(l1.edx, 25), "sse"), (has(l1.edx, 26), "sse2"),
+        (has(l1.edx, 28), "ht"), (true, "syscall"), (true, "nx"), (true, "lm"), (has(l1.ecx, 0), "pni"),
+        (has(l1.ecx, 1), "pclmulqdq"), (has(l1.ecx, 9), "ssse3"), (has(l1.ecx, 12), "fma"), (has(l1.ecx, 13), "cx16"),
+        (has(l1.ecx, 19), "sse4_1"), (has(l1.ecx, 20), "sse4_2"), (has(l1.ecx, 22), "movbe"), (has(l1.ecx, 23), "popcnt"),
+        (has(l1.ecx, 25), "aes"), (has(l1.ecx, 26), "xsave"), (has(l1.ecx, 28), "avx"), (has(l1.ecx, 29), "f16c"),
+        (has(l1.ecx, 30), "rdrand"), (has(l7.ebx, 3), "bmi1"), (has(l7.ebx, 5), "avx2"), (has(l7.ebx, 8), "bmi2"),
+        (has(l7.ebx, 16), "avx512f"), (has(l7.ebx, 18), "rdseed"), (has(l7.ebx, 19), "adx"), (has(l7.ebx, 29), "sha_ni"),
+    ].into_iter().filter(|f| f.0).map(|f| f.1).collect();
+    let (family, model_no, stepping) = ((l1.eax >> 8) & 0xf, ((l1.eax >> 4) & 0xf) | ((l1.eax >> 12) & 0xf0), l1.eax & 0xf);
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (0..n).map(|i| format!("processor\t: {i}\nvendor_id\t: {vendor}\ncpu family\t: {family}\nmodel\t\t: {model_no}\n\
+        model name\t: {model}\nstepping\t: {stepping}\nphysical id\t: 0\nsiblings\t: {n}\ncore id\t\t: {i}\n\
+        cpu cores\t: {n}\napicid\t\t: {i}\nfpu\t\t: yes\nflags\t\t: {}\nbogomips\t: 4000.00\n\
+        clflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 48 bits physical, 48 bits virtual\n\n", flags.join(" ")))
+        .collect()
+}
+
+const MOUNTINFO: &str = "1 0 0:1 / / rw,relatime - overlay overlay rw\n2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n\
+    3 1 0:3 / /dev rw,nosuid - tmpfs tmpfs rw\n4 3 0:4 / /dev/shm rw,nosuid,nodev,noexec - tmpfs shm rw\n";
