@@ -5,7 +5,7 @@
 //! Windows: creating NTFS symlinks needs admin/Developer Mode, and resolving ourselves means `..` and
 //! absolute targets can't leave the rootfs.
 use crate::syscall::{R, cstr, guest_mut, read_handle, write_handle};
-use crate::syscall::{EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ERANGE, ESPIPE, ENOTEMPTY, EACCES, EBUSY, EIO};
+use crate::syscall::{EROFS, EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ERANGE, ESPIPE, ENOTEMPTY, EACCES, EBUSY, EIO};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -154,8 +154,16 @@ pub struct Fs {
     /// The container's writable layer: every change lands here, the image is never modified.
     /// None for a plain `lx <rootfs> cmd`, which writes the rootfs directly.
     upper: Option<PathBuf>,
+    /// Volumes (`lx run -v host:guest`): host folders mounted over guest paths, bypassing the layers.
+    mounts: Vec<Mount>,
     cwd: String,
     fds: Vec<Option<Slot>>,
+}
+
+pub struct Mount {
+    guest: Vec<String>,
+    host: PathBuf,
+    ro: bool,
 }
 
 // Whiteouts in the upper layer use the OCI layer format, so a container layer is a valid image layer.
@@ -180,7 +188,24 @@ pub fn init(root: PathBuf) {
         let owned = (h != 0 && h != -1).then(|| unsafe { BorrowedHandle::borrow_raw(h as _) }.try_clone_to_owned().ok());
         owned.flatten().map(|h| Slot { fd: Fd::Handle(h), cloexec: false })
     };
-    *FS.lock().unwrap() = Some(Fs { root, upper: None, cwd: "/".into(), fds: vec![std(-10), std(-11), std(-12)] });
+    *FS.lock().unwrap() = Some(Fs { root, upper: None, mounts: Vec::new(), cwd: "/".into(), fds: vec![std(-10), std(-11), std(-12)] });
+}
+
+/// Mount host folder `host` (canonical) at guest path `guest`. The mount point is created in the
+/// container layer if the image doesn't have it, so it shows up in its parent's listing.
+pub fn add_mount(guest: &str, host: PathBuf, ro: bool) -> Result<(), i64> {
+    with(|fs| {
+        let comps = comps_of(guest);
+        if comps.is_empty() {
+            return Err(EINVAL); // mounting over / would hide the whole image
+        }
+        if !exists(&fs.host(&comps)) {
+            fs::create_dir_all(fs.writable(&comps, false)?).map_err(errno)?;
+        }
+        fs.mounts.push(Mount { guest: comps, host, ro });
+        fs.mounts.sort_by_key(|m| std::cmp::Reverse(m.guest.len())); // longest prefix wins
+        Ok(())
+    })
 }
 
 /// Give the container a writable layer on top of the image (call right after init).
@@ -235,6 +260,7 @@ fn errno(e: io::Error) -> i64 {
         Some(80 | 183) => EEXIST,
         Some(145) => ENOTEMPTY,
         Some(267) => ENOTDIR,
+        Some(17) => 18, // ERROR_NOT_SAME_DEVICE -> EXDEV: rename across a volume boundary
         Some(123 | 87) => EINVAL,
         _ => EIO,
     }
@@ -267,6 +293,11 @@ impl Fs {
     /// Where `comps` lives now: the upper layer if it's there, else the image unless a whiteout or an
     /// opaque directory hides it. A path that exists nowhere maps into the upper layer.
     fn host(&self, comps: &[String]) -> PathBuf {
+        if let Some((m, rest)) = self.mount_of(comps) {
+            let mut p = m.host.clone();
+            p.extend(rest);
+            return p;
+        }
         let mut lower = self.root.clone();
         lower.extend(comps);
         let Some(up) = &self.upper else { return lower };
@@ -277,6 +308,11 @@ impl Fs {
         } else {
             lower
         }
+    }
+
+    /// The volume `comps` is in (the innermost one), and the path inside it.
+    fn mount_of<'a>(&self, comps: &'a [String]) -> Option<(&Mount, &'a [String])> {
+        self.mounts.iter().find(|m| comps.starts_with(&m.guest)).map(|m| (m, &comps[m.guest.len()..]))
     }
 
     /// Is the image's copy of `comps` deleted in the upper layer?
@@ -293,6 +329,9 @@ impl Fs {
     }
 
     fn in_lower(&self, comps: &[String]) -> bool {
+        if self.mount_of(comps).is_some() {
+            return false; // a volume hides what the image had there
+        }
         let mut lower = self.root.clone();
         lower.extend(comps);
         self.upper.is_some() && !self.hidden(comps) && exists(&lower)
@@ -301,6 +340,9 @@ impl Fs {
     /// The upper-layer path for changing `comps`: parent directories are created in the upper layer, a
     /// whiteout for the name is cleared, and with `copy` an image file is copied up first.
     fn writable(&self, comps: &[String], copy: bool) -> Result<PathBuf, i64> {
+        if let Some((m, _)) = self.mount_of(comps) {
+            return if m.ro { Err(EROFS) } else { Ok(self.host(comps)) }; // straight to the host folder
+        }
         let Some(up) = &self.upper else { return Ok(self.host(comps)) };
         let mut upper = up.clone();
         upper.extend(comps);
@@ -322,6 +364,16 @@ impl Fs {
 
     /// Delete `comps` from the container: remove the upper copy, and whiteout the image's copy.
     fn remove(&self, comps: &[String], dir: bool) -> Result<(), i64> {
+        if let Some((m, rest)) = self.mount_of(comps) {
+            if m.ro {
+                return Err(EROFS);
+            }
+            if rest.is_empty() {
+                return Err(EBUSY); // the mount point itself
+            }
+            let host = self.host(comps);
+            return if dir { fs::remove_dir(host) } else { fs::remove_file(host) }.map_err(errno);
+        }
         let lower = self.in_lower(comps);
         if let Some(up) = &self.upper {
             let mut upper = up.clone();
@@ -342,6 +394,10 @@ impl Fs {
 
     /// Directory entries of `comps` across both layers (names, is-dir), whiteouts applied.
     fn list(&self, comps: &[String]) -> Result<Vec<(String, bool)>, i64> {
+        if self.mount_of(comps).is_some() {
+            let rd = fs::read_dir(self.host(comps)).map_err(errno)?;
+            return Ok(rd.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().is_ok_and(|t| t.is_dir()))).collect());
+        }
         let mut out: Vec<(String, bool)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut hide = std::collections::HashSet::new();
@@ -490,7 +546,9 @@ pub fn proc_state(fork: bool) -> Vec<String> {
             }
         }
         let upper = fs.upper.as_ref().map(|u| u.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut v = vec![fs.root.to_string_lossy().into_owned(), upper, fs.cwd.clone(), String::new()];
+        let mounts: Vec<String> = fs.mounts.iter()
+            .map(|m| format!("/{}\x1f{}\x1f{}", m.guest.join("/"), m.host.to_string_lossy(), m.ro as u8)).collect();
+        let mut v = vec![fs.root.to_string_lossy().into_owned(), upper, mounts.join("\x1e"), fs.cwd.clone(), String::new()];
         let mut n = 0;
         for (i, s) in fs.fds.iter().enumerate() {
             let Some(s) = s.as_ref().filter(|s| fork || !s.cloexec) else { continue };
@@ -508,7 +566,7 @@ pub fn proc_state(fork: bool) -> Vec<String> {
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
             n += 1;
         }
-        v[3] = n.to_string();
+        v[4] = n.to_string();
         v
     })
 }
@@ -516,7 +574,14 @@ pub fn proc_state(fork: bool) -> Vec<String> {
 /// Rebuild the fd table from `proc_state` fields (in the new lx). Returns the unparsed rest.
 pub fn init_from(fields: &[String]) -> Result<&[String], String> {
     let bad = || "malformed process state".to_string();
-    let [root, upper, cwd, n, rest @ ..] = fields else { return Err(bad()) };
+    let [root, upper, mounts, cwd, n, rest @ ..] = fields else { return Err(bad()) };
+    let mounts = mounts.split('\x1e').filter(|m| !m.is_empty()).map(|m| {
+        let f: Vec<&str> = m.split('\x1f').collect();
+        match f.as_slice() {
+            [g, h, ro] => Ok(Mount { guest: comps_of(g), host: PathBuf::from(h), ro: *ro == "1" }),
+            _ => Err(bad()),
+        }
+    }).collect::<Result<Vec<_>, _>>()?;
     let mut fds: Vec<Option<Slot>> = Vec::new();
     let mut rest = rest;
     for _ in 0..n.parse::<usize>().map_err(|_| bad())? {
@@ -540,7 +605,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
         rest = more;
     }
     let upper = (!upper.is_empty()).then(|| PathBuf::from(upper));
-    *FS.lock().unwrap() = Some(Fs { root: PathBuf::from(root), upper, cwd: cwd.clone(), fds });
+    *FS.lock().unwrap() = Some(Fs { root: PathBuf::from(root), upper, mounts, cwd: cwd.clone(), fds });
     Ok(rest)
 }
 
@@ -1352,7 +1417,7 @@ fn resolve_stays_inside_rootfs() {
     write_link(&root.join("bin/sh"), "busybox").unwrap();
     write_link(&root.join("up"), "../../../..").unwrap();
     write_link(&root.join("loop"), "loop").unwrap();
-    let fs_ = Fs { root: root.clone(), upper: None, cwd: "/".into(), fds: vec![] };
+    let fs_ = Fs { root: root.clone(), upper: None, mounts: vec![], cwd: "/".into(), fds: vec![] };
     let r = |p: &str| fs_.resolve("/bin", p, true).map(|x| x.0);
     assert_eq!(r("sh"), Ok("/bin/busybox".into()));
     assert_eq!(r("/up/etc/passwd"), Ok("/etc/passwd".into()));
@@ -1371,7 +1436,7 @@ fn layer_never_touches_the_image() {
     fs::write(lower.join("etc/a.conf"), "image").unwrap();
     fs::write(lower.join("etc/conf.d/x"), "x").unwrap();
     fs::create_dir_all(&upper).unwrap();
-    let f = Fs { root: lower.clone(), upper: Some(upper.clone()), cwd: "/".into(), fds: vec![] };
+    let f = Fs { root: lower.clone(), upper: Some(upper.clone()), mounts: vec![], cwd: "/".into(), fds: vec![] };
     let c = |p: &str| comps_of(p);
     let names = |p: &str| { let mut v: Vec<String> = f.list(&c(p)).unwrap().into_iter().map(|e| e.0).collect(); v.sort(); v };
 

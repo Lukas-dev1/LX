@@ -39,6 +39,7 @@ pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
 pub const ENOENT: i64 = 2;
+pub const EROFS: i64 = 30;
 pub const ENOTSOCK: i64 = 88;
 pub const ENOPROTOOPT: i64 = 92;
 pub const EAFNOSUPPORT: i64 = 97;

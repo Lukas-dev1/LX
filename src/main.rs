@@ -187,12 +187,35 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
        lx run [-p [ip:]hostport:port[/udp]]... <image> [command args...]
                                              runs the image's entrypoint/cmd, or the given command;
                                              -p publishes a container port (others stay on localhost)
+                                             -v C:\\data:/data[:ro] mounts a host folder (repeatable)
        lx ps                                 running containers
        lx stop <pid>                         SIGTERM, then SIGKILL after 10s
        lx kill <pid> [SIGNAL]                default TERM
        lx <rootfs-dir> <command> [args...]   run a command in an unpacked rootfs
        lx unpack <layer.tar[.gz]> <rootfs-dir>";
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// `-v HOST:/guest[:ro|:rw]`. HOST may be a Windows path with a drive letter (`C:\data:/data`), so the
+/// guest part starts at the first ":/" after it. The host folder is created if missing, like Docker.
+fn parse_volume(spec: &str) -> Result<(std::path::PathBuf, String, bool), String> {
+    let bad = || format!("bad -v {spec:?}: want HOSTPATH:/container/path[:ro]");
+    let i = spec.get(2..).and_then(|s| s.find(":/")).map(|i| i + 2).ok_or_else(bad)?;
+    let (host, guest) = (&spec[..i], &spec[i + 1..]);
+    let (guest, ro) = match guest.rsplit_once(':') {
+        Some((g, "ro")) => (g, true),
+        Some((g, "rw")) => (g, false),
+        _ => (guest, false),
+    };
+    if host.is_empty() || !guest.starts_with('/') || guest.contains(':') {
+        return Err(bad());
+    }
+    std::fs::create_dir_all(host).map_err(|e| format!("-v {host}: {e}"))?;
+    let host = std::fs::canonicalize(host).map_err(|e| format!("-v {host}: {e}"))?;
+    if !host.is_dir() {
+        return Err(format!("-v {}: not a folder", host.display()));
+    }
+    Ok((host, guest.to_string(), ro))
+}
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -236,8 +259,13 @@ fn run() -> Result<(), String> {
     if let [cmd, rest @ ..] = args.as_slice() && cmd == "run" {
         // Flags before the image: -p/--publish [hostip:]hostport:containerport[/udp], repeatable.
         let (mut rest, mut ports) = (rest, Vec::new());
-        while let [flag, value, more @ ..] = rest && (flag == "-p" || flag == "--publish") {
-            ports.push(net::parse_publish(value)?);
+        let mut volumes = Vec::new();
+        while let [flag, value, more @ ..] = rest {
+            match flag.as_str() {
+                "-p" | "--publish" => ports.push(net::parse_publish(value)?),
+                "-v" | "--volume" => volumes.push(parse_volume(value)?),
+                _ => break,
+            }
             rest = more;
         }
         let [image, rest @ ..] = rest else { return Err(USAGE.into()) };
@@ -257,6 +285,9 @@ fn run() -> Result<(), String> {
         let (resolv, hosts) = net::dns_files();
         let _ = fs::write_guest_file("/etc/resolv.conf", resolv.as_bytes());
         let _ = fs::write_guest_file("/etc/hosts", hosts.as_bytes());
+        for (host, guest, ro) in volumes {
+            fs::add_mount(&guest, host, ro).map_err(|_| format!("-v: can't mount at {guest}"))?;
+        }
         fs::set_cwd(&c.workdir).map_err(|_| format!("WorkingDir {} not found in image", c.workdir))?;
         proc::register_container(&format!("{image}  {}", c.argv.join(" ")));
         return start(&c.argv[0], c.argv.clone(), c.env);
