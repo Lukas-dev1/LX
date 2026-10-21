@@ -882,6 +882,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         17 => fs::pread(a[0], a[1], a[2], a[3], false),
         18 => fs::pread(a[0], a[1], a[2], a[3], true),
         19 => fs::readv(a[0], a[1], a[2]),
+        295 | 327 => fs::preadv(a[0], a[1], a[2], a[3], false), // preadv, preadv2 (flags ignored)
+        296 | 328 => fs::preadv(a[0], a[1], a[2], a[3], true),  // pwritev, pwritev2
+        285 => fs::fallocate(a[0], a[1], a[2], a[3]),
         37 => { signal::set_alarm(a[0] * 1000, 0); Ok(0) } // alarm
         38 => setitimer(a[0], a[1], a[2]),
         90 => fs::chmeta_at(CWD, a[0], true, Some(a[1]), None),                     // chmod

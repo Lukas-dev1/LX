@@ -1084,6 +1084,29 @@ pub fn readv(fd: u64, iov: u64, cnt: u64) -> R {
     Ok(total)
 }
 
+/// preadv/pwritev (and the -v2 forms, flags ignored): readv/writev at `off`, or at the file position
+/// when `off` is -1 (only the -v2 forms allow that).
+pub fn preadv(fd: u64, iov: u64, cnt: u64, off: u64, write: bool) -> R {
+    if off == u64::MAX {
+        return if write { writev(fd, iov, cnt) } else { readv(fd, iov, cnt) };
+    }
+    if cnt > 1024 {
+        return Err(EINVAL);
+    }
+    let mut total = 0;
+    for i in 0..cnt {
+        let [base, len] = unsafe { *((iov + i * 16) as *const [u64; 2]) };
+        match pread(fd, base, len, off + total as u64, write) {
+            Ok(n) => {
+                total += n;
+                if (n as u64) < len { break }
+            }
+            Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
+        }
+    }
+    Ok(total)
+}
+
 pub fn writev(fd: u64, iov: u64, cnt: u64) -> R {
     if cnt > 1024 {
         return Err(EINVAL);
@@ -1956,6 +1979,26 @@ pub fn truncate(dirfd: u64, path: u64, fd: Option<u64>, len: u64) -> R {
             }
         };
         OpenOptions::new().write(true).open(f).and_then(|f| f.set_len(len)).map(|_| 0).map_err(errno)
+    })
+}
+
+/// fallocate(fd, mode, off, len): mode 0 grows the file to cover [off, off+len) (posix_fallocate; postgres
+/// sizes its /dev/shm segments so); FALLOC_FL_KEEP_SIZE alone has nothing to do. Hole punching etc.: EOPNOTSUPP.
+pub fn fallocate(fd: u64, mode: u64, off: u64, len: u64) -> R {
+    const FALLOC_FL_KEEP_SIZE: u64 = 1;
+    with(|fs| {
+        let Fd::File { f, .. } = fs.fd(fd)? else { return Err(crate::syscall::ENODEV) };
+        match mode {
+            0 => {
+                let end = off.checked_add(len).ok_or(EINVAL)?;
+                if f.metadata().map_err(errno)?.len() < end {
+                    f.set_len(end).map_err(errno)?;
+                }
+                Ok(0)
+            }
+            FALLOC_FL_KEEP_SIZE => Ok(0),
+            _ => Err(95), // EOPNOTSUPP
+        }
     })
 }
 
