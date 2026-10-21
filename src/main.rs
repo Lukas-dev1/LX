@@ -209,7 +209,15 @@ fn parse_memory(v: &str) -> Result<String, String> {
     Ok((n * mult).to_string())
 }
 
+/// The container's job: the first lx process of a container makes it, every later one (fork, exec)
+/// starts inside it and stays there. It caps each process's memory and dies with that first process,
+/// taking the whole container along, like PID 1. Only one per container: a job per lx process killed
+/// a daemon (fork, then the parent exits: redis --daemonize, pg_ctl start) along with its parent.
 fn enter_job() -> Result<(), String> {
+    if env::var_os("LX_IN_JOB").is_some() {
+        return Ok(());
+    }
+    unsafe { env::set_var("LX_IN_JOB", "1") }; // inherited by every later lx process
     const LIMIT_PROCESS_MEMORY: u32 = 0x100;
     const KILL_ON_JOB_CLOSE: u32 = 0x2000;
     let limits = JobLimits {

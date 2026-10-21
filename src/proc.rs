@@ -287,16 +287,19 @@ pub fn kill(pid: i64, sig: u64) -> R {
     send(pid as u32, sig)
 }
 
-/// Signal any lx guest process by pid (the mailbox), SIGKILL by terminating it outright.
+/// Signal any lx guest process by pid (the mailbox). SIGKILL goes the same way (the watcher thread exits,
+/// or passes it on to an exec'd successor); a process without a mailbox is terminated outright.
 pub fn send(pid: u32, sig: u64) -> R {
-    if sig == 9 {
+    if sig == 9 && signal::send(pid, 9).is_err() {
         let h = unsafe { OpenProcess(0x0001 | 0x0010_0000, 0, pid) }; // PROCESS_TERMINATE | SYNCHRONIZE
         if h == 0 {
             return Err(ESRCH);
         }
-        // Its job object goes with it, taking any exec'd successor and its children along.
         unsafe { TerminateProcess(h, 128 + 9) };
         unsafe { CloseHandle(h) };
+        return Ok(0);
+    }
+    if sig == 9 {
         return Ok(0);
     }
     if sig == 0 {
