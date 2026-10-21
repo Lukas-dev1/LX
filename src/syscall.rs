@@ -16,6 +16,7 @@ pub const EPERM: i64 = 1;
 pub const ESRCH: i64 = 3;
 pub const EINTR: i64 = 4;
 pub const ENXIO: i64 = 6;
+pub const ENODEV: i64 = 19;
 pub const EIO: i64 = 5;
 pub const E2BIG: i64 = 7;
 pub const ENOEXEC: i64 = 8;
@@ -407,6 +408,7 @@ pub fn release_guest_memory() {
         false
     });
     CODE.lock().unwrap().regions.clear(); // nothing of the old program runs any more
+    unmap_views(0, u64::MAX);
     crate::jump::clear();
 }
 
@@ -442,6 +444,7 @@ pub fn snapshot() -> Vec<String> {
     // Only the forking thread survives a fork, as on Linux: its FS base and stack come along.
     let t = ts();
     v.extend([NEXT.load(Relaxed), t.fs, t.stack.0, t.stack.1]);
+    v.extend(views_snapshot());
     v.into_iter().map(|n| n.to_string()).collect()
 }
 
@@ -483,6 +486,16 @@ pub fn restore<'a>(f: &'a [String], parent: isize) -> Result<((u64, u64), &'a [S
     NEXT.store(next()?, Relaxed);
     ts().fs = next()?;
     let stack = (next()?, next()?);
+    // Shared views: the same sections (inherited at the same handle values), at the same addresses.
+    for _ in 0..next()? {
+        let (base, len, section, off, access) = (next()?, next()?, next()? as isize, next()?, next()? as u32);
+        let got = unsafe { MapViewOfFileEx(section, access, (off >> 32) as u32, off as u32, len as usize, base as *mut _) } as u64;
+        if got != base {
+            return Err(format!("shared mapping {base:#x}+{len:#x} can't be placed in the child ({})", unsafe { GetLastError() }));
+        }
+        unsafe { SetHandleInformation(section, 1, 0) };
+        VIEWS.lock().unwrap().push(View { base, len, section, off, access });
+    }
     let used = f.len() - it.len();
     Ok((stack, &f[used..]))
 }
@@ -806,6 +819,7 @@ fn dispatch(c: &mut Context) -> i64 {
         10 => mprotect(a[0], a[1], a[2]),
         11 => munmap(a[0], a[1], c.rsp),
         25 => mremap(a[0], a[1], a[2], a[3]),
+        26 => msync(a[0], a[1]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
@@ -1050,6 +1064,7 @@ fn decommit(addr: u64, len: u64) -> bool {
 }
 
 fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
+    const MAP_SHARED: u64 = 0x01;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
     if len == 0 || addr % PAGE != 0 || off % PAGE != 0 {
@@ -1057,6 +1072,9 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     }
     let len = len.next_multiple_of(PAGE);
     let reserve_only = prot == 0 && flags & MAP_ANONYMOUS != 0; // PROT_NONE: address space, no memory
+    if flags & MAP_SHARED != 0 && !reserve_only {
+        return mmap_shared(addr, len, prot, flags & MAP_FIXED != 0, (flags & MAP_ANONYMOUS == 0).then_some(fd), off);
+    }
     let p = if flags & MAP_FIXED != 0 {
         // Inside our reservations (ld.so carving up a library span, Go committing arena chunks): replace the
         // contents with fresh zero pages; elsewhere, a new reservation at exactly that address.
@@ -1085,6 +1103,148 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     }
     protect(p, len, page_prot(prot));
     Ok(p as i64)
+}
+
+// ---- MAP_SHARED: views of NT sections ----
+//
+// A shared mapping is a view of a section: pagefile-backed for anonymous memory, the file's own for a
+// file. Every process mapping it (forked children included) sees the same pages, and writes reach the
+// file. Views aren't in ALLOCS, so fork doesn't copy them: the child maps the same section at the same
+// address instead (`snapshot` / `restore`). Views must start on NT's 64K granularity, so an offset that
+// isn't 64K-aligned maps from the aligned offset below it and returns a pointer into the view.
+// ponytail: munmap of part of a view unmaps all of it; mremap of a view makes a private copy.
+
+struct View {
+    base: u64,
+    len: u64,
+    section: isize,
+    off: u64,
+    access: u32,
+}
+static VIEWS: Mutex<Vec<View>> = Mutex::new(Vec::new());
+
+const FILE_MAP_WRITE: u32 = 0x2;
+const FILE_MAP_READ: u32 = 0x4;
+const FILE_MAP_EXECUTE: u32 = 0x20;
+
+fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, off: u64) -> R {
+    let write = prot & 2 != 0;
+    let delta = off % 0x10000;
+    let aoff = off - delta;
+    let mut vlen = delta + len;
+    let section = match file {
+        None => unsafe { CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null()) },
+        Some(fd) => {
+            let (h, size) = fs::file_handle(fd)?;
+            if size <= aoff {
+                return Err(ENXIO); // ponytail: mapping wholly past the end of the file (Linux: SIGBUS on touch)
+            }
+            // NT views can't reach past the file's end (it maps the last partial page whole anyway).
+            vlen = vlen.min(size - aoff);
+            let exec = prot & 4 != 0;
+            let rw = if exec { 0x40 } else { PAGE_READWRITE }; // PAGE_EXECUTE_READWRITE
+            let mut s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), rw, 0, 0, std::ptr::null()) };
+            if s == 0 && !write {
+                // A file opened read-only can still be mapped for reading.
+                s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), if exec { 0x20 } else { 0x02 }, 0, 0, std::ptr::null()) };
+            }
+            if s == 0 {
+                return Err(EACCES);
+            }
+            s
+        }
+    };
+    if section == 0 {
+        return Err(ENOMEM);
+    }
+    let access = if write { FILE_MAP_WRITE } else { FILE_MAP_READ } | if prot & 4 != 0 { FILE_MAP_EXECUTE } else { 0 };
+    let view_at = |base: u64| unsafe { MapViewOfFileEx(section, access, (aoff >> 32) as u32, aoff as u32, vlen as usize, base as *mut _) } as u64;
+    let base = if fixed {
+        if delta != 0 {
+            unsafe { CloseHandle(section) };
+            return Err(EINVAL);
+        }
+        unmap_views(addr, len); // replacing an earlier shared mapping there
+        let whole = ALLOCS.lock().unwrap().iter().position(|&(b, l)| b == addr && l == len);
+        if let Some(i) = whole {
+            // Replacing one whole private mapping of ours: give its address space back first.
+            unsafe { VirtualFree(addr as *mut _, 0, MEM_RELEASE) };
+            ALLOCS.lock().unwrap().remove(i);
+        }
+        match view_at(addr) {
+            got if got == addr => addr,
+            _ => {
+                unsafe { CloseHandle(section) };
+                return Err(ENOMEM); // ponytail: a fixed shared mapping over part of a private one
+            }
+        }
+    } else {
+        loop {
+            let a = NEXT.fetch_add(vlen.next_multiple_of(0x10000), Relaxed);
+            if a + vlen > WINDOW.1 {
+                unsafe { CloseHandle(section) };
+                return Err(ENOMEM);
+            }
+            if view_at(a) == a {
+                break a;
+            }
+            // Only "that address is taken" is worth trying elsewhere; any other refusal is final.
+            const ERROR_INVALID_ADDRESS: u32 = 487;
+            let e = unsafe { GetLastError() };
+            if e != ERROR_INVALID_ADDRESS {
+                unsafe { CloseHandle(section) };
+                return Err(if e == 5 { EACCES } else { ENOMEM });
+            }
+        }
+    };
+    if prot == 0 {
+        let mut old = 0;
+        unsafe { VirtualProtect(base as *mut _, vlen as usize, 0x01, &mut old) }; // PROT_NONE
+    }
+    VIEWS.lock().unwrap().push(View { base, len: vlen, section, off: aoff, access });
+    Ok((base + delta) as i64)
+}
+
+/// Unmap every shared view overlapping [addr, addr+len). Returns whether there was one.
+fn unmap_views(addr: u64, len: u64) -> bool {
+    let mut views = VIEWS.lock().unwrap();
+    let before = views.len();
+    views.retain(|v| {
+        if v.base < addr + len && addr < v.base + v.len {
+            unsafe {
+                UnmapViewOfFile(v.base as *mut _);
+                CloseHandle(v.section);
+            }
+            false
+        } else {
+            true
+        }
+    });
+    views.len() != before
+}
+
+fn msync(addr: u64, len: u64) -> R {
+    unsafe { FlushViewOfFile(addr as *const _, len as usize) };
+    Ok(0)
+}
+
+/// Shared views for a forked child: (base, len, section, offset, access) with the sections made
+/// inheritable for the duration of the fork (`views_inheritable(false)` afterwards).
+fn views_snapshot() -> Vec<u64> {
+    let views = VIEWS.lock().unwrap();
+    let mut v = vec![views.len() as u64];
+    for w in views.iter() {
+        unsafe { SetHandleInformation(w.section, 1, 1) };
+        v.extend([w.base, w.len, w.section as u64, w.off, w.access as u64]);
+    }
+    v
+}
+
+/// Back to non-inheritable once the fork child has its copies (an exec'd successor mustn't keep them).
+pub fn views_inheritable(on: bool) {
+    for w in VIEWS.lock().unwrap().iter() {
+        unsafe { SetHandleInformation(w.section, 1, on as u32) };
+    }
 }
 
 fn mprotect(addr: u64, len: u64, prot: u64) -> R {
@@ -1120,6 +1280,9 @@ fn munmap(addr: u64, len: u64, rsp: u64) -> R {
     // A thread unmapping its own stack is about to exit (musl's detached-thread exit does this); NT
     // still needs that stack to dispatch the final exit syscall, so leave it mapped.
     if (addr..addr + len).contains(&rsp) {
+        return Ok(0);
+    }
+    if unmap_views(addr, len) {
         return Ok(0);
     }
     // ponytail: decommit only; the address space stays reserved (and leaks) until exit.

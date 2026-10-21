@@ -1019,6 +1019,14 @@ pub fn statfs(path: Option<u64>, fd: Option<u64>, buf: u64) -> R {
     Ok(0)
 }
 
+/// The NT handle and size of a regular file's fd (for MAP_SHARED file mappings).
+pub fn file_handle(fd: u64) -> Result<(isize, u64), i64> {
+    with(|fs| match fs.fd(fd)? {
+        Fd::File { f, .. } => Ok((f.as_raw_handle() as isize, f.metadata().map(|m| m.len()).unwrap_or(0))),
+        _ => Err(crate::syscall::ENODEV),
+    })
+}
+
 /// Make a directory in the container (through the layer), e.g. /dev/shm.
 pub fn mkdir_guest(guest: &str) -> Result<(), i64> {
     with(|fs| {

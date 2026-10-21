@@ -108,7 +108,9 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     let me = unsafe { OwnedHandle::from_raw_handle(me as _) };
     let fail = |e: String| { eprintln!("[lx] fork: {e}"); EAGAIN };
     let (ready_r, ready_w) = inheritable_pipe().map_err(|e| fail(e.to_string()))?;
-    let mut child = spawn_lx("--fork", &[raw(&me), raw(&ready_w)], state).map_err(|e| fail(e.to_string()))?;
+    let child = spawn_lx("--fork", &[raw(&me), raw(&ready_w)], state);
+    syscall::views_inheritable(false); // the child has its copies of the shared-memory sections now
+    let mut child = child.map_err(|e| fail(e.to_string()))?;
     drop((me, ready_w)); // if the child dies before reporting, `ready` hits EOF
     let mut byte = [0u8];
     if !matches!(std::fs::File::from(ready_r).read(&mut byte), Ok(1)) {

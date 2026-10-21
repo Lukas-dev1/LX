@@ -103,6 +103,9 @@ pub mod win {
         pub fn GetFileType(h: isize) -> u32;
         pub fn LockFileEx(h: isize, flags: u32, reserved: u32, len_lo: u32, len_hi: u32, ov: *mut c_void) -> i32;
         pub fn UnlockFileEx(h: isize, reserved: u32, len_lo: u32, len_hi: u32, ov: *mut c_void) -> i32;
+        pub fn MapViewOfFileEx(map: isize, access: u32, hi: u32, lo: u32, len: usize, base: *mut c_void) -> *mut c_void;
+        pub fn UnmapViewOfFile(base: *mut c_void) -> i32;
+        pub fn FlushViewOfFile(base: *const c_void, len: usize) -> i32;
         pub fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
         pub fn CreateFileMappingW(file: isize, attr: *mut c_void, prot: u32, hi: u32, lo: u32, name: *const u16) -> isize;
         pub fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> isize;
