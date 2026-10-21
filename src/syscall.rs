@@ -1410,13 +1410,14 @@ fn nanosleep(ts: u64) -> R {
     signal::interruptible_sleep(timespec_ms(ts).clamp(0, u32::MAX as i64 - 1) as u32)
 }
 
-/// Limits like a Docker container's defaults: 1M open files, 8 MB stack, the rest unlimited.
+/// Limits like a Docker container's defaults (8 MB stack, the rest unlimited), except a 1024 soft
+/// open-file limit: without /proc/self/fd, apt and others fcntl every fd number up to it.
 /// ponytail: new limits are accepted but not enforced.
 fn rlimit(resource: u64, _new: u64, old: u64) -> R {
     const INF: u64 = u64::MAX;
     let (cur, max) = match resource {
         3 => (8 << 20, INF),        // RLIMIT_STACK
-        7 => (1 << 20, 1 << 20),    // RLIMIT_NOFILE
+        7 => (1024, 1 << 20),       // RLIMIT_NOFILE
         _ => (INF, INF),
     };
     if old != 0 {
