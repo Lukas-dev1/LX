@@ -41,6 +41,8 @@ pub enum Fd {
     Dir { guest: String, pos: usize },
     /// Emulated character devices; image /dev directories are empty.
     Dev(Dev),
+    /// A guest pipe end (pipe2): an overlapped NT named pipe, see `Pipe`.
+    Pipe(Arc<Pipe>),
     /// Shared like a Linux open file description: dup and fork share the socket and its O_NONBLOCK.
     Socket(Arc<Sock>),
     Epoll(Arc<Mutex<Epoll>>),
@@ -136,6 +138,92 @@ impl Dev {
         let minor = match self { Dev::Null => 3, Dev::Zero => 5, Dev::Random => 9 };
         (s[1], s[2], s[3], s[5], s[7]) = (minor, 1, 0o020666, 0x100 | minor, 4096); // char device 1:minor
         s
+    }
+}
+
+/// A guest pipe end. NT serializes every operation on a synchronous pipe handle, so with CreatePipe a
+/// read pending in one process (a forked worker waiting for work) made even PeekNamedPipe/GetFileType
+/// from another process wait behind it: poll() hung. Overlapped pipes aren't serialized, so readiness
+/// checks never block; reads and writes wait on their own event plus the signal event (EINTR), and
+/// O_NONBLOCK works. Shared by dup and fork like an open file description.
+pub struct Pipe {
+    h: OwnedHandle,
+    nonblock: std::sync::atomic::AtomicBool,
+}
+
+impl Pipe {
+    fn raw(&self) -> isize {
+        self.h.as_raw_handle() as isize
+    }
+
+    fn nonblocking(&self) -> bool {
+        self.nonblock.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn available(&self) -> Option<u32> {
+        let mut avail = 0u32;
+        let ok = unsafe { crate::win::PeekNamedPipe(self.raw(), std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) };
+        (ok != 0).then_some(avail) // None: the other end is gone
+    }
+
+    /// One overlapped ReadFile/WriteFile, waited for (or EAGAIN when non-blocking and it would wait).
+    fn io(&self, buf: u64, len: u64, write: bool) -> R {
+        use crate::win::*;
+        const ERROR_IO_PENDING: u32 = 997;
+        const ERROR_BROKEN_PIPE: u32 = 109;
+        const ERROR_NO_DATA: u32 = 232;
+        let len = len.min(u32::MAX as u64) as u32;
+        if !write && self.nonblocking() {
+            match self.available() {
+                Some(0) => return Err(crate::syscall::EAGAIN),
+                None => return Ok(0), // EOF
+                _ => {}
+            }
+        }
+        let ev = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        let mut o = Overlapped { internal: [0; 2], offset: 0, offset_high: 0, event: ev };
+        let op = (&mut o as *mut Overlapped).cast();
+        let mut done = 0u32;
+        let ok = unsafe {
+            if write { WriteFile(self.raw(), buf as *const u8, len, &mut done, op) } else { ReadFile(self.raw(), buf as *mut u8, len, &mut done, op) }
+        };
+        let mut err = if ok != 0 { 0 } else { unsafe { GetLastError() } };
+        if err == ERROR_IO_PENDING {
+            let intr = crate::signal::intr_event();
+            let waits = if intr != 0 { vec![ev, intr] } else { vec![ev] };
+            loop {
+                let r = unsafe { WaitForMultipleObjects(waits.len() as u32, waits.as_ptr(), 0, u32::MAX) };
+                if r == 0 || crate::signal::deliverable() {
+                    break;
+                }
+            }
+            unsafe {
+                if WaitForMultipleObjects(1, &ev, 0, 0) != 0 {
+                    CancelIoEx(self.raw(), op); // a signal arrived first
+                }
+                err = if GetOverlappedResult(self.raw(), op, &mut done, 1) != 0 { 0 } else { GetLastError() };
+            }
+            if err == 995 && done == 0 {
+                unsafe { CloseHandle(ev) };
+                return Err(crate::syscall::EINTR); // ERROR_OPERATION_ABORTED
+            }
+        }
+        unsafe { CloseHandle(ev) };
+        match err {
+            0 | 995 => Ok(done as i64),
+            ERROR_BROKEN_PIPE if !write => Ok(0), // EOF
+            ERROR_BROKEN_PIPE | ERROR_NO_DATA => Err(crate::syscall::EPIPE),
+            _ => Err(EIO),
+        }
+    }
+
+    fn ready(&self, events: i16) -> i16 {
+        // ponytail: write ends always report POLLOUT (a full pipe makes the write wait instead).
+        match self.available() {
+            None => POLLHUP | (events & POLLIN),
+            Some(0) => events & POLLOUT,
+            Some(_) => events & (POLLIN | POLLOUT),
+        }
     }
 }
 
@@ -555,6 +643,7 @@ pub fn proc_state(fork: bool) -> Vec<String> {
             let Some(s) = s.as_ref().filter(|s| fork || !s.cloexec) else { continue };
             let (kind, h, path) = match &s.fd {
                 Fd::Handle(h) => ("h", h.as_raw_handle() as usize, String::new()),
+                Fd::Pipe(p) => ("p", p.raw() as usize, (p.nonblocking() as u8).to_string()),
                 Fd::File { f, host } => ("f", f.as_raw_handle() as usize, host.to_string_lossy().into_owned()),
                 Fd::Dir { guest, .. } => ("d", 0, guest.clone()),
                 Fd::Dev(d) => (d.tag(), 0, String::new()),
@@ -591,6 +680,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
         let h: usize = h.parse().map_err(|_| bad())?;
         let fd_ = match kind.as_str() {
             "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(h as _) }),
+            "p" => Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (path == "1").into() })),
             "f" => Fd::File { f: unsafe { File::from_raw_handle(h as _) }, host: PathBuf::from(path) },
             "d" => Fd::Dir { guest: path.clone(), pos: 0 },
             "null" => Fd::Dev(Dev::Null),
@@ -620,11 +710,30 @@ pub fn close_all() {
 }
 
 pub fn pipe2(fds: u64, flags: u64) -> R {
-    let (mut r, mut w) = (0isize, 0isize);
-    if unsafe { crate::win::CreatePipe(&mut r, &mut w, std::ptr::null_mut(), 65536) } == 0 {
+    use crate::win::*;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const PIPE_ACCESS_INBOUND: u32 = 0x1;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const OPEN_EXISTING: u32 = 3;
+    // An anonymous pipe with overlapped ends: a uniquely named pipe, used by name only for this open.
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name: Vec<u16> = format!("\\\\.\\pipe\\lx-{}-{n}", unsafe { GetCurrentProcessId() }).encode_utf16().chain([0]).collect();
+    let r = unsafe {
+        CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            0, 1, 65536, 65536, 0, std::ptr::null_mut()) // PIPE_TYPE_BYTE | PIPE_WAIT, one instance
+    };
+    if r == -1 {
         return Err(EIO);
     }
-    let own = |h: isize| Fd::Handle(unsafe { OwnedHandle::from_raw_handle(h as _) });
+    let w = unsafe { CreateFileW(name.as_ptr(), GENERIC_WRITE, 0, std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0) };
+    if w == -1 {
+        unsafe { CloseHandle(r) };
+        return Err(EIO);
+    }
+    let nonblock = flags & O_NONBLOCK != 0;
+    let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into() }));
     let cloexec = flags & O_CLOEXEC != 0;
     let (a, b) = with(|fs| (fs.add(own(r), 0, cloexec), fs.add(own(w), 0, cloexec)));
     unsafe { *(fds as *mut [i32; 2]) = [a as i32, b as i32] };
@@ -636,6 +745,7 @@ pub fn pipe2(fds: u64, flags: u64) -> R {
 fn handle(fd: &Fd) -> Result<isize, i64> {
     match fd {
         Fd::Handle(h) => Ok(h.as_raw_handle() as isize),
+        Fd::Pipe(p) => Ok(p.raw()),
         Fd::File { f, .. } => Ok(f.as_raw_handle() as isize),
         Fd::Dir { .. } => Err(EISDIR),
         Fd::Dev(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) => Err(EINVAL),
@@ -645,6 +755,7 @@ fn handle(fd: &Fd) -> Result<isize, i64> {
 /// What a read/write/poll on an fd talks to. Taken out of the fd table so blocking I/O runs unlocked.
 enum Io {
     Handle(isize),
+    Pipe(Arc<Pipe>),
     Dev(Dev),
     Sock(Arc<Sock>),
     Event(Arc<EventFd>),
@@ -655,6 +766,7 @@ fn io_target(fd: u64) -> Result<Io, i64> {
         Fd::Dev(d) => Ok(Io::Dev(*d)),
         Fd::Socket(s) => Ok(Io::Sock(s.clone())),
         Fd::Event(e) => Ok(Io::Event(e.clone())),
+        Fd::Pipe(p) => Ok(Io::Pipe(p.clone())),
         other => handle(other).map(Io::Handle),
     })
 }
@@ -662,6 +774,7 @@ fn io_target(fd: u64) -> Result<Io, i64> {
 pub fn read(fd: u64, buf: u64, len: u64) -> R {
     match io_target(fd)? {
         Io::Handle(h) => read_handle(h, buf, len),
+        Io::Pipe(p) => p.io(buf, len, false),
         Io::Sock(s) => s.recv(buf, len, 0),
         Io::Event(e) => e.read(buf, len),
         Io::Dev(Dev::Null) => Ok(0),
@@ -676,6 +789,7 @@ pub fn read(fd: u64, buf: u64, len: u64) -> R {
 pub fn write(fd: u64, buf: u64, len: u64) -> R {
     match io_target(fd)? {
         Io::Handle(h) => write_handle(h, buf, len),
+        Io::Pipe(p) => p.io(buf, len, true),
         Io::Sock(s) => s.send(buf, len, 0),
         Io::Dev(_) => Ok(len as i64), // devices swallow writes
         Io::Event(e) => e.write(buf, len),
@@ -723,6 +837,7 @@ pub fn readiness(fd: i32, events: i16) -> i16 {
         Ok(Io::Dev(_)) => events & (POLLIN | POLLOUT),
         Ok(Io::Sock(s)) => s.ready(events),
         Ok(Io::Event(e)) => e.ready(events),
+        Ok(Io::Pipe(p)) => p.ready(events),
         Ok(Io::Handle(h)) => match unsafe { crate::win::GetFileType(h) } {
             3 => {
                 // FILE_TYPE_PIPE. ponytail: write ends always report POLLOUT.
@@ -763,6 +878,10 @@ pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
         (FIONBIO, _) => Ok(0),
         (FIONREAD, Io::Sock(s)) => {
             unsafe { *(arg as *mut i32) = s.available() as i32 };
+            Ok(0)
+        }
+        (FIONREAD, Io::Pipe(p)) => {
+            unsafe { *(arg as *mut i32) = p.available().unwrap_or(0) as i32 };
             Ok(0)
         }
         (FIONREAD, Io::Handle(h)) => {
@@ -1251,6 +1370,7 @@ pub fn flock(fd: u64, op: u64) -> R {
 fn dup_fd(fd: &Fd) -> Result<Fd, i64> {
     Ok(match fd {
         Fd::Handle(h) => Fd::Handle(h.try_clone().map_err(errno)?),
+        Fd::Pipe(p) => Fd::Pipe(p.clone()),
         Fd::File { f, host } => Fd::File { f: f.try_clone().map_err(errno)?, host: host.clone() },
         Fd::Dir { guest, pos } => Fd::Dir { guest: guest.clone(), pos: *pos },
         Fd::Dev(d) => Fd::Dev(*d),
@@ -1301,10 +1421,12 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         4 => with(|fs| match fs.fd(fd)? {
             Fd::Socket(s) => { s.set_nonblocking(arg & O_NONBLOCK != 0); Ok(0) }
             Fd::Event(e) => { e.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
+            Fd::Pipe(p) => { p.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
             _ => Ok(0),
         }),
         3 => with(|fs| match fs.fd(fd)? {
             Fd::Socket(s) if s.nonblocking() => Ok(2 | O_NONBLOCK as i64),
+            Fd::Pipe(p) if p.nonblocking() => Ok(2 | O_NONBLOCK as i64),
             _ => Ok(2), // O_RDWR
         }),
         _ => Err(EINVAL),
@@ -1324,7 +1446,7 @@ pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
         }
         Fd::Dir { pos, .. } if off == 0 && whence == 0 => { *pos = 0; Ok(0) }
         Fd::Dir { .. } => Err(EINVAL),
-        Fd::Handle(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) => Err(ESPIPE),
+        Fd::Handle(_) | Fd::Pipe(_) | Fd::Socket(_) | Fd::Epoll(_) | Fd::Event(_) => Err(ESPIPE),
         Fd::Dev(_) => Ok(0),
     })
 }
@@ -1376,6 +1498,11 @@ pub fn fstat(fd: u64, buf: u64) -> R {
             Ok(s)
         }
         Fd::Dev(d) => Ok(d.stat()),
+        Fd::Pipe(p) => {
+            let mut s = [0u64; 18];
+            (s[1], s[2], s[3], s[7]) = (p.raw() as u64, 1, 0o010600, 4096); // fifo
+            Ok(s)
+        }
         Fd::Socket(k) => {
             let mut s = [0u64; 18];
             (s[1], s[2], s[3], s[7]) = (k.s as u64, 1, 0o140777, 4096); // S_IFSOCK
@@ -1438,6 +1565,7 @@ fn proc_link(guest: &str) -> Option<String> {
                     Some(format!("/{}", rel.to_string_lossy().replace('\\', "/")))
                 }
                 Fd::Handle(_) => Some("pipe:[0]".into()),
+                Fd::Pipe(p) => Some(format!("pipe:[{}]", p.raw())),
                 Fd::Socket(k) => Some(format!("socket:[{}]", k.s)),
                 Fd::Epoll(_) => Some("anon_inode:[eventpoll]".into()),
                 Fd::Event(_) => Some("anon_inode:[eventfd]".into()),

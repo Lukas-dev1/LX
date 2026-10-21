@@ -106,6 +106,10 @@ pub mod win {
         pub fn MapViewOfFileEx(map: isize, access: u32, hi: u32, lo: u32, len: usize, base: *mut c_void) -> *mut c_void;
         pub fn UnmapViewOfFile(base: *mut c_void) -> i32;
         pub fn FlushViewOfFile(base: *const c_void, len: usize) -> i32;
+        pub fn CreateNamedPipeW(name: *const u16, mode: u32, pipe_mode: u32, instances: u32, out: u32, inp: u32, timeout: u32, attr: *mut c_void) -> isize;
+        pub fn CreateFileW(name: *const u16, access: u32, share: u32, attr: *mut c_void, disposition: u32, flags: u32, template: isize) -> isize;
+        pub fn GetOverlappedResult(h: isize, ov: *mut c_void, done: *mut u32, wait: i32) -> i32;
+        pub fn CancelIoEx(h: isize, ov: *mut c_void) -> i32;
         pub fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
         pub fn CreateFileMappingW(file: isize, attr: *mut c_void, prot: u32, hi: u32, lo: u32, name: *const u16) -> isize;
         pub fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> isize;
