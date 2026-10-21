@@ -244,6 +244,138 @@ fn addr_out(a: &[u8], p: u64, lenp: u64) {
     }
 }
 
+// ---- published ports (`lx run -p`) ----
+//
+// Containers share the host's network stack, so publishing is done by rewriting addresses at the
+// socket calls instead of with a proxy: bind() of a published container port binds the host port,
+// getsockname() reports the container port back, and the container's own connections to that port on
+// loopback are redirected. An `lx run` container's unpublished listeners on "any address" are moved to
+// loopback: reachable from this machine, not from the network, which is the closest we get to Docker's
+// isolation without network namespaces (and keeps Windows Firewall from prompting).
+// ponytail: two containers still can't both listen on the same unpublished port.
+
+struct Publish {
+    udp: bool,
+    container: u16,
+    host: u16,
+    host_ip: Option<[u8; 4]>,
+}
+
+/// `LX_PORTS` (set by `lx run`, inherited by every lx process of the container): "tcp:80:8080:1.2.3.4,..."
+/// Present (even empty) = this is an `lx run` container.
+fn published() -> Option<&'static [Publish]> {
+    static P: std::sync::OnceLock<Option<Vec<Publish>>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let v = std::env::var("LX_PORTS").ok()?;
+        Some(v.split(',').filter(|e| !e.is_empty()).filter_map(|e| {
+            let f: Vec<&str> = e.split(':').collect();
+            let ip = f.get(3).and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()).map(|a| a.octets());
+            Some(Publish { udp: f[0] == "udp", container: f.get(1)?.parse().ok()?, host: f.get(2)?.parse().ok()?, host_ip: ip })
+        }).collect())
+    }).as_deref()
+}
+
+/// `-p [hostip:]hostport:containerport[/udp]` -> an LX_PORTS entry.
+pub fn parse_publish(spec: &str) -> Result<String, String> {
+    let bad = || format!("bad -p {spec:?}: want [hostip:]hostport:containerport[/tcp|/udp]");
+    let (ports, proto) = spec.split_once('/').unwrap_or((spec, "tcp"));
+    if proto != "tcp" && proto != "udp" {
+        return Err(bad());
+    }
+    let f: Vec<&str> = ports.split(':').collect();
+    let (ip, host, cont) = match f.as_slice() {
+        [h, c] => ("", *h, *c),
+        [ip, h, c] if ip.parse::<std::net::Ipv4Addr>().is_ok() => (*ip, *h, *c),
+        _ => return Err(bad()),
+    };
+    let (host, cont): (u16, u16) = (host.parse().map_err(|_| bad())?, cont.parse().map_err(|_| bad())?);
+    if host == 0 || cont == 0 {
+        return Err(bad());
+    }
+    Ok(format!("{proto}:{cont}:{host}:{ip}"))
+}
+
+fn is_udp(s: usize) -> bool {
+    let (mut t, mut len) = (0i32, 4i32);
+    unsafe { getsockopt(s, 0xffff, 0x1008, (&mut t as *mut i32).cast(), &mut len) }; // SO_TYPE
+    t == 2
+}
+
+fn port_of(a: &[u8]) -> u16 {
+    u16::from_be_bytes([a[2], a[3]]) // sin_port / sin6_port, network order, same offset in both
+}
+
+fn set_port(a: &mut [u8], p: u16) {
+    a[2..4].copy_from_slice(&p.to_be_bytes());
+}
+
+fn is_loopback(a: &[u8]) -> bool {
+    match u16::from_le_bytes([a[0], a[1]]) {
+        AF_INET => a[4] == 127,
+        AF_INET6_WIN if a.len() >= 24 => {
+            let ip = &a[8..24];
+            (ip[..15] == [0; 15] && ip[15] == 1) // ::1
+                || (ip[..10] == [0; 10] && ip[10..12] == [0xff, 0xff] && ip[12] == 127) // ::ffff:127.x
+        }
+        _ => false,
+    }
+}
+
+/// bind(): publish, or keep an unpublished any-address listener on loopback.
+fn bind_addr(s: usize, a: &mut [u8]) {
+    let Some(ports) = published() else { return };
+    let port = port_of(a);
+    if port == 0 || a.len() < 8 {
+        return; // ephemeral ports are nobody's business
+    }
+    let fam = u16::from_le_bytes([a[0], a[1]]);
+    let udp = is_udp(s);
+    if let Some(m) = ports.iter().find(|m| m.udp == udp && m.container == port) {
+        set_port(a, m.host);
+        if let Some(ip) = m.host_ip {
+            if fam == AF_INET {
+                a[4..8].copy_from_slice(&ip);
+            } else if fam == AF_INET6_WIN && a.len() >= 24 {
+                // An IPv6 listener published on an IPv4 host address: loopback stays loopback (::1),
+                // anything else becomes the v4-mapped address.
+                let v6 = if ip[0] == 127 { [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] }
+                         else { [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]] };
+                a[8..24].copy_from_slice(&v6);
+            }
+        }
+        return;
+    }
+    if fam == AF_INET && a[4..8] == [0; 4] {
+        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == [0; 16] {
+        a[23] = 1; // ::1
+    }
+}
+
+/// connect()/sendto(): the container reaching its own published port on loopback goes to the host port.
+fn dest_addr(s: usize, a: &mut [u8]) {
+    let Some(ports) = published() else { return };
+    if a.len() < 8 || !is_loopback(a) {
+        return;
+    }
+    let udp = is_udp(s);
+    if let Some(m) = ports.iter().find(|m| m.udp == udp && m.container == port_of(a)) {
+        set_port(a, m.host);
+    }
+}
+
+/// getsockname(): show the container port the program asked for.
+fn local_addr(s: usize, a: &mut [u8]) {
+    let Some(ports) = published() else { return };
+    if a.len() < 8 {
+        return;
+    }
+    let udp = is_udp(s);
+    if let Some(m) = ports.iter().find(|m| m.udp == udp && m.host == port_of(a)) {
+        set_port(a, m.container);
+    }
+}
+
 fn family(domain: u64) -> Result<i32, i64> {
     match domain as u16 {
         AF_INET => Ok(2),
@@ -309,7 +441,8 @@ pub fn sys_socketpair(_domain: u64, ty: u64, _proto: u64, out: u64) -> R {
 
 pub fn sys_bind(fd: u64, addr: u64, len: u64) -> R {
     let s = fs::sock(fd)?;
-    let a = addr_in(addr, len)?;
+    let mut a = addr_in(addr, len)?;
+    bind_addr(s.s, &mut a);
     if unsafe { bind(s.s, a.as_ptr(), a.len() as i32) } != 0 { Err(last_err()) } else { Ok(0) }
 }
 
@@ -339,7 +472,8 @@ fn so_error(s: usize) -> i64 {
 
 pub fn sys_connect(fd: u64, addr: u64, len: u64) -> R {
     let s = fs::sock(fd)?;
-    let a = addr_in(addr, len)?;
+    let mut a = addr_in(addr, len)?;
+    dest_addr(s.s, &mut a);
     if unsafe { connect(s.s, a.as_ptr(), a.len() as i32) } == 0 {
         return Ok(0);
     }
@@ -368,7 +502,8 @@ pub fn sys_sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, alen: u64)
     if addr == 0 {
         return s.send(buf, len, flags);
     }
-    let a = addr_in(addr, alen)?;
+    let mut a = addr_in(addr, alen)?;
+    dest_addr(s.s, &mut a);
     let len = len.min(i32::MAX as u64) as i32;
     s.op(POLLOUT, flags & MSG_DONTWAIT != 0, || {
         let n = unsafe { sendto(s.s, buf as *const u8, len, msg_flags(flags), a.as_ptr(), a.len() as i32) };
@@ -449,6 +584,9 @@ pub fn sys_getsockname(fd: u64, addr: u64, lenp: u64, peer: bool) -> R {
     let r = unsafe { if peer { getpeername(s.s, a.as_mut_ptr(), &mut alen) } else { getsockname(s.s, a.as_mut_ptr(), &mut alen) } };
     if r != 0 {
         return Err(last_err());
+    }
+    if !peer {
+        local_addr(s.s, &mut a[..alen as usize]);
     }
     addr_out(&a[..alen as usize], addr, lenp);
     Ok(0)
@@ -647,4 +785,15 @@ pub fn dns_files() -> (String, String) {
 #[link(name = "iphlpapi")]
 unsafe extern "system" {
     fn GetNetworkParams(info: *mut u8, len: *mut u32) -> u32;
+}
+
+#[test]
+fn publish_specs_and_loopback() {
+    assert_eq!(parse_publish("8080:80").unwrap(), "tcp:80:8080:");
+    assert_eq!(parse_publish("127.0.0.1:8080:80/udp").unwrap(), "udp:80:8080:127.0.0.1");
+    assert!(parse_publish("80").is_err() && parse_publish("x:80").is_err() && parse_publish("8080:80/sctp").is_err());
+    let v4 = |ip: [u8; 4]| { let mut a = vec![0u8; 16]; a[0] = 2; a[4..8].copy_from_slice(&ip); a };
+    let v6 = |last: u8| { let mut a = vec![0u8; 28]; a[0] = 23; a[23] = last; a };
+    assert!(is_loopback(&v4([127, 0, 0, 1])) && !is_loopback(&v4([10, 0, 0, 1])));
+    assert!(is_loopback(&v6(1)) && !is_loopback(&v6(2)));
 }
