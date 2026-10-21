@@ -162,13 +162,20 @@ pub fn build_stack(img: &Image, interp_base: u64, argv: &[&str], envp: &[&str]) 
     };
     let cstr = |s: &str| [s.as_bytes(), b"\0"].concat();
 
+    // Linux's layout, from the top down: an 8-byte zero end marker, the file name, the env strings, the
+    // argv strings (argv then env ascending and contiguous: setproctitle in nginx/postgres reuses that
+    // space), then platform and random bytes. Code scanning a string near the top stops at a zero; with the
+    // random bytes on top, npm's musl ran off the end of the stack.
+    push(&[0u8; 8]);
+    let execfn = push(&cstr(argv[0]));
+    let mut envp_p: Vec<u64> = envp.iter().rev().map(|e| push(&cstr(e))).collect();
+    envp_p.reverse();
+    let mut argv_p: Vec<u64> = argv.iter().rev().map(|a| push(&cstr(a))).collect();
+    argv_p.reverse();
+    let platform = push(b"x86_64\0");
     let mut random = [0u8; 16];
     unsafe { BCryptGenRandom(ptr::null_mut(), random.as_mut_ptr(), 16, 2) }; // SYSTEM_PREFERRED_RNG
     let at_random = push(&random);
-    let platform = push(b"x86_64\0");
-    let execfn = push(&cstr(argv[0]));
-    let argv_p: Vec<u64> = argv.iter().map(|a| push(&cstr(a))).collect();
-    let envp_p: Vec<u64> = envp.iter().map(|e| push(&cstr(e))).collect();
 
     let mut w = vec![argv.len() as u64];
     w.extend(&argv_p);
