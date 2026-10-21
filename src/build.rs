@@ -1,12 +1,14 @@
-//! `lx build -t name[:tag] [-f Dockerfile] <context>`: an image from a Dockerfile, like `docker build`.
+//! `lx build -t name[:tag] [-f Dockerfile] [--build-arg K=V] <context>`: an image from a Dockerfile, like
+//! `docker build`. Each FROM starts a stage (FROM image AS name); COPY --from takes files from an earlier
+//! stage or an image; the last stage is the image.
 //!
 //! The new image starts as a hard-link copy of its FROM image (instant, no admin rights needed; the links
 //! share the :lx mode stream too). Each RUN is an `lx run` of the image so far with a writable layer that's
 //! kept: its changes are then moved into the image (whiteouts delete, everything else replaces), so a file
 //! the base image still links to is never written in place. COPY/ADD copy from the context; ENV, WORKDIR,
 //! USER, CMD, ENTRYPOINT, SHELL and ARG update the config. The result sits where `lx run name:tag` looks.
-//! ponytail: one stage (no `FROM ... AS` + `COPY --from`), no build cache, ADD doesn't fetch URLs or
-//! unpack archives, and .dockerignore isn't read.
+//! ponytail: no build cache (every build starts over), ADD doesn't fetch URLs or unpack archives,
+//! .dockerignore isn't read, and ARG scope isn't per stage.
 
 use crate::fs::{enc, get_meta, set_meta, OPAQUE, WHITEOUT};
 use crate::image::Ref;
@@ -21,35 +23,57 @@ pub fn build(tag: &str, context: &Path, dockerfile: &Path, build_args: Vec<(Stri
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let work = target.with_file_name(format!(".build-{nanos}"));
     let r = run_steps(&text, context, &work, build_args.into_iter().collect());
-    if r.is_ok() {
+    let r = r.and_then(|last| {
         let _ = std::fs::remove_dir_all(&target);
-        std::fs::rename(&work, &target).map_err(|e| format!("{}: {e}", target.display()))?;
+        std::fs::rename(&last, &target).map_err(|e| format!("{}: {e}", target.display()))
+    });
+    let _ = std::fs::remove_dir_all(&work); // the other stages
+    if r.is_ok() {
         eprintln!("[lx] built {tag}");
-    } else {
-        let _ = std::fs::remove_dir_all(&work);
     }
     r
 }
 
-fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, String>) -> Result<(), String> {
-    let root = work.join("rootfs");
+/// The image directory (config.json + rootfs) a FROM or COPY --from names: an earlier stage (by
+/// `AS` name or number) or an image, pulled if missing.
+fn source(name: &str, stages: &[(Option<String>, PathBuf)]) -> Result<PathBuf, String> {
+    let by_name = stages.iter().find(|(n, _)| n.as_deref() == Some(name));
+    let by_index = name.parse::<usize>().ok().and_then(|i| stages.get(i));
+    if let Some((_, dir)) = by_name.or(by_index) {
+        return Ok(dir.clone());
+    }
+    let r = Ref::parse(name);
+    if r.dir().join("config.json").exists() { Ok(r.dir()) } else { crate::image::pull(&r) }
+}
+
+/// Runs the Dockerfile; returns the last stage's directory (the image).
+fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, String>) -> Result<PathBuf, String> {
+    let mut stages: Vec<(Option<String>, PathBuf)> = Vec::new();
+    let mut cur = work.to_path_buf(); // this stage's directory
+    let mut root = cur.join("rootfs");
     let mut config = json!({});
     let mut shell = vec!["/bin/sh".to_string(), "-c".to_string()];
-    let mut from = false;
     for (n, (op, rest)) in instructions(text).into_iter().enumerate() {
         eprintln!("[lx] step {}: {op} {rest}", n + 1);
         let env = env_map(&config);
         // Like Docker: commands are left to the shell (which sees ENV and ARG in its environment).
         let rest = if matches!(op.as_str(), "RUN" | "CMD" | "ENTRYPOINT") { rest } else { expand(&rest, &args, &env) };
         match op.as_str() {
-            "FROM" if from => return Err("multi-stage builds (a second FROM) aren't supported yet".into()),
             "FROM" => {
-                from = true;
-                let image = rest.split_whitespace().next().unwrap_or_default();
+                // FROM image [AS name]: a new stage, from an image or an earlier stage.
+                if !stages.is_empty() {
+                    std::fs::write(cur.join("config.json"), config.to_string()).map_err(|e| e.to_string())?;
+                }
+                let words: Vec<&str> = rest.split_whitespace().collect();
+                let image = words.first().copied().unwrap_or_default();
+                let name = (words.len() == 3 && words[1].eq_ignore_ascii_case("as")).then(|| words[2].to_string());
+                cur = work.join(format!("stage{}", stages.len()));
+                root = cur.join("rootfs");
                 std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+                config = json!({});
+                shell = vec!["/bin/sh".to_string(), "-c".to_string()];
                 if image != "scratch" {
-                    let r = Ref::parse(image);
-                    let base = if r.dir().join("config.json").exists() { r.dir() } else { crate::image::pull(&r)? };
+                    let base = source(image, &stages)?;
                     link_tree(&base.join("rootfs"), &root).map_err(|e| format!("copying {image}: {e}"))?;
                     let raw = std::fs::read(base.join("config.json")).map_err(|e| e.to_string())?;
                     config = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
@@ -57,8 +81,9 @@ fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, 
                 if config["config"].is_null() {
                     config["config"] = json!({});
                 }
+                stages.push((name, cur.clone()));
             }
-            _ if !from && op != "ARG" => return Err(format!("{op} before FROM")),
+            _ if stages.is_empty() && op != "ARG" => return Err(format!("{op} before FROM")),
             "ARG" => {
                 let (k, v) = rest.split_once('=').map_or((rest.as_str(), None), |(k, v)| (k, Some(unquote(v))));
                 if let Some(v) = v {
@@ -94,16 +119,17 @@ fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, 
                     config["config"]["Labels"][k] = json!(v);
                 }
             }
-            "COPY" | "ADD" => copy(&rest, context, &root, &config)?,
-            "RUN" => run(&rest, &shell, work, &config, &args)?,
+            "COPY" | "ADD" => copy(&rest, context, &root, &config, &stages)?,
+            "RUN" => run(&rest, &shell, &cur, &config, &args)?,
             "VOLUME" | "STOPSIGNAL" | "HEALTHCHECK" | "MAINTAINER" | "ONBUILD" => {} // nothing lx acts on yet
             _ => return Err(format!("unknown instruction {op}")),
         }
     }
-    if !from {
+    if stages.is_empty() {
         return Err("no FROM".into());
     }
-    std::fs::write(work.join("config.json"), config.to_string()).map_err(|e| e.to_string())
+    std::fs::write(cur.join("config.json"), config.to_string()).map_err(|e| e.to_string())?;
+    Ok(cur)
 }
 
 /// (INSTRUCTION, arguments): comments and blank lines dropped, `\` continuations joined.
@@ -309,21 +335,22 @@ fn make_dirs(root: &Path, guest: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// COPY/ADD [--chown=u[:g]] <src>... <dest>: from the build context, relative to WORKDIR.
-fn copy(rest: &str, context: &Path, root: &Path, config: &Value) -> Result<(), String> {
+/// COPY/ADD [--chown=u[:g]] [--from=stage|image] <src>... <dest>: from the build context (or, with
+/// --from, absolute paths in an earlier stage or an image), relative to WORKDIR.
+fn copy(rest: &str, context: &Path, root: &Path, config: &Value, stages: &[(Option<String>, PathBuf)]) -> Result<(), String> {
     let mut words: Vec<String> = if rest.starts_with('[') {
         serde_json::from_str(rest).map_err(|_| "bad COPY array")?
     } else {
         rest.split_whitespace().map(String::from).collect()
     };
-    let mut owner = (0, 0);
+    let (mut owner, mut from_root) = (None, None);
     while words.first().is_some_and(|w| w.starts_with("--")) {
         let flag = words.remove(0);
         if let Some(spec) = flag.strip_prefix("--chown=") {
             let (u, g, _) = crate::image::resolve_user(root, spec)?;
-            owner = (u, g);
-        } else if flag.starts_with("--from") {
-            return Err("COPY --from (multi-stage) isn't supported yet".into());
+            owner = Some((u, g));
+        } else if let Some(name) = flag.strip_prefix("--from=") {
+            from_root = Some(source(name, stages)?.join("rootfs"));
         }
     }
     let dest = words.pop().ok_or("COPY needs a destination")?;
@@ -331,33 +358,50 @@ fn copy(rest: &str, context: &Path, root: &Path, config: &Value) -> Result<(), S
     let dest = if dest.starts_with('/') { dest } else { format!("{}/{dest}", cwd.trim_end_matches('/')) };
     let into_dir = dest.ends_with('/') || words.len() > 1;
     for src in &words {
-        let from = context.join(src);
-        let from = std::fs::canonicalize(&from).map_err(|e| format!("COPY {src}: {e}"))?;
-        let ctx = std::fs::canonicalize(context).map_err(|e| e.to_string())?;
-        if !from.starts_with(&ctx) {
-            return Err(format!("COPY {src}: outside the build context"));
+        let from = match &from_root {
+            Some(r) => host_path(r, src), // ponytail: symlinks on the way aren't followed
+            None => {
+                let from = std::fs::canonicalize(context.join(src)).map_err(|e| format!("COPY {src}: {e}"))?;
+                let ctx = std::fs::canonicalize(context).map_err(|e| e.to_string())?;
+                if !from.starts_with(&ctx) {
+                    return Err(format!("COPY {src}: outside the build context"));
+                }
+                from
+            }
+        };
+        if !from.exists() {
+            return Err(format!("COPY {src}: not found"));
         }
         let to_guest = if from.is_dir() || !(into_dir || host_path(root, &dest).is_dir()) {
             dest.clone()
         } else {
-            format!("{}/{}", dest.trim_end_matches('/'), from.file_name().unwrap_or_default().to_string_lossy())
+            let name = src.trim_end_matches('/').rsplit('/').next().unwrap_or(src);
+            format!("{}/{name}", dest.trim_end_matches('/'))
         };
         let parent = to_guest.rsplit_once('/').map_or("/", |(p, _)| if p.is_empty() { "/" } else { p });
         make_dirs(root, parent)?;
-        copy_in(&from, &host_path(root, &to_guest), owner).map_err(|e| format!("COPY {src}: {e}"))?;
+        copy_in(&from, &host_path(root, &to_guest), owner, from_root.is_some()).map_err(|e| format!("COPY {src}: {e}"))?;
     }
     Ok(())
 }
 
-/// Copy a host file or tree into the image: files 0644 (0755 if it starts like a script or an ELF),
-/// directories 0755, owned by `owner`. Existing files are replaced, not written through (hard links).
-fn copy_in(from: &Path, to: &Path, owner: (u32, u32)) -> std::io::Result<()> {
+/// Copy a file or tree into the image, replacing (never writing through: hard links) what's there.
+/// From the context: files 0644 (0755 if it starts like a script or an ELF), directories 0755, root's
+/// unless `owner`. From an image (`imaged`): names are already host-encoded, modes and owners kept.
+fn copy_in(from: &Path, to: &Path, owner: Option<(u32, u32)>, imaged: bool) -> std::io::Result<()> {
+    let meta = |default: u32| {
+        let kept = if imaged { get_meta(from) } else { None };
+        let [mode, uid, gid] = kept.unwrap_or([default, 0, 0]);
+        let (uid, gid) = owner.unwrap_or((uid, gid));
+        [mode, uid, gid]
+    };
     if from.is_dir() {
         std::fs::create_dir_all(to)?;
-        set_meta(to, [0o755, owner.0, owner.1])?;
+        set_meta(to, meta(0o755))?;
         for e in std::fs::read_dir(from)? {
             let e = e?;
-            copy_in(&e.path(), &to.join(enc(&e.file_name().to_string_lossy())), owner)?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            copy_in(&e.path(), &to.join(if imaged { name } else { enc(&name) }), owner, imaged)?;
         }
         return Ok(());
     }
@@ -366,5 +410,5 @@ fn copy_in(from: &Path, to: &Path, owner: (u32, u32)) -> std::io::Result<()> {
     let mut head = [0u8; 4];
     let n = std::io::Read::read(&mut std::fs::File::open(from)?, &mut head)?;
     let exec = head[..n].starts_with(b"#!") || head[..n].starts_with(b"\x7fELF");
-    set_meta(to, [if exec { 0o755 } else { 0o644 }, owner.0, owner.1])
+    set_meta(to, meta(if exec { 0o755 } else { 0o644 }))
 }

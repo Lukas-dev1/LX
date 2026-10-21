@@ -1,0 +1,6 @@
+# lx build in the suite, two stages: COPY --from takes a file from the first, with its mode.
+FROM alpine:latest AS make
+RUN mkdir /out && echo "made in stage make" > /out/note && chmod 600 /out/note
+FROM alpine:latest
+COPY --from=make /out/note /note
+CMD ["sh", "-c", "echo \"$(cat /note), mode $(stat -c %a /note)\""]

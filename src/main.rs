@@ -253,7 +253,7 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
                                              -u user[:group] runs as that user (default: the image's USER)
        lx run -d ...                         the same in the background: prints the container's pid
        lx build -t name[:tag] [-f Dockerfile] <dir>
-                                             builds an image from a Dockerfile (one stage)
+                                             builds an image from a Dockerfile
        lx logs <pid>                         output of a `lx run -d` container
        lx exec [-e ..] [-w dir] [-u user] <pid> <command> [args...]
                                              runs a command inside a running container
