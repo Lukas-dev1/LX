@@ -931,9 +931,12 @@ pub fn openat(dirfd: u64, path: u64, flags: u64) -> R {
 /// close_range(first, last, flags): close every fd in the range, or with CLOSE_RANGE_CLOEXEC just mark them.
 pub fn close_range(first: u64, last: u64, flags: u64) -> R {
     const CLOSE_RANGE_CLOEXEC: u64 = 4;
+    if first > last {
+        return Err(EINVAL); // an empty range is an error, not "close `first`" (Python passes these)
+    }
     with(|fs| {
-        let end = (last.min(fs.fds.len() as u64 - 1) as usize).max(first as usize);
-        for i in first as usize..=end.min(fs.fds.len().saturating_sub(1)) {
+        let Some(top) = fs.fds.len().checked_sub(1) else { return Ok(0) };
+        for i in first as usize..=last.min(top as u64) as usize { // empty when first is past the last fd
             if flags & CLOSE_RANGE_CLOEXEC != 0 {
                 if let Some(s) = fs.fds[i].as_mut() {
                     s.cloexec = true;
