@@ -43,14 +43,30 @@ struct Action {
 }
 const DFL: Action = Action { handler: 0, flags: 0, restorer: 0, mask: 0 };
 
+/// Dispositions and pending signals are the process's; the blocked mask is each thread's own
+/// (`ThreadState::sigmask`), so one thread's handler or sigprocmask never changes another's.
+/// ponytail: pending is process-wide (no per-thread pending for tkill or faults): the first thread
+/// with the signal unblocked takes it.
 struct State {
     actions: [Action; 65],
-    blocked: u64,
     pending: u64,
-    /// While in sigsuspend: the mask to restore once the handler returns.
-    suspended_mask: Option<u64>,
 }
-static S: Mutex<State> = Mutex::new(State { actions: [DFL; 65], blocked: 0, pending: 0, suspended_mask: None });
+static S: Mutex<State> = Mutex::new(State { actions: [DFL; 65], pending: 0 });
+
+/// The main guest thread's mask, for the watcher thread's "is a fatal signal blocked?" check.
+static MAIN_MASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn mask() -> u64 {
+    crate::syscall::ts().sigmask
+}
+
+fn set_mask(v: u64) {
+    let v = v & !UNBLOCKABLE;
+    crate::syscall::ts().sigmask = v;
+    if unsafe { crate::win::GetCurrentThreadId() } == crate::thread::MAIN_TID.load(std::sync::atomic::Ordering::Relaxed) {
+        MAIN_MASK.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 fn bit(sig: u64) -> u64 {
     1 << (sig - 1)
@@ -77,18 +93,18 @@ pub fn sigaction(sig: u64, act: u64, old: u64) -> R {
 }
 
 pub fn sigprocmask(how: u64, set: u64, old: u64) -> R {
-    let mut s = S.lock().unwrap();
+    let m = mask();
     if old != 0 {
-        unsafe { *(old as *mut u64) = s.blocked };
+        unsafe { *(old as *mut u64) = m };
     }
     if set != 0 {
         let v = unsafe { *(set as *const u64) };
-        s.blocked = match how {
-            0 => s.blocked | v,  // SIG_BLOCK
-            1 => s.blocked & !v, // SIG_UNBLOCK
-            2 => v,              // SIG_SETMASK
+        set_mask(match how {
+            0 => m | v,  // SIG_BLOCK
+            1 => m & !v, // SIG_UNBLOCK
+            2 => v,      // SIG_SETMASK
             _ => return Err(EINVAL),
-        } & !UNBLOCKABLE;
+        });
     }
     Ok(0)
 }
@@ -102,8 +118,7 @@ pub fn raise(sig: u64) -> R {
 }
 
 pub fn deliverable() -> bool {
-    let s = S.lock().unwrap();
-    s.pending & !s.blocked != 0
+    S.lock().unwrap().pending & !mask() != 0
 }
 
 // ---- signals from other processes (kill, lx kill/stop) and from the console (Ctrl-C) ----
@@ -200,7 +215,8 @@ fn arrive(sig: u64) {
     // Default action "terminate" needs no guest cooperation: do it now, even if the guest is spinning.
     let fatal = {
         let s = S.lock().unwrap();
-        s.pending & !s.blocked & bit(sig) != 0 && s.actions[sig as usize].handler == 0 && !default_ignores(sig)
+        let blocked = MAIN_MASK.load(std::sync::atomic::Ordering::Relaxed);
+        s.pending & !blocked & bit(sig) != 0 && s.actions[sig as usize].handler == 0 && !default_ignores(sig)
     };
     if fatal {
         proc::exit(128 + sig);
@@ -288,12 +304,9 @@ pub fn parse(name: &str) -> Option<u64> {
 /// rt_sigsuspend (mask_ptr != 0) and pause (mask_ptr == 0): swap in the mask, sleep until a signal
 /// can be delivered, return EINTR. The handler then runs on the way out of the syscall.
 pub fn sigsuspend(mask_ptr: u64) -> R {
-    {
-        let mut s = S.lock().unwrap();
-        s.suspended_mask = Some(s.blocked);
-        if mask_ptr != 0 {
-            s.blocked = unsafe { *(mask_ptr as *const u64) } & !UNBLOCKABLE;
-        }
+    crate::syscall::ts().suspended_mask = Some(mask());
+    if mask_ptr != 0 {
+        set_mask(unsafe { *(mask_ptr as *const u64) });
     }
     while !deliverable() {
         proc::wait_for_child_exit(); // returns on a child exit (raising SIGCHLD) or a signal from outside
@@ -327,7 +340,7 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
     proc::notice_child_exits();
     let mut s = S.lock().unwrap();
     loop {
-        let ready = s.pending & !s.blocked;
+        let ready = s.pending & !mask();
         if ready == 0 {
             return None;
         }
@@ -351,26 +364,21 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
 
 /// A fault in guest code (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP) with `si_code` and `si_addr`: the frame
 /// for the guest's handler, which may fix the cause or move `rip` in the ucontext (HotSpot's implicit null
-/// checks and safepoint polls). None when there's no handler or it's ignored: the guest dies.
-/// ponytail: the mask is process-wide, so while one thread runs its SIGSEGV handler the signal reads as
-/// blocked for all (HotSpot died in 1 of 10 runs): a fault ignores the mask and leaves it as it was.
-/// Per-thread masks would make this exact.
+/// checks and safepoint polls). None when there's no handler, it's ignored, or this thread has it
+/// blocked (a fault inside its own handler): the guest dies, like Linux.
 pub fn fault(c: &mut Context, sig: u64, code: u64, addr: u64) -> Option<Vec<u8>> {
     let mut s = S.lock().unwrap();
     let a = s.actions[sig as usize];
-    if a.handler <= 1 {
+    if a.handler <= 1 || mask() & bit(sig) != 0 {
         return None;
     }
-    let (blocked, suspended) = (s.blocked, s.suspended_mask.take()); // another thread may be in sigsuspend
-    let f = frame(&mut s, c, sig, a, code, addr);
-    (s.blocked, s.suspended_mask) = (blocked, suspended);
-    Some(f)
+    Some(frame(&mut s, c, sig, a, code, addr))
 }
 
 /// Point `c` at the handler for `sig` and build its signal frame (see `deliver`).
 fn frame(s: &mut State, c: &mut Context, sig: u64, a: Action, code: u64, addr: u64) -> Vec<u8> {
     let handler = a.handler;
-    let restore_mask = s.suspended_mask.take().unwrap_or(s.blocked);
+    let restore_mask = crate::syscall::ts().suspended_mask.take().unwrap_or(mask());
     // Below the red zone: [return address = restorer][ucontext][siginfo].
     // SA_ONSTACK handlers start at the top of the thread's alternate stack, unless already on it.
     let t = crate::syscall::ts();
@@ -407,7 +415,7 @@ fn frame(s: &mut State, c: &mut Context, sig: u64, a: Action, code: u64, addr: u
         crate::syscall::dlog(format_args!("signal {sig}: handler {handler:#x}, frame {sp:#x}, interrupted rip {:#x} rsp {:#x}, alt {:?}", c.rip, c.rsp, alt));
     }
     (c.rsp, c.rip, c.rdi, c.rsi, c.rdx) = (sp, handler, sig, info, uc);
-    s.blocked |= (a.mask | if a.flags & SA_NODEFER == 0 { bit(sig) } else { 0 }) & !UNBLOCKABLE;
+    set_mask(mask() | a.mask | if a.flags & SA_NODEFER == 0 { bit(sig) } else { 0 });
     if a.flags & SA_RESETHAND != 0 {
         s.actions[sig as usize] = DFL;
     }
@@ -426,13 +434,13 @@ pub fn sigreturn(c: &mut Context) {
     if crate::syscall::siglog() {
         crate::syscall::dlog(format_args!("sigreturn to rip {:#x} rsp {:#x}", c.rip, c.rsp));
     }
-    S.lock().unwrap().blocked = unsafe { *((uc + UC_SIGMASK) as *const u64) } & !UNBLOCKABLE;
+    set_mask(unsafe { *((uc + UC_SIGMASK) as *const u64) });
 }
 
 /// Dispositions and mask survive fork. (Fields: blocked, then 64 x [handler, flags, restorer, mask].)
 pub fn snapshot() -> Vec<String> {
     let s = S.lock().unwrap();
-    let mut v = vec![s.blocked];
+    let mut v = vec![mask()]; // the forking thread's mask becomes the child's
     for a in &s.actions[1..] {
         v.extend([a.handler, a.flags, a.restorer, a.mask]);
     }
@@ -444,7 +452,7 @@ pub fn restore(f: &[String]) -> Result<&[String], String> {
     let nums: Vec<u64> = f.get(..N).ok_or("malformed signal state")?.iter()
         .map(|x| x.parse().map_err(|_| "malformed signal state".to_string())).collect::<Result<_, _>>()?;
     let mut s = S.lock().unwrap();
-    s.blocked = nums[0];
+    set_mask(nums[0]);
     for (i, a) in nums[1..].chunks(4).enumerate() {
         s.actions[i + 1] = Action { handler: a[0], flags: a[1], restorer: a[2], mask: a[3] };
     }

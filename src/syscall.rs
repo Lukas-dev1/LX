@@ -66,6 +66,9 @@ pub struct ThreadState {
     pub clear_tid: u64,
     /// sigaltstack: (base, size), or None when disabled.
     pub altstack: Option<(u64, u64)>,
+    /// This thread's blocked signals, and the one to restore after rt_sigsuspend's handler.
+    pub sigmask: u64,
+    pub suspended_mask: Option<u64>,
     /// Whether we're running on host_stack right now.
     on_host: bool,
     /// The TEB's own stack fields (StackBase, StackLimit, DeallocationStack) before the guest took over.
@@ -103,7 +106,8 @@ pub fn ts() -> &'static mut ThreadState {
     assert!(host != 0, "no memory for a thread's lx stack");
     let st = Box::leak(Box::new(ThreadState {
         fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host + HOST_STACK as u64,
-        frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, on_host: false, host_teb: None,
+        frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None,
+        on_host: false, host_teb: None,
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
     st
