@@ -469,7 +469,7 @@ impl Fs {
             // Directories made here stand for the image's: give them its modes and owners.
             let (mut u, mut l) = (up.clone(), self.root.clone());
             for name in &comps[..comps.len().saturating_sub(1)] {
-                (u.push(name), l.push(name));
+                (u.push(enc(name)), l.push(enc(name)));
                 if get_meta(&u).is_none() && let Some(m) = get_meta(&l) {
                     let _ = set_meta(&u, m);
                 }
