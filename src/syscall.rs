@@ -1223,6 +1223,11 @@ fn unmap_views(addr: u64, len: u64) -> bool {
     views.len() != before
 }
 
+/// Is `addr` inside a MAP_SHARED view (memory other processes may also see)?
+pub fn in_shared_view(addr: u64) -> bool {
+    VIEWS.lock().unwrap().iter().any(|v| (v.base..v.base + v.len).contains(&addr))
+}
+
 fn msync(addr: u64, len: u64) -> R {
     unsafe { FlushViewOfFile(addr as *const _, len as usize) };
     Ok(0)

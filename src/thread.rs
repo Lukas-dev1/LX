@@ -148,6 +148,23 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
                 }
                 want.as_millis().min(u32::MAX as u128 - 1) as u32
             };
+            if syscall::in_shared_view(uaddr) {
+                // In MAP_SHARED memory the waker may be another process, and WaitOnAddress only hears wakes
+                // from this one: wait in 1 ms slices and re-check the value (same-process wakes stay instant).
+                let start = std::time::Instant::now();
+                loop {
+                    unsafe { WaitOnAddress(uaddr as *const _, &expect as *const u32 as *const _, 4, 1) };
+                    if cur() != expect {
+                        return Ok(0);
+                    }
+                    if ms != u32::MAX && start.elapsed().as_millis() >= ms as u128 {
+                        return Err(ETIMEDOUT);
+                    }
+                    if crate::signal::deliverable() {
+                        return Err(crate::syscall::EINTR);
+                    }
+                }
+            }
             let woke = unsafe { WaitOnAddress(uaddr as *const _, &expect as *const u32 as *const _, 4, ms) };
             if woke == 0 && unsafe { GetLastError() } == 1460 { Err(ETIMEDOUT) } else { Ok(0) } // ERROR_TIMEOUT
         }
