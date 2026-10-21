@@ -846,19 +846,36 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
     }).collect::<Result<Vec<_>, _>>()?;
     let mut fds: Vec<Option<Slot>> = Vec::new();
     let mut rest = rest;
+    // dup'd fds arrive with the same handle: they must share it again, or closing one closes the
+    // handle under the others (erl_child_setup closes its pair end's dup, killing the connection).
+    // Pipes and sockets share their Arc; files and plain handles get a duplicate handle each.
+    let mut pipes: std::collections::HashMap<usize, Arc<Pipe>> = Default::default();
+    let mut socks: std::collections::HashMap<usize, Arc<Sock>> = Default::default();
+    let mut seen = std::collections::HashSet::new();
+    let own = |h: usize, seen: &mut std::collections::HashSet<usize>| -> usize {
+        if seen.insert(h) {
+            return h;
+        }
+        use crate::win::*;
+        let mut d = 0isize;
+        unsafe { DuplicateHandle(GetCurrentProcess(), h as isize, GetCurrentProcess(), &mut d, 0, 0, 2) }; // SAME_ACCESS
+        d as usize
+    };
     for _ in 0..n.parse::<usize>().map_err(|_| bad())? {
         let [fd, kind, h, path, cloexec, more @ ..] = rest else { return Err(bad()) };
         let fd: usize = fd.parse().map_err(|_| bad())?;
         let h: usize = h.parse().map_err(|_| bad())?;
         let fd_ = match kind.as_str() {
-            "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(h as _) }),
-            "p" => Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (path == "1").into() })),
-            "f" => Fd::File { f: unsafe { File::from_raw_handle(h as _) }, host: PathBuf::from(path) },
+            "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(own(h, &mut seen) as _) }),
+            "p" => Fd::Pipe(pipes.entry(h).or_insert_with(|| {
+                Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (path == "1").into() })
+            }).clone()),
+            "f" => Fd::File { f: unsafe { File::from_raw_handle(own(h, &mut seen) as _) }, host: PathBuf::from(path) },
             "d" => Fd::Dir { guest: path.clone(), pos: 0 },
             "null" => Fd::Dev(Dev::Null),
             "zero" => Fd::Dev(Dev::Zero),
             "random" => Fd::Dev(Dev::Random),
-            "s" => Fd::Socket(Arc::new(Sock::inherited(h, path))),
+            "s" => Fd::Socket(socks.entry(h).or_insert_with(|| Arc::new(Sock::inherited(h, path))).clone()),
             _ => return Err(bad()),
         };
         while fds.len() <= fd {
