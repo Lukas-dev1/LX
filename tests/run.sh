@@ -218,6 +218,22 @@ stop_test handler 7 "got TERM"
 stop_test busy 143
 stop_test exec 143
 
+# lx exec: a command in a running container sees its files, env and directory (here as another user),
+# and an exec'd process ends with the container.
+tag=exectest-$$
+$LX run -e GREETING=hi -w /tmp alpine sh -c "echo inside > /tmp/marker; sleep 60 # $tag" < /dev/null > /dev/null 2>&1 &
+job=$!
+for _ in $(seq 100); do cpid=$($LX ps | awk -v t="$tag" 'index($0, t) {print $1; exit}'); [ -n "$cpid" ] && break; sleep 0.1; done
+sleep 1
+out=$($LX exec -u nobody "$cpid" sh -c 'echo "$(cat /tmp/marker) $GREETING $(pwd) $(id -u)"' 2>&1)
+$LX exec "$cpid" sleep 60 < /dev/null > /dev/null 2>&1 &
+ejob=$!
+sleep 1
+$LX stop "$cpid" > /dev/null
+wait $job
+start=$(date +%s); wait $ejob; took=$(( $(date +%s) - start ))
+if [ "$out" = "inside hi /tmp 65534" ] && [ $took -lt 10 ]; then ok "lx exec into a running container"; else bad "lx exec: got '$out', exec'd process outlived the container by ${took}s"; fi
+
 # Only this checkout's lx.exe (every lx of a container runs it): another worktree's containers may run.
 exe=$(cygpath -w "$ROOT/target/release/lx.exe")
 left=$(powershell -NoProfile -Command "@(Get-CimInstance Win32_Process -Filter \"Name='lx.exe'\" | Where-Object ExecutablePath -eq '$exe').Count" | tr -d '\r')

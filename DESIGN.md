@@ -93,7 +93,7 @@ Anything unimplemented logs its number and returns `-ENOSYS`, so the trace from 
 ## 7. Isolation and safety model (be honest about it)
 
 The translation layer is **not** a security boundary. Guest code runs natively in our process: it could find `ntdll` and make raw NT calls, or JIT unpatched `syscall`s. The real boundary has to come from the OS:
-- **Job object** (done): 512 MiB memory cap, and kill-on-close takes down the whole process tree.
+- **Job object** (done): one per container (`Local\lx-job-<pid>`), made by its first lx process; every later one (fork, exec, `lx exec`) runs inside it. It caps each process's memory (`-m`, default the machine's RAM) and kill-on-close takes the whole container down when PID 1 exits. `lx exec <pid> cmd` joins it, and steps into the container's image, layer, volumes, env, workdir and user from `rootfs/containers/<pid>.json`.
 - **AppContainer or restricted token** (next): no access to user files outside the granted rootfs directory, and no network unless granted. This is what makes "confine file access to the rootfs" hold even against a hostile image.
 - Windows Server Silos are the real container primitive, but they need Server SKUs and admin. They're out of reach on Windows 11 Home, and the project doesn't depend on them.
 

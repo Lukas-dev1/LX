@@ -90,6 +90,7 @@ pub mod win {
         pub fn GetLastError() -> u32;
         pub fn ExitProcess(code: u32) -> !;
         pub fn CreateJobObjectW(attr: *mut c_void, name: *const u16) -> isize;
+        pub fn OpenJobObjectW(access: u32, inherit: i32, name: *const u16) -> isize;
         pub fn SetInformationJobObject(job: isize, class: u32, info: *const c_void, len: u32) -> i32;
         pub fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
         pub fn GetCurrentProcess() -> isize;
@@ -209,6 +210,10 @@ fn parse_memory(v: &str) -> Result<String, String> {
     Ok((n * mult).to_string())
 }
 
+fn job_name(pid: u32) -> Vec<u16> {
+    format!("Local\\lx-job-{pid}").encode_utf16().chain([0]).collect()
+}
+
 /// The container's job: the first lx process of a container makes it, every later one (fork, exec)
 /// starts inside it and stays there. It caps each process's memory and dies with that first process,
 /// taking the whole container along, like PID 1. Only one per container: a job per lx process killed
@@ -226,8 +231,9 @@ fn enter_job() -> Result<(), String> {
         ..Default::default()
     };
     unsafe {
-        // The handle is deliberately leaked: it closes at process exit, which kills the job.
-        let job = win::CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        // The handle is deliberately leaked: it closes at process exit, which kills the job. Named so
+        // `lx exec` can put its process in it too.
+        let job = win::CreateJobObjectW(std::ptr::null_mut(), job_name(win::GetCurrentProcessId()).as_ptr());
         let ok = job != 0
             && win::SetInformationJobObject(job, 9, &limits as *const _ as *const c_void, 144) != 0
             && win::AssignProcessToJobObject(job, win::GetCurrentProcess()) != 0;
@@ -244,6 +250,8 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
                                              -e NAME=value (or -e NAME: the host's) sets an env var
                                              -w /dir sets the working directory
                                              -u user[:group] runs as that user (default: the image's USER)
+       lx exec [-e ..] [-w dir] [-u user] <pid> <command> [args...]
+                                             runs a command inside a running container
        lx ps                                 running containers
        lx stop <pid>                         SIGTERM, then SIGKILL after 10s
        lx kill <pid> [SIGNAL]                default TERM
@@ -355,25 +363,91 @@ fn run() -> Result<(), String> {
         // ponytail: removed when the container exits (like `docker run --rm`); no named, restartable containers yet.
         proc::gc_layers();
         let layer = proc::new_layer().map_err(|e| format!("creating the container layer: {e}"))?;
-        fs::init(root);
+        fs::init(root.clone());
         fs::set_upper(layer.join("upper"));
         // Like Docker: the container resolves names through the host's DNS servers.
         let (resolv, hosts) = net::dns_files();
         let _ = fs::write_guest_file("/etc/resolv.conf", resolv.as_bytes());
         let _ = fs::write_guest_file("/etc/hosts", hosts.as_bytes());
         let _ = fs::mkdir_guest("/dev/shm"); // POSIX shared memory and semaphores (glibc's sem_open) live here
-        for (host, guest, ro) in volumes {
-            fs::add_mount(&guest, host, ro).map_err(|_| format!("-v: can't mount at {guest}"))?;
+        for (host, guest, ro) in &volumes {
+            fs::add_mount(guest, host.clone(), *ro).map_err(|_| format!("-v: can't mount at {guest}"))?;
         }
         fs::set_cwd(&c.workdir).map_err(|_| format!("WorkingDir {} not found in image", c.workdir))?;
-        proc::register_container(&format!("{image}  {}", c.argv.join(" ")));
+        // What `lx exec` needs to step into this container.
+        let config = serde_json::json!({
+            "root": root, "layer": layer, "env": c.env, "workdir": c.workdir, "uid": uid, "gid": gid,
+            "ports": ports.join(","), "mounts": volumes.iter().map(|(h, g, ro)| serde_json::json!([h, g, ro])).collect::<Vec<_>>(),
+        });
+        proc::register_container(&format!("{image}  {}", c.argv.join(" ")), &config.to_string());
         return start(&c.argv[0], c.argv.clone(), c.env);
+    }
+    if let [cmd, rest @ ..] = args.as_slice() && cmd == "exec" {
+        return exec(rest);
     }
     let [rootfs, cmd, rest @ ..] = args.as_slice() else { return Err(USAGE.into()) };
     let root = std::fs::canonicalize(rootfs).map_err(|e| format!("{rootfs}: {e}"))?;
     fs::init(root);
     let env = vec![format!("PATH={PATH}"), "HOME=/root".into(), "HOSTNAME=lx".into()];
     start(cmd, std::iter::once(cmd).chain(rest).cloned().collect(), env)
+}
+
+/// `lx exec [-e NAME[=value]] [-w DIR] [-u USER] <pid> <command> [args...]`, like `docker exec`: the command
+/// runs inside the running container `pid` (from `lx ps`): its image, writable layer and volumes, its env
+/// and working directory, its user, and its job, so it ends with the container.
+fn exec(args: &[String]) -> Result<(), String> {
+    let (mut rest, mut envs, mut workdir, mut user) = (args, Vec::new(), None, None);
+    while let [flag, value, more @ ..] = rest {
+        match flag.as_str() {
+            "-e" | "--env" if value.contains('=') => envs.push(value.clone()),
+            "-e" | "--env" => envs.extend(env::var(value).ok().map(|v| format!("{value}={v}"))),
+            "-w" | "--workdir" => workdir = Some(value.clone()),
+            "-u" | "--user" => user = Some(value.clone()),
+            _ => break,
+        }
+        rest = more;
+    }
+    let [pid, cmd, ..] = rest else { return Err(USAGE.into()) };
+    let pid: u32 = pid.parse().map_err(|_| format!("bad pid {pid}"))?;
+    let raw = proc::container_config(pid).ok_or(format!("{pid}: no such container (see lx ps)"))?;
+    let cfg: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("container {pid}: {e}"))?;
+    let path = |k: &str| cfg[k].as_str().map(std::path::PathBuf::from).ok_or(format!("container {pid}: no {k}"));
+    let (root, layer) = (path("root")?, path("layer")?);
+
+    // Into the container's job: memory cap, and gone when the container is.
+    unsafe {
+        let job = win::OpenJobObjectW(0x1 | 0x8, 0, job_name(pid).as_ptr()); // ASSIGN_PROCESS | QUERY
+        if job == 0 || win::AssignProcessToJobObject(job, win::GetCurrentProcess()) == 0 {
+            return Err(format!("container {pid}: can't join its job ({})", win::GetLastError()));
+        }
+        win::CloseHandle(job); // kill-on-close fires when the container's own handle goes: ours mustn't hold it open
+        env::set_var("LX_IN_JOB", "1");
+        env::set_var("LX_PORTS", cfg["ports"].as_str().unwrap_or(""));
+    }
+    let mut envv: Vec<String> = cfg["env"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(String::from)).collect();
+    for e in envs {
+        let name = e.split('=').next().unwrap_or_default().to_string();
+        envv.retain(|x| x.split('=').next() != Some(name.as_str()));
+        envv.push(e);
+    }
+    let (uid, gid) = match &user {
+        Some(u) => {
+            let (uid, gid, _) = image::resolve_user(&root, u)?;
+            (uid, gid)
+        }
+        None => (cfg["uid"].as_u64().unwrap_or(0) as u32, cfg["gid"].as_u64().unwrap_or(0) as u32),
+    };
+    (proc::UID.store(uid, std::sync::atomic::Ordering::Relaxed), proc::GID.store(gid, std::sync::atomic::Ordering::Relaxed));
+    proc::save_ids();
+    fs::init(root);
+    fs::set_upper(layer.join("upper"));
+    for m in cfg["mounts"].as_array().into_iter().flatten() {
+        let (Some(h), Some(g)) = (m[0].as_str(), m[1].as_str()) else { continue };
+        fs::add_mount(g, h.into(), m[2].as_bool().unwrap_or(false)).map_err(|_| format!("can't mount {g}"))?;
+    }
+    let dir = workdir.unwrap_or_else(|| cfg["workdir"].as_str().unwrap_or("/").to_string());
+    fs::set_cwd(&dir).map_err(|_| format!("{dir}: no such directory in the container"))?;
+    start(cmd, rest[1..].to_vec(), envv)
 }
 
 /// Load `cmd` (and its ELF interpreter, or its #! interpreter) and jump into it. Never returns on success.
