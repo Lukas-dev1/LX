@@ -71,9 +71,12 @@ fn area_near(s: &mut State, lo: u64, hi: u64, need: u64) -> Option<usize> {
 }
 
 /// Near branch targets inside [lo, hi): the places a rewrite must not cover (except at its first byte).
-fn branch_targets(instrs: &[Instruction], lo: u64, hi: u64) -> HashSet<u64> {
+/// Streams the decoder: a whole code region as a Vec<Instruction> is ~10x its size (numpy's 30 MB
+/// OpenBLAS would need 320 MB), and the windowed rewrite below only ever looks 4 instructions back.
+fn branch_targets(instrs: impl IntoIterator<Item = Instruction>, lo: u64, hi: u64) -> HashSet<u64> {
     let mut t = HashSet::new();
     for i in instrs {
+        let i = &i;
         let target = match i.flow_control() {
             FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::Call
                 if matches!(i.op0_kind(), OpKind::NearBranch64 | OpKind::NearBranch32 | OpKind::NearBranch16) => i.near_branch_target(),
@@ -176,8 +179,8 @@ fn build_stub(s: &mut State, displaced: &[Instruction], tail: Vec<Instruction>, 
 /// Put `bytes` at the next free spot of an area near [start, end) and point the site at it:
 /// `jmp stub`, then int3 over the rest of the displaced bytes.
 fn install(s: &mut State, code: &mut [u8], addr: u64, start: u64, end: u64, ai: usize, stub: u64, bytes: &[u8]) {
+    let _ = (s, ai); // the stub's space was reserved when it was planned
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), stub as *mut u8, bytes.len()) };
-    s.areas[ai].used += (bytes.len() as u64).next_multiple_of(16);
     let at = (start - addr) as usize;
     code[at] = 0xe9;
     code[at + 1..at + 5].copy_from_slice(&((stub as i64 - (start + 5) as i64) as i32).to_le_bytes());
@@ -189,14 +192,23 @@ fn install(s: &mut State, code: &mut [u8], addr: u64, start: u64, end: u64, ai: 
 pub fn rewrite(code: &mut [u8], addr: u64) -> Vec<u64> {
     use iced_x86::{Code, Decoder, DecoderOptions, MemoryOperand, Register as R};
     let hi = addr + code.len() as u64;
-    let instrs: Vec<Instruction> = Decoder::with_ip(64, code, addr, DecoderOptions::NONE).into_iter().collect();
-    let targets = branch_targets(&instrs, addr, hi);
+    let targets = branch_targets(Decoder::with_ip(64, code, addr, DecoderOptions::NONE), addr, hi);
     let mut fallback = Vec::new();
     let mut s = S.lock().unwrap();
     let mut busy: Vec<(u64, u64)> = Vec::new(); // byte ranges already rewritten
     let overlaps = |busy: &[(u64, u64)], a: u64, b: u64| busy.iter().any(|&(x, y)| a < y && x < b);
+    // Patches to the guest code are applied after decoding: the decoder reads the original bytes, as it
+    // did when the whole region was decoded up front. (start, end, area, stub, bytes)
+    let mut patches: Vec<(u64, u64, usize, u64, Vec<u8>)> = Vec::new();
+    // The current instruction and the 4 before it: all displace_from ever looks at.
+    let mut instrs: Vec<Instruction> = Vec::with_capacity(5);
 
-    for k in 0..instrs.len() {
+    for i in Decoder::with_ip(64, code, addr, DecoderOptions::NONE) {
+        if instrs.len() == 5 {
+            instrs.remove(0);
+        }
+        instrs.push(i);
+        let k = instrs.len() - 1;
         let is_syscall = instrs[k].mnemonic() == Mnemonic::Syscall;
         if !is_syscall && !is_fs_access(&instrs[k]) {
             continue;
@@ -226,9 +238,14 @@ pub fn rewrite(code: &mut [u8], addr: u64) -> Vec<u64> {
         if is_syscall {
             s.redirects.push((instrs[k].ip(), stub + bytes.len() as u64 - 13)); // the lea + jmp (7 + 6 bytes)
         }
-        install(&mut s, code, addr, start, end, ai, stub, &bytes);
+        // Reserve the stub's space now (later stubs go after it); the bytes go in after decoding.
+        s.areas[ai].used += (bytes.len() as u64).next_multiple_of(16);
+        patches.push((start, end, ai, stub, bytes));
         busy.push((start, end));
         if is_syscall { REWRITTEN.fetch_add(1, Relaxed); } else { FS_REWRITTEN.fetch_add(1, Relaxed); }
+    }
+    for (start, end, ai, stub, bytes) in patches {
+        install(&mut s, code, addr, start, end, ai, stub, &bytes);
     }
     FALLBACK_SITES.fetch_add(fallback.len() as u64, Relaxed);
     s.redirects.sort_unstable();
@@ -239,12 +256,23 @@ pub fn rewrite(code: &mut [u8], addr: u64) -> Vec<u64> {
 pub fn describe(code: &[u8], addr: u64, site: u64) -> String {
     use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
     let hi = addr + code.len() as u64;
-    let instrs: Vec<Instruction> = Decoder::with_ip(64, code, addr, DecoderOptions::NONE).into_iter().collect();
-    let targets = branch_targets(&instrs, addr, hi);
-    let Some(k) = instrs.iter().position(|i| i.ip() == site) else { return "not on an instruction boundary".into() };
+    let targets = branch_targets(Decoder::with_ip(64, code, addr, DecoderOptions::NONE), addr, hi);
+    let mut window: Vec<Instruction> = Vec::new();
+    for i in Decoder::with_ip(64, code, addr, DecoderOptions::NONE) {
+        if i.ip() > site {
+            break;
+        }
+        if window.len() == 4 {
+            window.remove(0);
+        }
+        window.push(i);
+    }
+    if window.last().is_none_or(|i| i.ip() != site) {
+        return "not on an instruction boundary".into();
+    }
     let mut f = IntelFormatter::new();
     let mut text = String::new();
-    for i in &instrs[k.saturating_sub(3)..=k] {
+    for i in &window {
         if targets.contains(&i.ip()) {
             text.push_str("[target] ");
         }
