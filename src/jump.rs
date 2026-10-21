@@ -38,6 +38,8 @@ pub static REWRITTEN: AtomicU64 = AtomicU64::new(0);
 pub static FALLBACK_SITES: AtomicU64 = AtomicU64::new(0);
 pub static FS_REWRITTEN: AtomicU64 = AtomicU64::new(0);
 pub static FS_LEFT: AtomicU64 = AtomicU64::new(0);
+/// Syscall sites rewritten forward (they return into the stub, so rcx and signal frames show a stub address).
+pub static FORWARD: AtomicU64 = AtomicU64::new(0);
 
 /// Where lx_sys_entry is in this process (forked children may load lx.exe elsewhere).
 fn entry_addr() -> u64 {
@@ -88,31 +90,31 @@ fn branch_targets(instrs: &[Instruction], lo: u64, hi: u64) -> HashSet<u64> {
     t
 }
 
-/// Index of the first instruction to displace for the site at `k`, if a rewrite is safe. `k` itself may
-/// be a branch target only if it can start the rewrite (then it carries the jmp).
-fn displace_from(instrs: &[Instruction], k: usize, targets: &HashSet<u64>) -> Option<usize> {
-    if instrs[k].len() >= 5 {
-        return Some(k);
-    }
-    if targets.contains(&instrs[k].ip()) {
-        return None; // something jumps straight to the site: it would land inside our jmp
-    }
+fn simple(i: &Instruction) -> bool {
+    i.flow_control() == FlowControl::Next && !i.is_invalid() && i.mnemonic() != Mnemonic::Syscall
+}
+
+/// The instructions [j, m] to displace for the site at `k` (j <= k <= m), if a rewrite is safe: at least
+/// 5 bytes, all straight-line, and no known branch target at any boundary after the first (the first
+/// carries the jmp). Instructions before the site are taken first. Taking ones after it (forward) is
+/// only needed when a branch or a jump target sits right before the site, as with glibc's errno stores
+/// and its syscall wrappers.
+fn displace(instrs: &[Instruction], k: usize, targets: &HashSet<u64>) -> Option<(usize, usize)> {
     let mut bytes = instrs[k].len();
     let mut j = k;
-    while bytes < 5 {
-        if j == 0 || k - j >= 4 {
-            return None;
-        }
+    while bytes < 5 && j > 0 && k - j < 4 && simple(&instrs[j - 1]) && !targets.contains(&instrs[j].ip()) {
         j -= 1;
-        let i = &instrs[j];
-        let simple = i.flow_control() == FlowControl::Next && !i.is_invalid() && i.mnemonic() != Mnemonic::Syscall;
-        if !simple || (j + 1 < k && targets.contains(&instrs[j + 1].ip())) {
+        bytes += instrs[j].len();
+    }
+    let mut m = k;
+    while bytes < 5 {
+        m += 1;
+        if m >= instrs.len() || m - k > 4 || !simple(&instrs[m]) || targets.contains(&instrs[m].ip()) {
             return None;
         }
-        bytes += i.len();
+        bytes += instrs[m].len();
     }
-    // Every boundary after the first displaced instruction must be free of known targets.
-    (j + 1..=k).all(|m| !targets.contains(&instrs[m].ip())).then_some(j)
+    Some((j, m))
 }
 
 fn is_fs_access(i: &Instruction) -> bool {
@@ -155,9 +157,9 @@ fn fs_free(i: &Instruction, ts_slot: u32, scratch: u32) -> Option<Vec<Instructio
     Some(v)
 }
 
-/// Encode a stub at `at`: the displaced instructions (relocated; fs-relative ones made FS-free), then
-/// `tail`. Records where each displaced instruction went, for the int3 redirects.
-fn build_stub(s: &mut State, displaced: &[Instruction], tail: Vec<Instruction>, at: u64) -> Option<Vec<u8>> {
+/// Encode stub code at `at`: the displaced instructions (relocated; fs-relative ones made FS-free), then
+/// `tail`. Also returns where each displaced instruction went, for the int3 redirects.
+fn encode(displaced: &[Instruction], tail: Vec<Instruction>, at: u64) -> Option<(Vec<u8>, Vec<(u64, u64)>)> {
     let (ts_slot, scratch) = crate::syscall::tls_slot_offsets();
     let mut out = Vec::new();
     let mut first = Vec::new();
@@ -166,11 +168,43 @@ fn build_stub(s: &mut State, displaced: &[Instruction], tail: Vec<Instruction>, 
         if is_fs_access(i) { out.extend(fs_free(i, ts_slot, scratch)?) } else { out.push(*i) }
     }
     out.extend(tail);
-    let r = BlockEncoder::encode(64, InstructionBlock::new(&out, at), BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).ok()?;
-    for (m, i) in displaced.iter().enumerate() {
-        s.redirects.push((i.ip(), at + r.new_instruction_offsets[first[m]] as u64));
+    if out.is_empty() {
+        return Some((Vec::new(), Vec::new()));
     }
-    Some(r.code_buffer)
+    let r = BlockEncoder::encode(64, InstructionBlock::new(&out, at), BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).ok()?;
+    let moved = displaced.iter().enumerate().map(|(m, i)| (i.ip(), at + r.new_instruction_offsets[first[m]] as u64)).collect();
+    Some((r.code_buffer, moved))
+}
+
+/// A whole stub for the site at `k`, displacing [j, m]; `end` is where the original code continues.
+///   %fs: site:  [j..=m] (FS-free) ; jmp end
+///   syscall:    [j..k) ; lea r11,[rip+back] ; jmp [entry slot] ; back: (k..=m] ; jmp end
+/// For a plain backward rewrite (m == k) `back` is `end` itself, so rcx/r11 and signal frames see the
+/// original return address, exactly as on Linux; a forward one returns into the stub instead.
+fn build_stub(instrs: &[Instruction], j: usize, k: usize, m: usize, end: u64, stub: u64, slot: u64) -> Option<(Vec<u8>, Vec<(u64, u64)>)> {
+    use iced_x86::{Code, MemoryOperand, Register as R};
+    let jmp_end = || Instruction::with_branch(Code::Jmp_rel32_64, end).ok();
+    if instrs[k].mnemonic() != Mnemonic::Syscall {
+        return encode(&instrs[j..=m], vec![jmp_end()?], stub);
+    }
+    let rip = |target: u64| MemoryOperand::new(R::RIP, R::None, 1, target as i64, 8, false, R::None);
+    let entry = |back: u64| -> Option<Vec<Instruction>> {
+        Some(vec![Instruction::with2(Code::Lea_r64_m, R::R11, rip(back)).ok()?, Instruction::with1(Code::Jmp_rm64, rip(slot)).ok()?])
+    };
+    if m == k {
+        let (code, mut moved) = encode(&instrs[j..k], entry(end)?, stub)?;
+        moved.push((instrs[k].ip(), stub + code.len() as u64 - 13)); // the lea + jmp (7 + 6 bytes)
+        return Some((code, moved));
+    }
+    // Forward: the length of the first part doesn't depend on where `back` is (lea rip+disp32 is 7 bytes).
+    let len1 = encode(&instrs[j..k], entry(stub)?, stub)?.0.len() as u64;
+    let back = stub + len1;
+    let (mut code, mut moved) = encode(&instrs[j..k], entry(back)?, stub)?;
+    moved.push((instrs[k].ip(), back - 13));
+    let (rest, moved2) = encode(&instrs[k + 1..=m], vec![jmp_end()?], back)?;
+    code.extend(rest);
+    moved.extend(moved2);
+    Some((code, moved))
 }
 
 /// Put `bytes` at the next free spot of an area near [start, end) and point the site at it:
@@ -184,10 +218,28 @@ fn install(s: &mut State, code: &mut [u8], addr: u64, start: u64, end: u64, ai: 
     code[at + 5..(end - addr) as usize].fill(0xcc);
 }
 
+/// Count an %fs: site left on the fault fallback; with LX_PATCHLOG, say why (with the code around it).
+fn fs_left(instrs: &[Instruction], k: usize, targets: &HashSet<u64>, why: &str) {
+    FS_LEFT.fetch_add(1, Relaxed);
+    if crate::syscall::patchlog() {
+        use iced_x86::{Formatter, IntelFormatter};
+        let mut f = IntelFormatter::new();
+        let mut text = String::new();
+        for i in &instrs[k.saturating_sub(2)..(k + 2).min(instrs.len())] {
+            if targets.contains(&i.ip()) {
+                text.push_str("[target] ");
+            }
+            f.format(i, &mut text);
+            text.push_str(" | ");
+        }
+        crate::syscall::dlog(format_args!("  fs site left {:#x} ({why}): {text}", instrs[k].ip()));
+    }
+}
+
 /// Rewrite the syscall and %fs: sites of writable guest code at [addr, addr+len). Returns the addresses
 /// of the `syscall` instructions that could NOT be rewritten (the caller turns those into ud2).
 pub fn rewrite(code: &mut [u8], addr: u64) -> Vec<u64> {
-    use iced_x86::{Code, Decoder, DecoderOptions, MemoryOperand, Register as R};
+    use iced_x86::{Decoder, DecoderOptions};
     let hi = addr + code.len() as u64;
     let instrs: Vec<Instruction> = Decoder::with_ip(64, code, addr, DecoderOptions::NONE).into_iter().collect();
     let targets = branch_targets(&instrs, addr, hi);
@@ -201,34 +253,36 @@ pub fn rewrite(code: &mut [u8], addr: u64) -> Vec<u64> {
         if !is_syscall && !is_fs_access(&instrs[k]) {
             continue;
         }
-        let end = instrs[k].ip() + instrs[k].len() as u64; // where execution continues after the site
-        let j = displace_from(&instrs, k, &targets).filter(|&j| !overlaps(&busy, instrs[j].ip(), end));
-        let start = j.map(|j| instrs[j].ip());
-        let ai = start.and_then(|st| area_near(&mut s, st, end, 256));
-        let (Some(j), Some(start), Some(ai)) = (j, start, ai) else {
-            if is_syscall { fallback.push(instrs[k].ip()) } else { FS_LEFT.fetch_add(1, Relaxed); }
-            continue;
-        };
-        let stub = s.areas[ai].base + s.areas[ai].used;
-        let tail = if is_syscall {
-            // r11 = return address, then jmp [area entry slot] -> lx_sys_entry
-            let rip = |target: u64| MemoryOperand::new(R::RIP, R::None, 1, target as i64, 8, false, R::None);
-            vec![Instruction::with2(Code::Lea_r64_m, R::R11, rip(end)), Instruction::with1(Code::Jmp_rm64, rip(s.areas[ai].base))]
-        } else {
-            vec![Instruction::with_branch(Code::Jmp_rel32_64, end)]
-        };
-        let tail: Option<Vec<Instruction>> = tail.into_iter().map(|t| t.ok()).collect();
-        let displaced = if is_syscall { &instrs[j..k] } else { &instrs[j..=k] };
-        let Some(bytes) = tail.and_then(|tail| build_stub(&mut s, displaced, tail, stub)) else {
-            if is_syscall { fallback.push(instrs[k].ip()) } else { FS_LEFT.fetch_add(1, Relaxed); }
-            continue;
-        };
-        if is_syscall {
-            s.redirects.push((instrs[k].ip(), stub + bytes.len() as u64 - 13)); // the lea + jmp (7 + 6 bytes)
+        let site_end = instrs[k].ip() + instrs[k].len() as u64;
+        if overlaps(&busy, instrs[k].ip(), site_end) {
+            continue; // displaced by an earlier site (forward): its stub already handles this one
         }
+        let range = displace(&instrs, k, &targets).filter(|&(j, m)| {
+            !overlaps(&busy, instrs[j].ip(), instrs[m].ip() + instrs[m].len() as u64)
+        });
+        let ai = range.and_then(|(j, m)| area_near(&mut s, instrs[j].ip(), instrs[m].ip() + instrs[m].len() as u64, 320));
+        let (Some((j, m)), Some(ai)) = (range, ai) else {
+            if is_syscall { fallback.push(instrs[k].ip()) } else { fs_left(&instrs, k, &targets, if range.is_none() { "no room" } else { "no stub area" }); }
+            continue;
+        };
+        let (start, end) = (instrs[j].ip(), instrs[m].ip() + instrs[m].len() as u64);
+        let stub = s.areas[ai].base + s.areas[ai].used;
+        let Some((bytes, moved)) = build_stub(&instrs, j, k, m, end, stub, s.areas[ai].base) else {
+            if is_syscall { fallback.push(instrs[k].ip()) } else { fs_left(&instrs, k, &targets, "can't encode"); }
+            continue;
+        };
+        s.redirects.extend(moved);
         install(&mut s, code, addr, start, end, ai, stub, &bytes);
         busy.push((start, end));
-        if is_syscall { REWRITTEN.fetch_add(1, Relaxed); } else { FS_REWRITTEN.fetch_add(1, Relaxed); }
+        // Count every site the stub covers (a forward rewrite can take further %fs: sites along).
+        for i in &instrs[j..=m] {
+            if i.mnemonic() == Mnemonic::Syscall {
+                REWRITTEN.fetch_add(1, Relaxed);
+                if m > k { FORWARD.fetch_add(1, Relaxed); }
+            } else if is_fs_access(i) {
+                FS_REWRITTEN.fetch_add(1, Relaxed);
+            }
+        }
     }
     FALLBACK_SITES.fetch_add(fallback.len() as u64, Relaxed);
     s.redirects.sort_unstable();
