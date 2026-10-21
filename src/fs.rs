@@ -1858,7 +1858,7 @@ fn proc_link(guest: &str) -> Option<String> {
     let rest = guest.strip_prefix("/proc/self/").or_else(|| {
         let r = guest.strip_prefix("/proc/")?;
         let (pid, rest) = r.split_once('/')?;
-        (pid.parse::<u32>().ok()? == unsafe { crate::win::GetCurrentProcessId() }).then_some(rest)
+        (pid.parse::<u32>().ok()? == crate::proc::pid()).then_some(rest)
     })?;
     match rest {
         "exe" => Some(EXE.lock().unwrap().clone()),
