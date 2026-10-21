@@ -737,8 +737,11 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         1 | 2 => with(|fs| {
             fs.fd(fd)?;
             let slot = fs.fds[fd as usize].as_mut().unwrap();
-            if cmd == 2 { slot.cloexec = arg & 1 != 0 } // F_SETFD
-            Ok(slot.cloexec as i64)                      // F_GETFD
+            if cmd == 2 {
+                slot.cloexec = arg & 1 != 0;
+                return Ok(0); // F_SETFD returns 0, not the flags (Python treats anything else as failure)
+            }
+            Ok(slot.cloexec as i64) // F_GETFD
         }),
         // F_SETFL / F_GETFL: O_NONBLOCK matters for sockets. ponytail: ignored on pipes and files.
         8 => with(|fs| fs.fd(fd).map(|_| 0)), // F_SETOWN: only matters for SIGIO, which we don't send
