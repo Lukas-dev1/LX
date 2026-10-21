@@ -814,7 +814,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
     let r = match c.rax {
         0 => fs::read(a[0], a[1], a[2]),
         1 => fs::write(a[0], a[1], a[2]),
-        2 => fs::openat(CWD, a[0], a[1]),
+        2 => fs::openat(CWD, a[0], a[1], a[2]),
+        85 => fs::openat(CWD, a[0], 0o1101, a[1]), // creat: O_CREAT | O_WRONLY | O_TRUNC
         3 => fs::close(a[0]),
         4 => fs::fstatat(CWD, a[0], a[1], 0),
         5 => fs::fstat(a[0], a[1]),
@@ -841,8 +842,14 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         19 => fs::readv(a[0], a[1], a[2]),
         37 => { signal::set_alarm(a[0] * 1000, 0); Ok(0) } // alarm
         38 => setitimer(a[0], a[1], a[2]),
-        90 | 91 | 268 => Ok(0),        // chmod, fchmod, fchmodat. ponytail: modes aren't stored yet (DESIGN.md §6)
-        92 | 93 | 94 | 260 => Ok(0),   // chown, fchown, lchown, fchownat: everything is root's anyway
+        90 => fs::chmeta_at(CWD, a[0], true, Some(a[1]), None),                     // chmod
+        91 => fs::fchmeta(a[0], Some(a[1]), None),                                  // fchmod
+        268 => fs::chmeta_at(a[0], a[1], true, Some(a[2]), None),                   // fchmodat (no flags)
+        92 => fs::chmeta_at(CWD, a[0], true, None, Some((a[1], a[2]))),             // chown
+        93 => fs::fchmeta(a[0], None, Some((a[1], a[2]))),                          // fchown
+        94 => fs::chmeta_at(CWD, a[0], false, None, Some((a[1], a[2]))),            // lchown
+        260 if a[4] & 0x1000 != 0 && cstr(a[1]).is_ok_and(|p| p.is_empty()) => fs::fchmeta(a[0], None, Some((a[2], a[3]))), // fchownat(AT_EMPTY_PATH)
+        260 => fs::chmeta_at(a[0], a[1], a[4] & AT_SYMLINK_NOFOLLOW == 0, None, Some((a[2], a[3]))), // fchownat
         97 => rlimit(a[0], 0, a[1]),   // getrlimit
         160 => Ok(0),                  // setrlimit: accepted, not enforced
         302 => rlimit(a[1], a[2], a[3]), // prlimit64 (self only)
@@ -897,14 +904,14 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         80 => fs::chdir(a[0]),
         81 => fs::fchdir(a[0]),
         82 => fs::renameat(CWD, a[0], CWD, a[1]),
-        83 => fs::mkdirat(CWD, a[0]),
+        83 => fs::mkdirat(CWD, a[0], a[1]),
         84 => fs::unlinkat(CWD, a[0], 0x200),
         87 => fs::unlinkat(CWD, a[0], 0),
         76 => fs::truncate(CWD, a[0], None, a[1]),
         77 => fs::truncate(0, 0, Some(a[0]), a[1]),
         88 => fs::symlinkat(a[0], CWD, a[1]),
         89 => fs::readlinkat(CWD, a[0], a[1], a[2]),
-        95 => Ok(0o022),               // umask
+        95 => fs::umask(a[0]),
         96 => gettimeofday(a[0]),
         102 | 107 => Ok(proc::UID.load(Relaxed) as i64), // getuid, geteuid
         104 | 108 => Ok(proc::GID.load(Relaxed) as i64), // getgid, getegid
@@ -943,9 +950,10 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         138 => fs::statfs(None, Some(a[0]), a[1]),
         299 => net::sys_mmsg(a[0], a[1], a[2], a[3], false), // recvmmsg
         307 => net::sys_mmsg(a[0], a[1], a[2], a[3], true),  // sendmmsg
-        257 => fs::openat(a[0], a[1], a[2]),
-        258 => fs::mkdirat(a[0], a[1]),
+        257 => fs::openat(a[0], a[1], a[2], a[3]),
+        258 => fs::mkdirat(a[0], a[1], a[2]),
         262 => fs::fstatat(a[0], a[1], a[2], a[3]),
+        332 => fs::statx(a[0], a[1], a[2], a[4]),
         263 => fs::unlinkat(a[0], a[1], a[2]),
         264 | 316 => fs::renameat(a[0], a[1], a[2], a[3]),
         266 => fs::symlinkat(a[0], a[1], a[2]),

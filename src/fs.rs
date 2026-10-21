@@ -14,6 +14,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::time::UNIX_EPOCH;
 use crate::net::{Epoll, Sock};
 
@@ -444,7 +445,17 @@ impl Fs {
             return Ok(upper);
         }
         let parent = upper.parent().unwrap_or(up);
-        fs::create_dir_all(parent).map_err(errno)?;
+        if !exists(parent) {
+            fs::create_dir_all(parent).map_err(errno)?;
+            // Directories made here stand for the image's: give them its modes and owners.
+            let (mut u, mut l) = (up.clone(), self.root.clone());
+            for name in &comps[..comps.len().saturating_sub(1)] {
+                (u.push(name), l.push(name));
+                if get_meta(&u).is_none() && let Some(m) = get_meta(&l) {
+                    let _ = set_meta(&u, m);
+                }
+            }
+        }
         if let Some(name) = comps.last() {
             let _ = fs::remove_file(parent.join(format!("{WHITEOUT}{name}")));
         }
@@ -1047,7 +1058,7 @@ pub fn writev(fd: u64, iov: u64, cnt: u64) -> R {
     Ok(total)
 }
 
-pub fn openat(dirfd: u64, path: u64, flags: u64) -> R {
+pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
     let cloexec = flags & O_CLOEXEC != 0;
     let guest = with(|fs| fs.at(dirfd, path, flags & O_NOFOLLOW == 0))?.0;
     if let Some(n) = fd_alias(&guest) {
@@ -1084,6 +1095,9 @@ pub fn openat(dirfd: u64, path: u64, flags: u64) -> R {
                 .create_new(flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL)
                 .open(&host)
                 .map_err(errno)?;
+            if flags & O_CREAT != 0 && meta.is_err() && fs.mount_of(&comps_of(&guest)).is_none() {
+                let _ = set_meta(&host, new_meta(mode));
+            }
             Fd::File { f, host }
         };
         Ok(fs.add(fd, 0, cloexec))
@@ -1495,10 +1509,106 @@ pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
 }
 
 /// `struct stat` for x86-64 (144 bytes).
+// ---- modes and owners ----
+//
+// NTFS has no Linux mode bits or owners, so they live in an alternate data stream of each file and
+// directory, "<host>:lx": permission bits, uid, gid as three little-endian u32s. Unpack writes them
+// from the tar headers, chmod/chown and creation update them; without one, an entry reads as
+// 0755 root:root (images pulled before this, files lx didn't create). Volumes' host files never get one.
+
+pub static UMASK: AtomicU32 = AtomicU32::new(0o022);
+
+fn meta_stream(host: &Path) -> PathBuf {
+    let mut p = host.as_os_str().to_owned();
+    p.push(":lx");
+    p.into()
+}
+
+fn get_meta(host: &Path) -> Option<[u32; 3]> {
+    let b = fs::read(meta_stream(host)).ok()?;
+    let v = |i: usize| Some(u32::from_le_bytes(b.get(i * 4..i * 4 + 4)?.try_into().ok()?));
+    Some([v(0)?, v(1)?, v(2)?])
+}
+
+fn set_meta(host: &Path, m: [u32; 3]) -> io::Result<()> {
+    fs::write(meta_stream(host), m.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
+}
+
+/// What a newly created file or directory gets: `mode` less the umask, owned by the effective ids.
+fn new_meta(mode: u64) -> [u32; 3] {
+    [mode as u32 & 0o7777 & !UMASK.load(Relaxed), crate::proc::UID.load(Relaxed), crate::proc::GID.load(Relaxed)]
+}
+
+/// umask(mask): returns the old one. ponytail: not carried across exec (a new lx starts at 022).
+pub fn umask(mask: u64) -> R {
+    Ok(UMASK.swap(mask as u32 & 0o777, Relaxed) as i64)
+}
+
+/// Fill st_mode's permission bits, st_uid and st_gid from the stored metadata.
+fn with_meta(s: &mut [u64; 18], host: &Path) {
+    let [perm, uid, gid] = get_meta(host).unwrap_or([s[3] as u32 & 0o7777, 0, 0]);
+    s[3] = (s[3] & !0o7777) | (perm & 0o7777) as u64 | (uid as u64) << 32;
+    s[4] = gid as u64;
+}
+
+/// chmod/chown of the entry at `c` (guest path components; `host` is where it is now): through the
+/// writable layer, so the image keeps its own. `mode`/`owner` None: keep; an id of -1 keeps that id.
+fn chmeta(fs: &Fs, c: &[String], host: &Path, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
+    if fs.mount_of(c).is_some() {
+        return Ok(0); // ponytail: a volume's files are the host's: their modes and owners aren't ours to set
+    }
+    let dir = host.is_dir();
+    let up = fs.writable(c, !dir)?; // a directory is created in the upper layer, not copied whole
+    if dir {
+        fs::create_dir_all(&up).map_err(errno)?;
+    }
+    let mut m = get_meta(&up).or_else(|| get_meta(host)).unwrap_or([0o755, 0, 0]);
+    if let Some(mode) = mode {
+        m[0] = mode as u32 & 0o7777;
+    }
+    if let Some((uid, gid)) = owner {
+        for (slot, id) in [(1, uid as u32), (2, gid as u32)] {
+            if id != u32::MAX {
+                m[slot] = id;
+            }
+        }
+    }
+    set_meta(&up, m).map_err(errno)?;
+    Ok(0)
+}
+
+/// chmod, fchmodat, chown, lchown, fchownat.
+pub fn chmeta_at(dirfd: u64, path: u64, follow: bool, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
+    with(|fs| {
+        let (guest, host) = fs.at(dirfd, path, follow)?;
+        if fs::symlink_metadata(&host).is_err() {
+            return Err(ENOENT);
+        }
+        chmeta(fs, &comps_of(&guest), &host, mode, owner)
+    })
+}
+
+/// fchmod, fchown: by the file's path in the container. Pipes, sockets and the like: accepted.
+pub fn fchmeta(fd: u64, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
+    with(|fs| {
+        let guest = match fs.fd(fd)? {
+            Fd::Dir { guest, .. } => guest.clone(),
+            Fd::File { host, .. } => {
+                let host = host.clone();
+                let rel = fs.upper.as_ref().and_then(|u| host.strip_prefix(u).ok()).or_else(|| host.strip_prefix(&fs.root).ok());
+                let Some(rel) = rel else { return Ok(0) }; // in a volume
+                format!("/{}", rel.to_string_lossy().replace('\\', "/"))
+            }
+            _ => return Ok(0),
+        };
+        let host = fs.resolve("/", &guest, false)?.1;
+        chmeta(fs, &comps_of(&guest), &host, mode, owner)
+    })
+}
+
 fn stat_of(host: &Path) -> Result<[u64; 18], i64> {
     let m = fs::symlink_metadata(host).map_err(errno)?;
     let link = if m.is_file() { read_link(host) } else { None };
-    // ponytail: no stored modes/owners yet, so files are 0755 root:root. Keep real modes in an ADS (DESIGN.md §6).
     let sock = m.len() == SOCK_MAGIC.len() as u64 && fs::read(host).is_ok_and(|d| d == SOCK_MAGIC);
     let (mode, size, nlink) = match &link {
         _ if m.is_dir() => (0o040755, 4096, 2),
@@ -1517,6 +1627,9 @@ fn stat_of(host: &Path) -> Result<[u64; 18], i64> {
     s[8] = size.div_ceil(512);
     for i in [9, 11, 13] {
         (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
+    }
+    if link.is_none() {
+        with_meta(&mut s, host);
     }
     Ok(s)
 }
@@ -1538,6 +1651,7 @@ pub fn fstat(fd: u64, buf: u64) -> R {
             for i in [9, 11, 13] {
                 (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
             }
+            with_meta(&mut s, host);
             Ok(s)
         }
         Fd::Dir { guest, .. } => {
@@ -1580,6 +1694,34 @@ pub fn fstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> R {
         return put_stat(buf, d.stat());
     }
     put_stat(buf, stat_of(&host)?)
+}
+
+/// statx(dirfd, path, flags, mask, buf): newer coreutils and glibc's stat use it. Filled from the same
+/// struct stat as fstatat (flags: AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW; the sync bits don't matter here).
+pub fn statx(dirfd: u64, path: u64, flags: u64, buf: u64) -> R {
+    let mut s = [0u64; 18];
+    fstatat(dirfd, path, s.as_mut_ptr() as u64, flags & (AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW))?;
+    let mut x = [0u8; 256];
+    let mut put = |off: usize, v: &[u8]| x[off..off + v.len()].copy_from_slice(v);
+    put(0, &0x7ffu32.to_le_bytes()); // STATX_BASIC_STATS
+    put(4, &(s[7] as u32).to_le_bytes()); // blksize
+    put(16, &(s[2] as u32).to_le_bytes()); // nlink
+    put(20, &((s[3] >> 32) as u32).to_le_bytes()); // uid
+    put(24, &(s[4] as u32).to_le_bytes()); // gid
+    put(28, &(s[3] as u16).to_le_bytes()); // mode
+    put(32, &s[1].to_le_bytes()); // ino
+    put(40, &s[6].to_le_bytes()); // size
+    put(48, &s[8].to_le_bytes()); // blocks
+    for (off, i) in [(64, 9), (96, 13), (112, 11)] { // atime, ctime, mtime: { i64 sec; u32 nsec; }
+        put(off, &s[i].to_le_bytes());
+        put(off + 8, &(s[i + 1] as u32).to_le_bytes());
+    }
+    put(128, &((s[5] >> 8) as u32 & 0xfff).to_le_bytes()); // rdev major, minor
+    put(132, &(s[5] as u32 & 0xff).to_le_bytes());
+    put(136, &((s[0] >> 8) as u32 & 0xfff).to_le_bytes()); // dev major, minor
+    put(140, &(s[0] as u32 & 0xff).to_le_bytes());
+    unsafe { std::ptr::copy_nonoverlapping(x.as_ptr(), buf as *mut u8, 256) };
+    Ok(0)
 }
 
 
@@ -1640,7 +1782,7 @@ fn comps_of(guest: &str) -> Vec<String> {
     split(guest).into_iter().collect()
 }
 
-pub fn mkdirat(dirfd: u64, path: u64) -> R {
+pub fn mkdirat(dirfd: u64, path: u64, mode: u64) -> R {
     with(|fs| {
         let (guest, host) = fs.at(dirfd, path, false)?;
         if exists(&host) {
@@ -1650,6 +1792,9 @@ pub fn mkdirat(dirfd: u64, path: u64) -> R {
         let was_hidden = fs.upper.is_some() && fs.hidden(&c);
         let up = fs.writable(&c, false)?;
         fs::create_dir(&up).map_err(errno)?;
+        if fs.mount_of(&c).is_none() {
+            let _ = set_meta(&up, new_meta(mode));
+        }
         if was_hidden {
             // Recreated over a deleted image dir: it must not show the old contents (overlayfs: opaque).
             fs::write(up.join(OPAQUE), b"").map_err(errno)?;
@@ -1881,6 +2026,11 @@ pub fn unpack(layer: &Path, dest: &Path) -> Result<(u32, u32), String> {
             skipped += 1; // device nodes, fifos
             continue;
         };
+        if r.is_ok() && !ty.is_symlink() {
+            let h = e.header();
+            let id = |v: io::Result<u64>| v.unwrap_or(0) as u32;
+            let _ = set_meta(&host, [h.mode().unwrap_or(0o755) & 0o7777, id(h.uid()), id(h.gid())]);
+        }
         match r {
             Ok(()) => done += 1,
             Err(err) => { eprintln!("[lx] unpack {}: {err}", path.display()); skipped += 1 }
@@ -1893,6 +2043,9 @@ pub fn unpack(layer: &Path, dest: &Path) -> Result<(u32, u32), String> {
 fn copy_up(from: &Path, to: &Path) -> io::Result<()> {
     if fs::symlink_metadata(from)?.is_dir() {
         fs::create_dir_all(to)?;
+        if let Some(m) = get_meta(from) {
+            set_meta(to, m)?;
+        }
         for e in fs::read_dir(from)? {
             let e = e?;
             copy_up(&e.path(), &to.join(e.file_name()))?;

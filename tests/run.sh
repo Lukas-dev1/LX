@@ -64,6 +64,10 @@ fi
 # ---- images: pull what's missing; guest scripts reach containers through a read-only volume ----
 for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine; do
   dir=$STORE/library_${img%%:*}/${img#*:}/rootfs
+  # Pulled before lx kept file modes, every file reads 0755 (no real image has /etc/passwd so): re-pull.
+  if [ -d "$dir" ] && [ "$($LX run "$img" stat -c %a /etc/passwd 2> /dev/null < /dev/null)" = 755 ]; then
+    rm -rf "$dir"
+  fi
   [ -d "$dir" ] || $LX pull "$img" > /dev/null 2>&1 || die "pull $img"
 done
 GUEST="$ROOT/guest:/t:ro" # nothing is copied into an image: containers never modify the image store
@@ -92,6 +96,8 @@ expect "debian: AF_UNIX echo (path + abstract)" 0 "OK" -- run -v "$GUEST" python
 expect "AF_UNIX datagrams"         0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/dgramtest.py
 expect "debian: AF_UNIX datagrams" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/dgramtest.py
 expect "socketpair (stream, dgram, fork, mp.Pipe)" 0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/pairtest.py
+expect "file modes + owners"       0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/modetest.py
+expect "debian: file modes + owners" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/modetest.py
 
 # ---- volumes: data written in one container run is there in the next; the image stays untouched ----
 VOL="$ROOT/rootfs/voltest-suite"
