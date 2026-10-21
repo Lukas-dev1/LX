@@ -110,7 +110,7 @@ pub fn load(f: &[u8]) -> Result<Image, String> {
 /// Returns (initial rsp, stack low, stack high).
 pub fn build_stack(img: &Image, interp_base: u64, argv: &[&str], envp: &[&str]) -> Result<(u64, u64, u64), String> {
     const SIZE: usize = 8 << 20;
-    let base = crate::syscall::alloc(None, SIZE as u64).ok_or("stack allocation failed")?;
+    let base = crate::syscall::alloc_stack(SIZE as u64).ok_or("stack allocation failed")?;
     let mut sp = base + SIZE as u64;
     let mut push = |bytes: &[u8]| -> u64 {
         sp -= bytes.len() as u64;

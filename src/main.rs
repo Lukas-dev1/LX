@@ -2,6 +2,7 @@
 mod elf;
 mod fs;
 mod image;
+mod net;
 mod proc;
 mod signal;
 mod syscall;
@@ -20,6 +21,9 @@ pub mod win {
     pub const MEM_FREE: u32 = 0x10000;
     pub const MEM_RELEASE: u32 = 0x8000;
     pub const PAGE_READWRITE: u32 = 0x04;
+    pub const PAGE_GUARD: u32 = 0x100;
+    pub const FILE_MAP_WRITE: u32 = 0x02;
+    pub const EVENT_MODIFY_STATE: u32 = 0x02;
 
     #[repr(C)]
     #[derive(Default)]
@@ -96,6 +100,16 @@ pub mod win {
         pub fn SetHandleInformation(h: isize, mask: u32, flags: u32) -> i32;
         pub fn CreatePipe(r: *mut isize, w: *mut isize, attr: *mut c_void, size: u32) -> i32;
         pub fn GetFileType(h: isize) -> u32;
+        pub fn CreateFileMappingW(file: isize, attr: *mut c_void, prot: u32, hi: u32, lo: u32, name: *const u16) -> isize;
+        pub fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> isize;
+        pub fn MapViewOfFile(map: isize, access: u32, hi: u32, lo: u32, len: usize) -> *mut c_void;
+        pub fn CreateEventW(attr: *mut c_void, manual: i32, initial: i32, name: *const u16) -> isize;
+        pub fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
+        pub fn SetEvent(ev: isize) -> i32;
+        pub fn CancelSynchronousIo(thread: isize) -> i32;
+        pub fn SetConsoleCtrlHandler(h: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+        pub fn GetCurrentThread() -> isize;
+        pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
         pub fn PeekNamedPipe(h: isize, buf: *mut c_void, len: u32, read: *mut u32, avail: *mut u32, left: *mut u32) -> i32;
         pub fn DuplicateHandle(sp: isize, h: isize, tp: isize, out: *mut isize, access: u32, inherit: i32, opts: u32) -> i32;
         pub fn ReadProcessMemory(p: isize, from: *const c_void, to: *mut c_void, len: usize, done: *mut usize) -> i32;
@@ -170,6 +184,9 @@ fn enter_job() -> Result<(), String> {
 
 const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull nginx:alpine
        lx run <image> [command args...]      runs the image's entrypoint/cmd, or the given command
+       lx ps                                 running containers
+       lx stop <pid>                         SIGTERM, then SIGKILL after 10s
+       lx kill <pid> [SIGNAL]                default TERM
        lx <rootfs-dir> <command> [args...]   run a command in an unpacked rootfs
        lx unpack <layer.tar[.gz]> <rootfs-dir>";
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -198,6 +215,21 @@ fn run() -> Result<(), String> {
         eprintln!("[lx] pulled {image} into {}", dir.display());
         return Ok(());
     }
+    if let [cmd] = args.as_slice() && cmd == "ps" {
+        println!("{:<8} COMMAND", "PID");
+        for (pid, desc) in proc::ps() {
+            println!("{pid:<8} {}", desc.split_whitespace().collect::<Vec<_>>().join(" ")); // one line per container
+        }
+        return Ok(());
+    }
+    if let [cmd, pid, rest @ ..] = args.as_slice() && (cmd == "kill" || cmd == "stop") {
+        let pid: u32 = pid.parse().map_err(|_| format!("bad pid {pid}"))?;
+        if cmd == "stop" {
+            return proc::stop(pid, std::time::Duration::from_secs(10));
+        }
+        let sig = rest.first().map_or(Some(15), |s| signal::parse(s)).ok_or("unknown signal")?;
+        return proc::send(pid, sig).map(|_| ()).map_err(|_| format!("{pid}: no such lx process"));
+    }
     if let [cmd, image, rest @ ..] = args.as_slice() && cmd == "run" {
         let r = image::Ref::parse(image);
         let dir = if r.dir().join("config.json").exists() { r.dir() } else { image::pull(&r)? };
@@ -205,8 +237,16 @@ fn run() -> Result<(), String> {
         // ponytail: the container writes straight into the pulled image; a per-container
         // copy-on-write layer (DESIGN.md §6) is still to come.
         let root = std::fs::canonicalize(dir.join("rootfs")).map_err(|e| e.to_string())?;
+        // Like Docker: the container resolves names through the host's DNS servers.
+        let (resolv, hosts) = net::dns_files();
+        let etc = root.join("etc");
+        let _ = std::fs::create_dir_all(&etc);
+        let _ = std::fs::remove_file(etc.join("resolv.conf")); // may be a symlink marker
+        let _ = std::fs::write(etc.join("resolv.conf"), resolv);
+        let _ = std::fs::write(etc.join("hosts"), hosts);
         fs::init(root);
         fs::set_cwd(&c.workdir).map_err(|_| format!("WorkingDir {} not found in image", c.workdir))?;
+        proc::register_container(&format!("{image}  {}", c.argv.join(" ")));
         return start(&c.argv[0], c.argv.clone(), c.env);
     }
     let [rootfs, cmd, rest @ ..] = args.as_slice() else { return Err(USAGE.into()) };

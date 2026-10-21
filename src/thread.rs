@@ -101,6 +101,14 @@ pub fn exit(code: u64) -> ! {
         }
         tid != me
     });
+    // ExitThread frees the stack the TEB names: make that our host stack again, not the guest's memory
+    // (which belongs to the guest: musl's pthread struct lives there and pthread_join still reads it).
+    if let Some([b, l, d]) = t.host_teb {
+        unsafe {
+            std::arch::asm!("mov qword ptr gs:[0x08], {b}", "mov qword ptr gs:[0x10], {l}", "mov qword ptr gs:[0x1478], {d}",
+                b = in(reg) b, l = in(reg) l, d = in(reg) d);
+        }
+    }
     unsafe { ExitThread(code as u32) }
 }
 
@@ -184,15 +192,4 @@ pub fn membarrier(cmd: u64) -> R {
 pub fn sched_yield() -> R {
     unsafe { SwitchToThread() };
     Ok(0)
-}
-
-/// sched_getaffinity: all CPUs (up to 64). Go sizes its scheduler from this.
-pub fn sched_getaffinity(len: u64, mask: u64) -> R {
-    if len < 8 {
-        return Err(EINVAL);
-    }
-    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64);
-    let bits = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
-    unsafe { *(mask as *mut u64) = bits };
-    Ok(8)
 }

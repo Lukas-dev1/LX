@@ -4,7 +4,7 @@
 //! - NT resets FS base to 0 on context switches, so a guest `%fs:` access faults (low/kernel address).
 //!   We bounce through `fs_tramp`, which reloads FS base in user mode and resumes the faulting instruction.
 //!   Every return to the guest goes through the trampoline, because NtContinue also loses FS base.
-use crate::{fs, proc, signal, thread};
+use crate::{fs, net, proc, signal, thread};
 use crate::win::*;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -39,6 +39,9 @@ pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
 pub const ENOENT: i64 = 2;
+pub const ENOTSOCK: i64 = 88;
+pub const ENOPROTOOPT: i64 = 92;
+pub const EAFNOSUPPORT: i64 = 97;
 
 /// Per guest thread: what the trampolines need (fixed offsets, read from assembly) plus Linux thread state.
 #[repr(C)]
@@ -60,6 +63,9 @@ pub struct ThreadState {
     /// Our own stack for handling this thread's traps (top), and whether we're on it right now.
     host_stack: u64,
     on_host: bool,
+    /// The TEB's own stack fields (StackBase, StackLimit, DeallocationStack) before the guest took over.
+    /// ExitThread frees whatever DeallocationStack names, so they go back before a thread exits.
+    pub host_teb: Option<[u64; 3]>,
 }
 
 const _: () = assert!(std::mem::offset_of!(ThreadState, resume) == 8);
@@ -80,7 +86,7 @@ pub fn ts() -> &'static mut ThreadState {
     }
     let st = Box::leak(Box::new(ThreadState {
         fs: 0, resume: 0, frame_len: 0, frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None,
-        host_stack: 0, on_host: false,
+        host_stack: 0, on_host: false, host_teb: None,
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
     st
@@ -148,11 +154,33 @@ unsafe extern "C" {
 
 /// Jump into guest code on this thread. Never returns: the guest ends it with exit or exit_group.
 pub fn enter(regs: [u64; 18], stack_lo: u64, stack_hi: u64) -> ! {
-    ts().stack = (stack_lo, stack_hi);
+    let t = ts();
+    t.stack = (stack_lo, stack_hi);
+    if t.host_teb.is_none() {
+        let (b, l, d): (u64, u64, u64);
+        unsafe {
+            std::arch::asm!("mov {b}, qword ptr gs:[0x08]", "mov {l}, qword ptr gs:[0x10]", "mov {d}, qword ptr gs:[0x1478]",
+                b = out(reg) b, l = out(reg) l, d = out(reg) d);
+        }
+        t.host_teb = Some([b, l, d]);
+    }
     let regs = Box::leak(Box::new(regs));
+    // Lowest committed byte of the stack: where NT's guard-page growth continues from.
+    let mut limit = stack_hi;
+    while limit > stack_lo {
+        let mut m = MemoryBasicInformation::default();
+        unsafe { VirtualQuery((limit - 1) as *const _, &mut m, size_of::<MemoryBasicInformation>()) };
+        if m.state != MEM_COMMIT || m.protect & PAGE_GUARD != 0 {
+            break;
+        }
+        limit = m.base as u64;
+    }
     unsafe {
-        std::arch::asm!("mov qword ptr gs:[0x08], {hi}", "mov qword ptr gs:[0x10], {lo}", // NT_TIB StackBase/Limit
-            hi = in(reg) stack_hi, lo = in(reg) stack_lo);
+        std::arch::asm!(
+            "mov qword ptr gs:[0x08], {hi}",   // NT_TIB.StackBase
+            "mov qword ptr gs:[0x10], {lim}",  // NT_TIB.StackLimit
+            "mov qword ptr gs:[0x1478], {lo}", // TEB.DeallocationStack: lets NT grow the stack on demand
+            hi = in(reg) stack_hi, lim = in(reg) limit, lo = in(reg) stack_lo);
         lx_resume(regs)
     }
 }
@@ -165,6 +193,30 @@ static ALLOCS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// a forked lx can re-reserve the same addresses. ponytail: bump pointer, freed space is never reused.
 const WINDOW: (u64, u64) = (0x2000_0000_0000, 0x6000_0000_0000);
 static NEXT: AtomicU64 = AtomicU64::new(WINDOW.0);
+
+/// The guest stack, grown on demand like a Win32 thread stack: reserve `len`, commit the top
+/// 256K, and put a guard page under it. With the TEB bounds set (`enter`), NT itself commits further
+/// pages as the stack grows, so a process doesn't pay for 8 MB it never touches.
+pub fn alloc_stack(len: u64) -> Option<u64> {
+    const COMMIT: u64 = 256 << 10;
+    let len = len.next_multiple_of(0x10000);
+    let base = loop {
+        let a = NEXT.fetch_add(len, Relaxed);
+        if a + len > WINDOW.1 {
+            return None;
+        }
+        if unsafe { VirtualAlloc(a as *mut _, len as usize, MEM_RESERVE, PAGE_READWRITE) } as u64 == a {
+            break a;
+        }
+    };
+    let top = base + len - COMMIT;
+    unsafe {
+        VirtualAlloc(top as *mut _, COMMIT as usize, MEM_COMMIT, PAGE_READWRITE);
+        VirtualAlloc((top - PAGE) as *mut _, PAGE as usize, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
+    }
+    ALLOCS.lock().unwrap().push((base, len));
+    Some(base)
+}
 
 /// Reserve+commit RW guest memory, at `fixed` or anywhere in the guest window.
 pub fn alloc(fixed: Option<u64>, len: u64) -> Option<u64> {
@@ -199,6 +251,21 @@ fn alloc_ex(fixed: Option<u64>, len: u64, commit: bool) -> Option<u64> {
     };
     ALLOCS.lock().unwrap().push((p, len));
     Some(p)
+}
+
+/// After exec: this process only waits for its successor, so give back the old program's memory.
+/// The guest stack stays: our own code is running on it.
+pub fn release_guest_memory() {
+    let (lo, _) = ts().stack;
+    let mut allocs = ALLOCS.lock().unwrap();
+    allocs.retain(|&(base, len)| {
+        if (base..base + len).contains(&lo) {
+            return true;
+        }
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        false
+    });
+    CODE.lock().unwrap().regions.clear(); // nothing of the old program runs any more
 }
 
 /// Serialize everything a forked child needs to rebuild the guest's address space and runtime state.
@@ -255,7 +322,9 @@ pub fn restore<'a>(f: &'a [String], parent: isize) -> Result<((u64, u64), &'a [S
         unsafe { VirtualAlloc(a as *mut _, len as usize, MEM_COMMIT, PAGE_READWRITE) };
         let mut done = 0;
         // PAGE_NOACCESS ranges can't be read and don't need to be: their contents are unobservable.
-        if prot != 0x01 && unsafe { ReadProcessMemory(parent, a as *const _, a as *mut _, len as usize, &mut done) } == 0 {
+        // Guard pages are untouched by definition (touching one commits it), so they're zero too.
+        let copy = prot != 0x01 && prot & PAGE_GUARD == 0;
+        if copy && unsafe { ReadProcessMemory(parent, a as *const _, a as *mut _, len as usize, &mut done) } == 0 {
             return Err(format!("copying guest memory {a:#x}+{len:#x} failed ({})", unsafe { GetLastError() }));
         }
         let mut old = 0;
@@ -288,6 +357,12 @@ pub fn dlog(msg: std::fmt::Arguments) {
     let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
 }
 
+/// Signal-event trace only (LX_SIGLOG): cheap enough not to change timing the way LX_DEBUG does.
+pub fn siglog() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LX_SIGLOG").is_some() || debug())
+}
+
 /// Verbose [lx] diagnostics, enabled by setting LX_DEBUG in the host environment.
 pub fn debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -302,6 +377,7 @@ pub fn install() {
     LX_TLS_OFF.store(0x1480 + 8 * idx as u64, Relaxed);
     crate::thread::set_main();
     unsafe { AddVectoredExceptionHandler(1, veh) };
+    signal::listen();
 }
 
 /// Rewrite every `syscall` in writable guest code at [addr, addr+len) to `ud2` and register the range.
@@ -505,9 +581,11 @@ fn lost_fs_base(c: &Context, fault_addr: u64, code_end: u64) -> bool {
 
 fn guest_crash(rec: &ExceptionRecord, c: &Context) -> ! {
     // One line, one write: several threads may fault at once.
-    let msg = format!("[lx] guest fault {:#x} at rip {:#x} (addr {:#x}) tid {} rsp {:#x} fs {:#x}
+    let mut m = MemoryBasicInformation::default();
+    unsafe { VirtualQuery(rec.info[1] as *const _, &mut m, size_of::<MemoryBasicInformation>()) };
+    let msg = format!("[lx] guest fault {:#x} at rip {:#x} (addr {:#x}: state {:#x} protect {:#x} alloc {:#x}) tid {} rsp {:#x} fs {:#x}
 ",
-        rec.code, c.rip, rec.info[1], unsafe { GetCurrentThreadId() }, c.rsp, ts().fs);
+        rec.code, c.rip, rec.info[1], m.state, m.protect, m.allocation_base, unsafe { GetCurrentThreadId() }, c.rsp, ts().fs);
     let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
     proc::exit(139) // 128 + SIGSEGV, like a shell would report
 }
@@ -533,12 +611,44 @@ fn dispatch(c: &mut Context) -> i64 {
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
         131 => signal::sigaltstack(a[0], a[1], c.rsp),
-        97 | 302 => prlimit(if c.rax == 97 { a[0] } else { a[1] }, if c.rax == 97 { a[1] } else { a[3] }),
         7 => fs::poll(a[0], a[1], a[2] as i32 as i64),
         271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
         34 => signal::sigsuspend(0),   // pause
         130 => signal::sigsuspend(a[0]),
-        16 => Err(ENOTTY),             // ioctl: no terminals yet
+        16 => fs::ioctl(a[0], a[1], a[2]),
+        17 => fs::pread(a[0], a[1], a[2], a[3], false),
+        18 => fs::pread(a[0], a[1], a[2], a[3], true),
+        19 => fs::readv(a[0], a[1], a[2]),
+        37 => { signal::set_alarm(a[0] * 1000, 0); Ok(0) } // alarm
+        38 => setitimer(a[0], a[1], a[2]),
+        90 | 91 | 268 => Ok(0),        // chmod, fchmod, fchmodat. ponytail: modes aren't stored yet (DESIGN.md §6)
+        92 | 93 | 94 | 260 => Ok(0),   // chown, fchown, lchown, fchownat: everything is root's anyway
+        97 => rlimit(a[0], 0, a[1]),   // getrlimit
+        160 => Ok(0),                  // setrlimit: accepted, not enforced
+        302 => rlimit(a[1], a[2], a[3]), // prlimit64 (self only)
+        98 => { unsafe { std::ptr::write_bytes(a[1] as *mut u8, 0, 144) }; Ok(0) } // getrusage: zeros
+        204 => sched_getaffinity(a[1], a[2]),
+        41 => net::sys_socket(a[0], a[1], a[2]),
+        42 => net::sys_connect(a[0], a[1], a[2]),
+        43 => net::sys_accept(a[0], a[1], a[2], 0),
+        44 => net::sys_sendto(a[0], a[1], a[2], a[3], a[4], a[5]),
+        45 => net::sys_recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]),
+        46 => net::sys_sendmsg(a[0], a[1], a[2]),
+        47 => net::sys_recvmsg(a[0], a[1], a[2]),
+        48 => net::sys_shutdown(a[0], a[1]),
+        49 => net::sys_bind(a[0], a[1], a[2]),
+        50 => net::sys_listen(a[0], a[1]),
+        51 => net::sys_getsockname(a[0], a[1], a[2], false),
+        52 => net::sys_getsockname(a[0], a[1], a[2], true),
+        53 => net::sys_socketpair(a[0], a[1], a[2], a[3]),
+        54 => net::sys_setsockopt(a[0], a[1], a[2], a[3], a[4]),
+        55 => net::sys_getsockopt(a[0], a[1], a[2], a[3], a[4]),
+        288 => net::sys_accept(a[0], a[1], a[2], a[3]),
+        213 => net::sys_epoll_create(0),
+        291 => net::sys_epoll_create(a[0]),
+        233 => net::sys_epoll_ctl(a[0], a[1], a[2], a[3]),
+        232 | 281 => net::sys_epoll_wait(a[0], a[1], a[2], a[3] as i32 as i64), // pwait: mask ignored
+        441 => net::sys_epoll_wait(a[0], a[1], a[2], timespec_ms(a[3])),
         20 => fs::writev(a[0], a[1], a[2]),
         22 => fs::pipe2(a[0], 0),
         21 => fs::faccessat(CWD, a[0]),
@@ -570,14 +680,23 @@ fn dispatch(c: &mut Context) -> i64 {
         89 => fs::readlinkat(CWD, a[0], a[1], a[2]),
         95 => Ok(0o022),               // umask
         96 => gettimeofday(a[0]),
-        102 | 104 | 107 | 108 => Ok(0), // getuid, getgid, geteuid, getegid: root in the container
+        102 | 107 => Ok(proc::UID.load(Relaxed) as i64), // getuid, geteuid
+        104 | 108 => Ok(proc::GID.load(Relaxed) as i64), // getgid, getegid
+        105 => proc::set_id(&proc::UID, a[0]),            // setuid
+        106 => proc::set_id(&proc::GID, a[0]),            // setgid
+        113 | 117 => proc::set_id(&proc::UID, a[1]),      // setreuid, setresuid: the effective id
+        114 | 119 => proc::set_id(&proc::GID, a[1]),      // setregid, setresgid
+        118 => proc::get_res(&proc::UID, [a[0], a[1], a[2]]), // getresuid
+        120 => proc::get_res(&proc::GID, [a[0], a[1], a[2]]), // getresgid
+        157 => Ok(0),                  // prctl (PR_SET_NAME, PR_SET_DUMPABLE, PR_SET_PDEATHSIG, ...): accepted
+        115 => Ok(0),                  // getgroups: no supplementary groups
+        116 => Ok(0),                  // setgroups: accepted
         109 => Ok(0),                  // setpgid. ponytail: no process groups / job control
         110 => proc::getppid(),
         111 | 112 | 121 => proc::getpid(), // getpgrp, setsid, getpgid
         158 if a[0] == 0x1002 => { ts().fs = a[1]; Ok(0) } // arch_prctl(ARCH_SET_FS)
         217 => fs::getdents64(a[0], a[1], a[2]),
         202 => thread::futex(a[0], a[1], a[2], a[3], a[5]),
-        204 => thread::sched_getaffinity(a[1], a[2]),
         324 => thread::membarrier(a[0]),
         218 => { ts().clear_tid = a[0]; thread::gettid() } // set_tid_address
         230 => clock_nanosleep(a[0], a[1], a[2]),
@@ -639,7 +758,11 @@ pub fn write_handle(h: isize, buf: u64, len: u64) -> R {
         return Ok(done as i64);
     }
     // ERROR_NO_DATA / ERROR_BROKEN_PIPE: the reader is gone. ponytail: EPIPE without SIGPIPE.
-    if matches!(unsafe { GetLastError() }, 232 | 109) { Err(EPIPE) } else { Err(EIO) }
+    match unsafe { GetLastError() } {
+        232 | 109 => Err(EPIPE),
+        995 => Err(EINTR), // a signal cancelled the write
+        _ => Err(EIO),
+    }
 }
 
 pub fn read_handle(h: isize, buf: u64, len: u64) -> R {
@@ -648,7 +771,11 @@ pub fn read_handle(h: isize, buf: u64, len: u64) -> R {
     if unsafe { ReadFile(h, buf as *mut u8, len, &mut done, std::ptr::null_mut()) } != 0 {
         return Ok(done as i64);
     }
-    if unsafe { GetLastError() } == 109 { Ok(0) } else { Err(EIO) } // ERROR_BROKEN_PIPE is EOF
+    match unsafe { GetLastError() } {
+        109 => Ok(0),       // ERROR_BROKEN_PIPE is EOF
+        995 => Err(EINTR),  // ERROR_OPERATION_ABORTED: a signal cancelled the read
+        _ => Err(EIO),
+    }
 }
 
 // ---- memory ----
@@ -820,21 +947,47 @@ fn gettimeofday(tv: u64) -> R {
 }
 
 fn nanosleep(ts: u64) -> R {
-    let [s, ns] = unsafe { *(ts as *const [u64; 2]) };
-    std::thread::sleep(std::time::Duration::new(s, ns as u32));
+    // ponytail: on EINTR the remaining time isn't written back; callers (sleep) just exit.
+    signal::interruptible_sleep(timespec_ms(ts).clamp(0, u32::MAX as i64 - 1) as u32)
+}
+
+/// Limits like a Docker container's defaults: 1M open files, 8 MB stack, the rest unlimited.
+/// ponytail: new limits are accepted but not enforced.
+fn rlimit(resource: u64, _new: u64, old: u64) -> R {
+    const INF: u64 = u64::MAX;
+    let (cur, max) = match resource {
+        3 => (8 << 20, INF),        // RLIMIT_STACK
+        7 => (1 << 20, 1 << 20),    // RLIMIT_NOFILE
+        _ => (INF, INF),
+    };
+    if old != 0 {
+        unsafe { *(old as *mut [u64; 2]) = [cur, max] };
+    }
     Ok(0)
 }
 
-/// getrlimit / prlimit64 (own process): generous fixed limits. Setting is accepted and ignored.
-fn prlimit(resource: u64, old: u64) -> R {
-    const INFINITY: u64 = u64::MAX;
-    let lim = match resource {
-        3 => [8 << 20, INFINITY],         // RLIMIT_STACK: 8 MiB, like the stack we give the main thread
-        7 => [1 << 20, 1 << 20],          // RLIMIT_NOFILE
-        _ => [INFINITY, INFINITY],
-    };
+/// All host CPUs are ours. Returns the mask size like the kernel does.
+fn sched_getaffinity(len: u64, mask: u64) -> R {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
+    if len < 8 {
+        return Err(EINVAL);
+    }
+    let bits = if cpus == 64 { u64::MAX } else { (1u64 << cpus) - 1 };
+    unsafe { *(mask as *mut u64) = bits };
+    Ok(8)
+}
+
+/// setitimer(ITIMER_REAL, {interval, value} as timevals, old).
+fn setitimer(which: u64, new: u64, old: u64) -> R {
+    if which != 0 {
+        return Err(EINVAL); // ITIMER_VIRTUAL / ITIMER_PROF
+    }
     if old != 0 {
-        unsafe { *(old as *mut [u64; 2]) = lim };
+        unsafe { *(old as *mut [u64; 4]) = [0; 4] };
+    }
+    if new != 0 {
+        let [is, ius, vs, vus] = unsafe { *(new as *const [u64; 4]) };
+        signal::set_alarm(vs * 1000 + vus / 1000, is * 1000 + ius / 1000);
     }
     Ok(0)
 }
