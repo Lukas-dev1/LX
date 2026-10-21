@@ -142,8 +142,8 @@ else
       grep -q "exited with code 137" "$OUT/nginx" && stuck=$((stuck + 1))
     done
     if [ $served = $((runs * 40)) ]; then ok "nginx: $served/$((runs * 40)) requests"; else bad "nginx: $served/$((runs * 40)) requests"; fi
-    # Known open bug: a worker sometimes misses its shutdown message and is SIGKILLed after ~3 s.
-    [ $stuck = 0 ] || note "nginx: $stuck/$runs stops had a worker killed after ~3 s (known bug)"
+    # A worker SIGKILLed at stop means it missed the shutdown (was: blocked in a shared accept(), fixed).
+    if [ $stuck = 0 ]; then ok "nginx: $runs/$runs stops clean"; else bad "nginx: $stuck/$runs stops had a worker killed after ~3 s"; fi
   fi
   # These need the internet (DNS + example.com): one retry, so a host/VPN DNS hiccup shows as a warning.
   online() { # online <name> <text> <lx args...>

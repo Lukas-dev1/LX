@@ -38,6 +38,29 @@ unsafe extern "system" {
     fn WSAPoll(fds: *mut WsaPollFd, n: u32, timeout: i32) -> i32;
 }
 
+#[link(name = "mswsock")]
+unsafe extern "system" {
+    fn AcceptEx(ls: usize, acc: usize, buf: *mut u8, rx: u32, local_len: u32, remote_len: u32, got: *mut u32, ov: *mut Overlapped) -> i32;
+    fn GetAcceptExSockaddrs(buf: *const u8, rx: u32, local_len: u32, remote_len: u32,
+        local: *mut *mut u8, local_n: *mut i32, remote: *mut *mut u8, remote_n: *mut i32);
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CancelIoEx(h: isize, ov: *mut Overlapped) -> i32;
+    fn GetOverlappedResult(h: isize, ov: *mut Overlapped, got: *mut u32, wait: i32) -> i32;
+    fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: isize,
+}
+
 const INVALID_SOCKET: usize = usize::MAX;
 const FIONBIO: i32 = 0x8004667Eu32 as i32;
 const FIONREAD: i32 = 0x4004667F;
@@ -560,18 +583,75 @@ pub fn sys_listen(fd: u64, backlog: u64) -> R {
     if unsafe { listen(s.s, backlog.min(i32::MAX as u64) as i32) } != 0 { Err(last_err()) } else { Ok(0) }
 }
 
+/// accept() that can't block, for IP listeners. Winsock's own accept() on a listening socket shared by
+/// several processes (nginx workers after fork) can block forever even in non-blocking mode, when another
+/// process takes the connection between our readiness check and the accept (probe/acceptrace.c). So:
+/// nothing pending -> EAGAIN; else an overlapped AcceptEx, and if it hasn't completed within 10 ms the
+/// connection went elsewhere: cancel, EAGAIN. Returns the new socket and the peer address.
+fn accept_nowait(ls: usize) -> Result<(usize, Vec<u8>), i64> {
+    let mut p = WsaPollFd { fd: ls, events: WSA_POLLRDNORM, revents: 0 };
+    if unsafe { WSAPoll(&mut p, 1, 0) } <= 0 {
+        return Err(EAGAIN);
+    }
+    let (mut la, mut ll) = ([0u8; 128], 128i32);
+    if unsafe { getsockname(ls, la.as_mut_ptr(), &mut ll) } != 0 {
+        return Err(last_err());
+    }
+    let acc = unsafe { socket(u16::from_le_bytes([la[0], la[1]]) as i32, 1, 0) }; // SOCK_STREAM, same family
+    if acc == INVALID_SOCKET {
+        return Err(last_err());
+    }
+    const ALEN: u32 = 128 + 16; // AcceptEx wants address space + 16 per side
+    let mut buf = [0u8; 2 * ALEN as usize];
+    let ev = unsafe { crate::win::CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+    let mut ov = Overlapped { event: ev, ..Default::default() };
+    let mut got = 0u32;
+    let done = unsafe {
+        if AcceptEx(ls, acc, buf.as_mut_ptr(), 0, ALEN, ALEN, &mut got, &mut ov) != 0 {
+            true
+        } else if WSAGetLastError() != 997 { // not ERROR_IO_PENDING: a real error
+            let e = last_err();
+            crate::win::CloseHandle(ev);
+            closesocket(acc);
+            return Err(e);
+        } else {
+            if WaitForSingleObject(ev, 10) != 0 {
+                CancelIoEx(ls as isize, &mut ov);
+            }
+            // After a cancel the result still says whether a connection got in first.
+            GetOverlappedResult(ls as isize, &mut ov, &mut got, 1) != 0
+        }
+    };
+    unsafe { crate::win::CloseHandle(ev) };
+    if !done {
+        unsafe { closesocket(acc) };
+        return Err(EAGAIN);
+    }
+    unsafe {
+        setsockopt(acc, 0xffff, 0x700B, (&ls as *const usize).cast(), size_of::<usize>() as i32); // SO_UPDATE_ACCEPT_CONTEXT
+        let (mut lp, mut rp) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let (mut ln, mut rn) = (0i32, 0i32);
+        GetAcceptExSockaddrs(buf.as_ptr(), 0, ALEN, ALEN, &mut lp, &mut ln, &mut rp, &mut rn);
+        Ok((acc, std::slice::from_raw_parts(rp, rn.max(0) as usize).to_vec()))
+    }
+}
+
 pub fn sys_accept(fd: u64, addr: u64, lenp: u64, flags: u64) -> R {
     let s = fs::sock(fd)?;
-    let mut a = [0u8; 128];
+    let unix = s.unix.lock().unwrap().is_some();
     let new = s.op(POLLIN, false, || {
-        let mut alen = a.len() as i32;
+        if !unix {
+            return accept_nowait(s.s);
+        }
+        // ponytail: AF_UNIX listeners use plain accept(); Windows' AF_UNIX has no AcceptEx.
+        let (mut a, mut alen) = ([0u8; 128], 128i32);
         let n = unsafe { accept(s.s, a.as_mut_ptr(), &mut alen) };
-        if n == INVALID_SOCKET { Err(last_err()) } else { Ok((n, alen as usize)) }
+        if n == INVALID_SOCKET { Err(last_err()) } else { Ok((n, a[..alen as usize].to_vec())) }
     })?;
-    if u16::from_le_bytes([a[0], a[1]]) == AF_UNIX {
+    if unix {
         unix_out(None, addr, lenp); // the connecting side is unnamed
     } else {
-        addr_out(&a[..new.1], addr, lenp);
+        addr_out(&new.1, addr, lenp);
     }
     let sock = Sock::new(new.0, flags & SOCK_NONBLOCK != 0);
     Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), flags & SOCK_CLOEXEC != 0))
