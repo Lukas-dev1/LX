@@ -959,6 +959,21 @@ pub fn sys_getsockopt(fd: u64, level: u64, name: u64, val: u64, lenp: u64) -> R 
             return int(t);
         }
         (1, 2) | (1, 15) => return int(0),                     // SO_REUSEADDR / SO_REUSEPORT: as set (ignored)
+        (1, 38) | (1, 39) => {
+            // SO_PROTOCOL, SO_DOMAIN (Python's socket(fileno=fd) asks both).
+            let mut a = [0u8; 128];
+            let mut len = a.len() as i32;
+            unsafe { getsockname(s.s, a.as_mut_ptr(), &mut len) };
+            let unix = s.udgram || a[0] == AF_UNIX as u8;
+            let (mut t, mut tl) = (0i32, 4i32);
+            unsafe { getsockopt(s.s, 0xffff, 0x1008, (&mut t as *mut i32).cast(), &mut tl) }; // SO_TYPE
+            return int(match name {
+                39 if unix => 1,
+                39 => if a[0] == 23 { 10 } else { 2 }, // AF_INET6 is 23 on Windows, 10 on Linux
+                _ if unix => 0,
+                _ => if t == 1 { 6 } else { 17 },        // IPPROTO_TCP / IPPROTO_UDP
+            });
+        }
         _ => {}
     }
     let Some((l, n)) = sockopt(level, name) else { return Err(ENOPROTOOPT) };
