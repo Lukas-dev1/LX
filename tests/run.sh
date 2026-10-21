@@ -234,6 +234,16 @@ wait $job
 start=$(date +%s); wait $ejob; took=$(( $(date +%s) - start ))
 if [ "$out" = "inside hi /tmp 65534" ] && [ $took -lt 10 ]; then ok "lx exec into a running container"; else bad "lx exec: got '$out', exec'd process outlived the container by ${took}s"; fi
 
+# lx run -d returns at once with the pid (even inside $(...)), the container runs on, lx logs has its output.
+start=$(date +%s)
+dpid=$($LX run -d alpine sh -c 'echo started; sleep 60')
+took=$(( $(date +%s) - start ))
+sleep 2
+logs=$($LX logs "$dpid" 2>&1)
+listed=$($LX ps | awk -v p="$dpid" '$1 == p' | wc -l)
+$LX stop "$dpid" > /dev/null 2>&1
+if [ $took -lt 5 ] && [ "$listed" = 1 ] && [ "$logs" = started ]; then ok "lx run -d + lx logs"; else bad "lx run -d: ${took}s, listed $listed, logs '$logs'"; fi
+
 # Only this checkout's lx.exe (every lx of a container runs it): another worktree's containers may run.
 exe=$(cygpath -w "$ROOT/target/release/lx.exe")
 left=$(powershell -NoProfile -Command "@(Get-CimInstance Win32_Process -Filter \"Name='lx.exe'\" | Where-Object ExecutablePath -eq '$exe').Count" | tr -d '\r')

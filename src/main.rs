@@ -250,6 +250,8 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
                                              -e NAME=value (or -e NAME: the host's) sets an env var
                                              -w /dir sets the working directory
                                              -u user[:group] runs as that user (default: the image's USER)
+       lx run -d ...                         the same in the background: prints the container's pid
+       lx logs <pid>                         output of a `lx run -d` container
        lx exec [-e ..] [-w dir] [-u user] <pid> <command> [args...]
                                              runs a command inside a running container
        lx ps                                 running containers
@@ -321,6 +323,18 @@ fn run() -> Result<(), String> {
         let sig = rest.first().map_or(Some(15), |s| signal::parse(s)).ok_or("unknown signal")?;
         return proc::send(pid, sig).map(|_| ()).map_err(|_| format!("{pid}: no such lx process"));
     }
+    if let [cmd, rest @ ..] = args.as_slice() && cmd == "run" && let Some(i) = detach_flag(rest) {
+        let mut run_args = rest.to_vec();
+        run_args.remove(i);
+        return detach(&run_args);
+    }
+    if let [cmd, pid] = args.as_slice() && cmd == "logs" {
+        let pid: u32 = pid.parse().map_err(|_| format!("bad pid {pid}"))?;
+        let log = proc::log_of(pid).ok_or(format!("{pid}: no log (only `lx run -d` containers have one)"))?;
+        let text = std::fs::read(&log).map_err(|e| format!("{log}: {e}"))?;
+        std::io::Write::write_all(&mut std::io::stdout(), &text).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     if let [cmd, rest @ ..] = args.as_slice() && cmd == "run" {
         // Flags before the image: -p/--publish [hostip:]hostport:containerport[/udp], repeatable.
         let (mut rest, mut ports) = (rest, Vec::new());
@@ -390,6 +404,49 @@ fn run() -> Result<(), String> {
     fs::init(root);
     let env = vec![format!("PATH={PATH}"), "HOME=/root".into(), "HOSTNAME=lx".into()];
     start(cmd, std::iter::once(cmd).chain(rest).cloned().collect(), env)
+}
+
+/// Where `-d`/`--detach` is among `lx run`'s flags (each of the others takes a value).
+fn detach_flag(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        match a.as_str() {
+            "-d" | "--detach" => return Some(i),
+            a if a.starts_with('-') => i += 2,
+            _ => return None, // the image
+        }
+    }
+    None
+}
+
+/// `lx run -d ...`: the same `lx run` as a background process with its output in a log file (`lx logs`);
+/// prints the container's pid, like `docker run -d` prints its id. It leaves the caller's job object if it
+/// may, so closing the terminal that started it doesn't end it. ponytail: logs stay until removed by hand.
+fn detach(run_args: &[String]) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x8;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let logs = std::path::Path::new("rootfs/logs");
+    std::fs::create_dir_all(logs).map_err(|e| e.to_string())?;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let log = std::fs::canonicalize(logs).map_err(|e| e.to_string())?.join(format!("{nanos}.log"));
+    let out = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let spawn = |flags: u32| -> std::io::Result<std::process::Child> {
+        std::process::Command::new(env::current_exe()?).arg("run").args(run_args)
+            .stdin(std::process::Stdio::null()).stdout(out.try_clone()?).stderr(out.try_clone()?)
+            .creation_flags(flags).spawn()
+    };
+    // Our own stdin/out/err (a shell's pipe, for `pid=$(lx run -d ...)`) must not leak into the
+    // background process, or whoever reads that pipe waits for the container to end.
+    for std in [-10i32, -11, -12] {
+        unsafe { win::SetHandleInformation(win::GetStdHandle(std as u32), 1, 0) }; // HANDLE_FLAG_INHERIT off
+    }
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    let child = spawn(base | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(base)).map_err(|e| e.to_string())?;
+    proc::set_log(child.id(), &log.to_string_lossy());
+    println!("{}", child.id());
+    Ok(())
 }
 
 /// `lx exec [-e NAME[=value]] [-w DIR] [-u USER] <pid> <command> [args...]`, like `docker exec`: the command

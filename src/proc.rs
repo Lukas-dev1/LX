@@ -375,6 +375,16 @@ pub fn register_container(desc: &str, config: &str) {
     CONTAINER.store(true, Relaxed);
 }
 
+/// `lx run -d`: where container `pid`'s output goes (`lx logs`). Kept after it exits, like Docker's logs.
+pub fn set_log(pid: u32, path: &str) {
+    let _ = std::fs::create_dir_all(RUNNING);
+    let _ = std::fs::write(format!("{RUNNING}/{pid}.log"), path);
+}
+
+pub fn log_of(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("{RUNNING}/{pid}.log")).ok()
+}
+
 /// A running container's config (see register_container).
 pub fn container_config(pid: u32) -> Option<String> {
     send(pid, 0).ok()?;
