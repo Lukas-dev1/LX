@@ -351,14 +351,20 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
 
 /// A fault in guest code (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP) with `si_code` and `si_addr`: the frame
 /// for the guest's handler, which may fix the cause or move `rip` in the ucontext (HotSpot's implicit null
-/// checks and safepoint polls). None when there's no handler, or it's ignored or blocked: the guest dies.
+/// checks and safepoint polls). None when there's no handler or it's ignored: the guest dies.
+/// ponytail: the mask is process-wide, so while one thread runs its SIGSEGV handler the signal reads as
+/// blocked for all (HotSpot died in 1 of 10 runs): a fault ignores the mask and leaves it as it was.
+/// Per-thread masks would make this exact.
 pub fn fault(c: &mut Context, sig: u64, code: u64, addr: u64) -> Option<Vec<u8>> {
     let mut s = S.lock().unwrap();
     let a = s.actions[sig as usize];
-    if a.handler <= 1 || s.blocked & bit(sig) != 0 {
+    if a.handler <= 1 {
         return None;
     }
-    Some(frame(&mut s, c, sig, a, code, addr))
+    let (blocked, suspended) = (s.blocked, s.suspended_mask.take()); // another thread may be in sigsuspend
+    let f = frame(&mut s, c, sig, a, code, addr);
+    (s.blocked, s.suspended_mask) = (blocked, suspended);
+    Some(f)
 }
 
 /// Point `c` at the handler for `sig` and build its signal frame (see `deliver`).
