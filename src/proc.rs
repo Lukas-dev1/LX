@@ -366,10 +366,29 @@ const RUNNING: &str = "rootfs/containers";
 
 /// Record this top-level `lx run` so `lx ps` can list it (removed again on exit; stale entries,
 /// e.g. after a hard kill, are filtered out by checking the pid is still alive).
-pub fn register_container(desc: &str) {
+/// `config` (JSON) is what `lx exec` needs to step in, kept beside it as `<pid>.json`.
+pub fn register_container(desc: &str, config: &str) {
     let _ = std::fs::create_dir_all(RUNNING);
-    let _ = std::fs::write(format!("{RUNNING}/{}", unsafe { GetCurrentProcessId() }), desc);
+    let pid = unsafe { GetCurrentProcessId() };
+    let _ = std::fs::write(format!("{RUNNING}/{pid}.json"), config);
+    let _ = std::fs::write(format!("{RUNNING}/{pid}"), desc);
     CONTAINER.store(true, Relaxed);
+}
+
+/// `lx run -d`: where container `pid`'s output goes (`lx logs`). Kept after it exits, like Docker's logs.
+pub fn set_log(pid: u32, path: &str) {
+    let _ = std::fs::create_dir_all(RUNNING);
+    let _ = std::fs::write(format!("{RUNNING}/{pid}.log"), path);
+}
+
+pub fn log_of(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("{RUNNING}/{pid}.log")).ok()
+}
+
+/// A running container's config (see register_container).
+pub fn container_config(pid: u32) -> Option<String> {
+    send(pid, 0).ok()?;
+    std::fs::read_to_string(format!("{RUNNING}/{pid}.json")).ok()
 }
 static CONTAINER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -412,6 +431,7 @@ pub fn ps() -> Vec<(u32, String)> {
             v.push((pid, std::fs::read_to_string(e.path()).unwrap_or_default()));
         } else {
             let _ = std::fs::remove_file(e.path());
+            let _ = std::fs::remove_file(format!("{RUNNING}/{pid}.json"));
         }
     }
     v
@@ -431,7 +451,9 @@ pub fn exit(code: u64) -> ! {
         crate::syscall::dlog(format_args!("pid {} exit {}", unsafe { GetCurrentProcessId() }, code as u8));
     }
     if CONTAINER.load(Relaxed) {
-        let _ = std::fs::remove_file(format!("{RUNNING}/{}", unsafe { GetCurrentProcessId() }));
+        let pid = unsafe { GetCurrentProcessId() };
+        let _ = std::fs::remove_file(format!("{RUNNING}/{pid}"));
+        let _ = std::fs::remove_file(format!("{RUNNING}/{pid}.json"));
     }
     if let Ok(g) = LAYER.try_lock() && let Some(dir) = g.as_ref() {
         let _ = std::fs::remove_dir_all(dir); // the container's changes go with it (docker run --rm)

@@ -108,6 +108,12 @@ expect "java -version (HotSpot's SIGSEGV use)" 0 "OpenJDK 64-Bit Server VM" -- r
 # -e adds and overrides the image's env (PYTHON_VERSION is set by the image), -w sets the directory.
 expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERSION=9 -w /usr python:3.12-alpine sh -c 'echo A=$A V=$PYTHON_VERSION $(pwd)'
 expect "run -u / USER + HOME"      0 "65534:65533 HOME=/." -- run -u nobody:nogroup alpine sh -c 'echo $(id -u):$(id -g) HOME=$HOME.'
+# lx build: an image from guest/buildctx/Dockerfile, then run (and the base image keeps its /etc/motd).
+expect "lx build"                  0 "built lxtest-build:1" -- build -t lxtest-build:1 --build-arg FLAVOR=spicy guest/buildctx
+expect "lx build: run the image"   0 "hello from lx build: spicy in /srv/app as builder, motd gone, owned.sh nobody" -- run lxtest-build:1
+expect "lx build: base untouched"  0 "motd kept" -- run alpine sh -c 'test -e /etc/motd && echo motd kept'
+expect "lx build: multi-stage"     0 "built lxtest-multi:1" -- build -t lxtest-multi:1 -f guest/buildctx/Dockerfile.multi guest/buildctx
+expect "lx build: COPY --from"     0 "made in stage make, mode 600" -- run lxtest-multi:1
 # A daemon outlives the process that started it (redis --daemonize forks; its parent exits at once).
 expect "redis: daemonized server"  0 "PONG" -- run redis:alpine sh -c 'redis-server --port 6390 --daemonize yes > /dev/null; sleep 2; redis-cli -p 6390 ping; redis-cli -p 6390 shutdown nosave'
 expect "postgres: initdb, pg_ctl start, query, stop" 0 "answer 42" -- run -v "$GUEST" postgres:alpine sh /t/pgtest.sh
@@ -221,6 +227,32 @@ stop_test() { # stop_test <mode> <expected exit> [text]
 stop_test handler 7 "got TERM"
 stop_test busy 143
 stop_test exec 143
+
+# lx exec: a command in a running container sees its files, env and directory (here as another user),
+# and an exec'd process ends with the container.
+tag=exectest-$$
+$LX run -e GREETING=hi -w /tmp alpine sh -c "echo inside > /tmp/marker; sleep 60 # $tag" < /dev/null > /dev/null 2>&1 &
+job=$!
+for _ in $(seq 100); do cpid=$($LX ps | awk -v t="$tag" 'index($0, t) {print $1; exit}'); [ -n "$cpid" ] && break; sleep 0.1; done
+sleep 1
+out=$($LX exec -u nobody "$cpid" sh -c 'echo "$(cat /tmp/marker) $GREETING $(pwd) $(id -u)"' 2>&1)
+$LX exec "$cpid" sleep 60 < /dev/null > /dev/null 2>&1 &
+ejob=$!
+sleep 1
+$LX stop "$cpid" > /dev/null
+wait $job
+start=$(date +%s); wait $ejob; took=$(( $(date +%s) - start ))
+if [ "$out" = "inside hi /tmp 65534" ] && [ $took -lt 10 ]; then ok "lx exec into a running container"; else bad "lx exec: got '$out', exec'd process outlived the container by ${took}s"; fi
+
+# lx run -d returns at once with the pid (even inside $(...)), the container runs on, lx logs has its output.
+start=$(date +%s)
+dpid=$($LX run -d alpine sh -c 'echo started; sleep 60')
+took=$(( $(date +%s) - start ))
+sleep 2
+logs=$($LX logs "$dpid" 2>&1)
+listed=$($LX ps | awk -v p="$dpid" '$1 == p' | wc -l)
+$LX stop "$dpid" > /dev/null 2>&1
+if [ $took -lt 5 ] && [ "$listed" = 1 ] && [ "$logs" = started ]; then ok "lx run -d + lx logs"; else bad "lx run -d: ${took}s, listed $listed, logs '$logs'"; fi
 
 # Only this checkout's lx.exe (every lx of a container runs it): another worktree's containers may run.
 exe=$(cygpath -w "$ROOT/target/release/lx.exe")
