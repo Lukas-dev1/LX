@@ -341,51 +341,71 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
                 proc::exit(128 + sig); // default action: terminate, reported like a shell would
             }
             1 => continue, // SIG_IGN
-            handler => {
-                let restore_mask = s.suspended_mask.take().unwrap_or(s.blocked);
-                // Below the red zone: [return address = restorer][ucontext][siginfo].
-                // SA_ONSTACK handlers start at the top of the thread's alternate stack, unless already on it.
-                let t = crate::syscall::ts();
-                let alt = t.altstack.filter(|&(b, n)| a.flags & SA_ONSTACK != 0 && !(b..b + n).contains(&c.rsp));
-                let top = alt.map(|(b, n)| b + n).unwrap_or(c.rsp - 128); // else below the red zone
-                let info = (top - SI_SIZE) & !15;
-                let uc = (info - UC_SIZE) & !15;
-                let sp = uc - 8; // handler entry: rsp % 16 == 8, as after a call
-                let mut frame = vec![0u8; (info + SI_SIZE - sp) as usize];
-                let mut put = |addr: u64, v: u64| {
-                    let o = (addr - sp) as usize;
-                    frame[o..o + 8].copy_from_slice(&v.to_le_bytes());
-                };
-                put(sp, a.restorer);
-                put(info, sig); // si_signo (low half), si_errno 0
-                put(info + 8, if sig == SIGCHLD { 1 } else { 0 }); // si_code: CLD_EXITED / SI_USER
-                let flags = c.eflags as u64;
-                for (i, r) in gregs(c).into_iter().enumerate() {
-                    put(uc + UC_MCONTEXT + 8 * i as u64, *r);
-                }
-                put(uc + UC_MCONTEXT + 8 * 17, flags);
-                put(uc + UC_SIGMASK, restore_mask);
-                if let Some((b, n)) = t.altstack {
-                    // uc_stack describes the alternate stack (Go reads it back).
-                    let on_alt = alt.is_some() || (b..b + n).contains(&c.rsp);
-                    put(uc + 16, b);
-                    put(uc + 24, if on_alt { SS_ONSTACK } else { 0 });
-                    put(uc + 32, n);
-                } else {
-                    put(uc + 24, SS_DISABLE);
-                }
-                if crate::syscall::siglog() {
-                    crate::syscall::dlog(format_args!("signal {sig}: handler {handler:#x}, frame {sp:#x}, interrupted rip {:#x} rsp {:#x}, alt {:?}", c.rip, c.rsp, alt));
-                }
-                (c.rsp, c.rip, c.rdi, c.rsi, c.rdx) = (sp, handler, sig, info, uc);
-                s.blocked |= (a.mask | if a.flags & SA_NODEFER == 0 { bit(sig) } else { 0 }) & !UNBLOCKABLE;
-                if a.flags & SA_RESETHAND != 0 {
-                    s.actions[sig as usize] = DFL;
-                }
-                return Some(frame); // one handler at a time; the rest go when it returns via rt_sigreturn
+            _ => {
+                let code = if sig == SIGCHLD { 1 } else { 0 }; // si_code: CLD_EXITED / SI_USER
+                return Some(frame(&mut s, c, sig, a, code, 0)); // one handler at a time; the rest go when it returns via rt_sigreturn
             }
         }
     }
+}
+
+/// A fault in guest code (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP) with `si_code` and `si_addr`: the frame
+/// for the guest's handler, which may fix the cause or move `rip` in the ucontext (HotSpot's implicit null
+/// checks and safepoint polls). None when there's no handler, or it's ignored or blocked: the guest dies.
+pub fn fault(c: &mut Context, sig: u64, code: u64, addr: u64) -> Option<Vec<u8>> {
+    let mut s = S.lock().unwrap();
+    let a = s.actions[sig as usize];
+    if a.handler <= 1 || s.blocked & bit(sig) != 0 {
+        return None;
+    }
+    Some(frame(&mut s, c, sig, a, code, addr))
+}
+
+/// Point `c` at the handler for `sig` and build its signal frame (see `deliver`).
+fn frame(s: &mut State, c: &mut Context, sig: u64, a: Action, code: u64, addr: u64) -> Vec<u8> {
+    let handler = a.handler;
+    let restore_mask = s.suspended_mask.take().unwrap_or(s.blocked);
+    // Below the red zone: [return address = restorer][ucontext][siginfo].
+    // SA_ONSTACK handlers start at the top of the thread's alternate stack, unless already on it.
+    let t = crate::syscall::ts();
+    let alt = t.altstack.filter(|&(b, n)| a.flags & SA_ONSTACK != 0 && !(b..b + n).contains(&c.rsp));
+    let top = alt.map(|(b, n)| b + n).unwrap_or(c.rsp - 128); // else below the red zone
+    let info = (top - SI_SIZE) & !15;
+    let uc = (info - UC_SIZE) & !15;
+    let sp = uc - 8; // handler entry: rsp % 16 == 8, as after a call
+    let mut frame = vec![0u8; (info + SI_SIZE - sp) as usize];
+    let mut put = |addr: u64, v: u64| {
+        let o = (addr - sp) as usize;
+        frame[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    };
+    put(sp, a.restorer);
+    put(info, sig); // si_signo (low half), si_errno 0
+    put(info + 8, code); // si_code (low half)
+    put(info + 16, addr); // si_addr, for faults
+    let flags = c.eflags as u64;
+    for (i, r) in gregs(c).into_iter().enumerate() {
+        put(uc + UC_MCONTEXT + 8 * i as u64, *r);
+    }
+    put(uc + UC_MCONTEXT + 8 * 17, flags);
+    put(uc + UC_SIGMASK, restore_mask);
+    if let Some((b, n)) = t.altstack {
+        // uc_stack describes the alternate stack (Go reads it back).
+        let on_alt = alt.is_some() || (b..b + n).contains(&c.rsp);
+        put(uc + 16, b);
+        put(uc + 24, if on_alt { SS_ONSTACK } else { 0 });
+        put(uc + 32, n);
+    } else {
+        put(uc + 24, SS_DISABLE);
+    }
+    if crate::syscall::siglog() {
+        crate::syscall::dlog(format_args!("signal {sig}: handler {handler:#x}, frame {sp:#x}, interrupted rip {:#x} rsp {:#x}, alt {:?}", c.rip, c.rsp, alt));
+    }
+    (c.rsp, c.rip, c.rdi, c.rsi, c.rdx) = (sp, handler, sig, info, uc);
+    s.blocked |= (a.mask | if a.flags & SA_NODEFER == 0 { bit(sig) } else { 0 }) & !UNBLOCKABLE;
+    if a.flags & SA_RESETHAND != 0 {
+        s.actions[sig as usize] = DFL;
+    }
+    frame
 }
 
 /// rt_sigreturn: the handler's restorer called it with rsp at our ucontext. Restore everything.

@@ -644,16 +644,19 @@ unsafe extern "C" {
 /// Resume, entering a signal handler first if `deliver` prepared a frame.
 fn resume_with_signals(c: &mut Context) -> i32 {
     match signal::deliver(c) {
-        Some(frame) => {
-            let t = ts();
-            t.frame[..frame.len()].copy_from_slice(&frame);
-            t.frame_len = frame.len() as u64;
-            t.resume = c.rip;
-            c.rip = lx_sig_tramp as *const () as u64;
-            EXCEPTION_CONTINUE_EXECUTION
-        }
+        Some(frame) => enter_handler(c, frame),
         None => resume(c, c.rip),
     }
+}
+
+/// Continue in the signal handler `c` now points at; the trampoline puts `frame` at its rsp.
+fn enter_handler(c: &mut Context, frame: Vec<u8>) -> i32 {
+    let t = ts();
+    t.frame[..frame.len()].copy_from_slice(&frame);
+    t.frame_len = frame.len() as u64;
+    t.resume = c.rip;
+    c.rip = lx_sig_tramp as *const () as u64;
+    EXCEPTION_CONTINUE_EXECUTION
 }
 
 // Call f(arg) with rsp switched to `top` (Win64 ABI: rcx = top, rdx = f, r8 = arg).
@@ -754,7 +757,30 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
             if patchlog() { dlog(format_args!("FS-base fault at rip {:#x} rsp {:#x}", c.rip, c.rsp)); }
             resume(c, c.rip)
         }
-        _ => guest_crash(rec, c),
+        _ => match fault_signal(rec, c).and_then(|(sig, code, addr)| signal::fault(c, sig, code, addr)) {
+            Some(frame) => enter_handler(c, frame),
+            None => guest_crash(rec, c),
+        },
+    }
+}
+
+/// The Linux signal for a guest fault: (signal, si_code, si_addr).
+fn fault_signal(rec: &ExceptionRecord, c: &Context) -> Option<(u64, u64, u64)> {
+    const STATUS_GUARD_PAGE: u32 = 0x8000_0001;
+    const STATUS_INT_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
+    const STATUS_INT_OVERFLOW: u32 = 0xC000_0095;
+    match rec.code {
+        STATUS_ACCESS_VIOLATION | STATUS_GUARD_PAGE => {
+            let addr = rec.info[1] as u64;
+            let mut m = MemoryBasicInformation::default();
+            unsafe { VirtualQuery(addr as *const _, &mut m, size_of::<MemoryBasicInformation>()) };
+            const MEM_COMMIT: u32 = 0x1000;
+            Some((11, if m.state == MEM_COMMIT { 2 } else { 1 }, addr)) // SIGSEGV: SEGV_ACCERR / SEGV_MAPERR
+        }
+        STATUS_INT_DIVIDE_BY_ZERO => Some((8, 1, c.rip)), // SIGFPE, FPE_INTDIV
+        STATUS_INT_OVERFLOW => Some((8, 2, c.rip)),       // FPE_INTOVF
+        STATUS_ILLEGAL_INSTRUCTION => Some((4, 1, c.rip)), // SIGILL, ILL_ILLOPC
+        _ => None,
     }
 }
 
