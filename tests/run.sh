@@ -67,13 +67,13 @@ done
 ALPINE_IMG=$STORE/library_alpine/latest/rootfs
 PY_IMG=$STORE/library_python/3.12-alpine/rootfs
 cleanup() {
-  rm -f "$ALPINE_IMG/sigtest.sh" "$PY_IMG/nettest.py" "$PY_IMG/nettest.sh"
+  rm -f "$ALPINE_IMG/sigtest.sh" "$PY_IMG/nettest.py"
   rm -rf "$OUT"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 cp guest/sigtest.sh "$ALPINE_IMG/"
-cp guest/nettest.py guest/nettest.sh "$PY_IMG/"
+cp guest/nettest.py "$PY_IMG/"
 
 # ---- single runs ----
 expect() { # expect <name> <exit code> <text in output> -- <lx args...>
@@ -151,7 +151,7 @@ else
     bad "$name"; tail -3 "$OUT/net"
   }
   online "wget (DNS + HTTP out)" "<title>Example Domain</title>" run alpine wget -qO- http://example.com
-  online "python sockets + threaded server" "20/20 responses" run python:3.12-alpine sh /nettest.sh
+  online "python3 /script.py: sockets + threaded server" "20/20 responses" run python:3.12-alpine python3 /nettest.py
 fi
 
 stop_test() { # stop_test <mode> <expected exit> [text]

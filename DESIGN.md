@@ -3,17 +3,18 @@
 `lx` runs unmodified x86-64 Linux user-space binaries as ordinary Windows processes. It needs no hypervisor, WSL, or kernel driver. Guest code runs natively on the CPU. Only the kernel boundary (`syscall`) and a few ABI differences are translated.
 
 ```
-┌─────────────── one Windows process per Linux process ───────────────┐
-│  guest ELF code (native x86-64)                                     │
-│     │ syscall ──patched──> ud2 ──#UD──┐                             │
-│     │ %fs: access (base lost) ──#AV───┤                             │
-│                                       ▼                             │
-│  lx runtime: vectored exception handler                             │
-│     ├─ syscall table  → NT / Win32 / user-space emulation           │
-│     └─ fs_tramp       → wrfsbase + resume (user mode, no kernel)    │
-│                                                                     │
-│  confinement: job object (+ AppContainer/restricted token, planned) │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────── one Windows process per Linux process ────────────────┐
+│  guest ELF code (native x86-64), rewritten at load / mmap(PROT_EXEC):  │
+│     syscall   ──jmp──> stub ──> lx_sys_entry (switch to lx stack)  ─┐ │
+│     %fs: x    ──jmp──> stub: same access via the guest FS base held │ │
+│                        in ThreadState (no FS register, no fault)    │ │
+│     unrewritable site ──ud2 / #AV──> vectored exception handler ────┤ │
+│                                                                     ▼ │
+│  lx runtime (on its own per-thread stack): syscall table → NT/Win32/  │
+│  user-space emulation; signals delivered on the way back (iretq)      │
+│                                                                       │
+│  confinement: job object (+ AppContainer/restricted token, planned)   │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 1. The NT facts that shape everything (measured on this machine, Win11 26200)
@@ -21,9 +22,10 @@
 | Fact | Probe | Consequence |
 |---|---|---|
 | `wrfsbase` works in user mode | `probe/fsbase2.c` | Linux TLS (`%fs:`) can point at guest memory with no kernel help. |
-| NT resets FS base to 0 on context switches and kernel transitions | `probe/fsbase2.c`, `probe/fsbase3.c` (~100 losses/s/thread) | We can't set FS base once. It must be restored lazily (§4). |
+| NT resets FS base to 0 on context switches and kernel transitions | `probe/fsbase2.c`, `probe/fsbase3.c` (~100 losses/s/thread) | We can't rely on FS base. `%fs:` accesses are rewritten to not use it (§4). |
 | A raw `syscall` goes to the **NT** kernel with Linux numbers | — | Every `syscall` must be found and rewritten before it runs (§3). |
-| The NT exception path writes below `rsp` | — | Exception-based traps can clobber the SysV 128-byte red zone (§7, risk). It also means the `CONTEXT` being edited, and the handler's own frames, sit exactly where a signal frame goes, so signal frames are copied in by a trampoline after `NtContinue` (§5). |
+| The NT exception path writes ~2.7 KB below `rsp` (CONTEXT + XSAVE + dispatcher frames) | `LX_DEBUG` measurement | A Linux kernel never touches the user stack, and Go runs syscalls on 8–16 KB stacks: traps corrupted neighbouring goroutine stacks. Hot paths therefore avoid exceptions entirely (§3, §4). On the trap fallback, the `CONTEXT` being edited sits exactly where a signal frame goes, so there the frame is copied in by a trampoline after `NtContinue`. |
+| `ExitThread` frees the stack named by `TEB.DeallocationStack` | crash in `pthread_join` | Guest threads point the TEB at the guest stack (for on-demand growth), so they restore the host thread's TEB stack fields before `ExitThread`. Otherwise the guest's thread mapping (with musl's pthread struct) is freed. |
 | `RtlCloneUserProcess` gives a working copy-on-write child… | `probe/clone.c` | …but that child crashes in `CreateProcessW` (`probe/clone2.c`), and a forked shell child must exec. `fork` is spawn-and-copy instead (§5). |
 
 ## 2. ELF loader (`src/elf.rs`)
@@ -32,7 +34,8 @@
 - Reserves the whole `PT_LOAD` span with one `VirtualAlloc`, aligned to 64 KiB because NT reserves memory in 64 KiB units. `ET_EXEC` maps at its linked address. `ET_DYN` (static-pie) maps anywhere with a load bias, and musl's `rcrt1` relocates itself.
 - Copies segments, zero-fills `.bss`, patches syscalls, then applies `R/W/X` with `VirtualProtect`.
 - Builds the SysV initial stack: `argc, argv[], envp[], auxv[]`, with `AT_PHDR`, `AT_PHNUM`, `AT_ENTRY`, `AT_RANDOM` (BCrypt), `AT_PAGESZ` and the rest, 16-byte aligned. It then jumps to `e_entry` with `rdx = 0`.
-- **Next:** `PT_INTERP`. Load `ld-musl` or `ld-linux` as a second image and pass `AT_BASE`. This is the same code path again. Dynamic linking then becomes plain `mmap` and `open` syscalls.
+- `PT_INTERP`: the interpreter (`ld-musl`, `ld-linux`) is loaded as a second image and gets `AT_BASE`; dynamic linking is then plain `mmap`/`open`. `#!` scripts are resolved by the loader too (up to 4 levels).
+- The main thread's stack is reserved at 8 MB with the top 256 KB committed and a guard page below; NT grows it on demand because the TEB describes it.
 
 ## 3. Syscall interception: direct jumps, trap fallback
 
@@ -58,15 +61,15 @@ Unrewritten `%fs:` sites keep the exact fault-and-reload fallback: decode the fa
 
 | Group | Linux | NT mapping | Status |
 |---|---|---|---|
-| Process bootstrap | `arch_prctl`, `set_tid_address`, `exit`, `exit_group` | FS emulation, `ExitProcess` | ✅ |
+| Process bootstrap | `arch_prctl`, `set_tid_address`, `exit`, `exit_group` | FS base kept in `ThreadState`; `exit` ends the thread (the last one ends the process), `exit_group` → `TerminateProcess` | ✅ |
 | stdio | `read`, `write`, `writev`, `ioctl(TCGETS/TIOCGWINSZ)` | `ReadFile`/`WriteFile` on std handles; `-ENOTTY` | ✅ (no tty yet) |
-| Memory | `mmap`, `munmap`, `mprotect`, `brk`, `madvise` | `VirtualAlloc`/`VirtualProtect`. Guest memory lives in a dedicated window (`0x2000_0000_0000`+) and every allocation is registered, so fork can recreate it. `brk` always fails, and libc falls back to `mmap` | ✅ |
-| Files | `openat`, `close`, `fstat`/`newfstatat`, `getdents64`, `lseek`, `readlinkat`, `sendfile`, … | std file APIs on paths resolved by `lx`. fd table → owned HANDLEs with CLOEXEC. `/dev/null`/`zero`/`urandom`/`std*`/`fd/N` emulated | ✅ (`statx`, `pread` next) |
-| Time | `clock_gettime`, `nanosleep`, `clock_nanosleep` | `QueryPerformanceCounter`, `NtDelayExecution`, vDSO | partly (no `clock_nanosleep`) |
+| Memory | `mmap`, `munmap`, `mprotect`, `mremap`, `brk`, `madvise` | `VirtualAlloc`/`VirtualProtect`. Guest memory lives in a dedicated window (`0x2000_0000_0000`+), free address hints are honoured, and every allocation is registered, so fork can recreate it. `PROT_NONE` is reserve-only (Go reserves hundreds of GB) and is committed on `mprotect`/`MAP_FIXED`. `madvise(MADV_DONTNEED)` decommits + recommits, so pages read back as zero like on Linux (Go's scavenger depends on it). `brk` always fails, and libc falls back to `mmap` | ✅ |
+| Files | `openat`, `close`, `fstat`/`newfstatat`, `getdents64`, `lseek`, `pread`/`pwrite`, `readv`/`writev`, `readlinkat`, `sendfile`, `fcntl`, … | std file APIs on paths resolved by `lx`. fd table → owned HANDLEs with CLOEXEC. `/dev/null`/`zero`/`urandom`/`std*`/`fd/N` and `/proc/self/{exe,cwd,root,fd/N}` emulated | ✅. **Not yet:** `statx` (libc falls back), stored file modes (everything reads as 0755 root) |
+| Time | `clock_gettime`, `gettimeofday`, `nanosleep`, `clock_nanosleep`, `setitimer`/`alarm` | system time / monotonic since start; sleeps are interruptible by signals; `SIGALRM` from a timer thread | ✅. **Next:** a vDSO, so time calls don't enter lx at all |
 | Threads | `clone(CLONE_THREAD)`, `futex`, `set_tid_address`, `membarrier`, `sched_*`, `sigaltstack` | `CreateThread` with the guest's registers/stack/TLS; per-thread `ThreadState` behind a TEB TLS slot; `CHILD_CLEARTID` + futex wake for `pthread_join`; `futex` → `WaitOnAddress`/`WakeByAddress*`; `membarrier` → `FlushProcessWriteBuffers`; host TEB stack fields restored before `ExitThread` (it frees what `DeallocationStack` names) | ✅ pthreads (static + dynamic) 20/20, Go runtime 20/20, Python `ThreadingHTTPServer` |
 | Processes | `fork`, `vfork`, `clone` (no threads), `execve`, `wait4`, `pipe2` | **fork** = start `lx --fork`. The child re-reserves every registered guest allocation at the same address and copies the paused parent's memory (`ReadProcessMemory`), along with registers, FS base, syscall-site registry, signal state and fds (handles inherited at the same values), then resumes after the syscall with `rax = 0`. Same idea as Cygwin. **execve** = start `lx --exec` with fds/cwd/argv/env; the old process waits and forwards the exit code. `#!` scripts are handled by the loader. **pipes** = anonymous pipes; EOF works because each fd owns its handle and CLOEXEC handles aren't inherited | ✅ ~23 ms per fork+exec. Faster later: exec in place (one process, not two), and skip the copy when a vfork child execs immediately |
-| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigsuspend`, `rt_sigreturn`, `kill`/`tkill`/`tgkill` | Real dispositions and mask. Delivery happens at syscall return, with a Linux-layout frame (`siginfo` + `ucontext`) placed by `lx_sig_tramp` after `NtContinue`. Handlers return via `rt_sigreturn`. SIGCHLD is raised when a child exits; default actions terminate (exit 128+n) or ignore | ✅. **From outside:** each lx process has a mailbox (shared memory `Local\lx-sig-<pid>` + event) and a watcher thread. A default-terminate signal ends the process at once, even mid-loop. Otherwise the watcher raises the signal and wakes blocking waits (`CancelSynchronousIo` for reads/writes, an event for sleep/poll/wait/sigsuspend), and the handler runs at syscall return. An exec proxy forwards signals, so the container pid stays stable. Ctrl-C → SIGINT (untested). `lx ps`, `lx kill`, `lx stop` (TERM, then KILL after 10 s). **Not yet:** running a *handler* while the guest spins without syscalls (needs thread hijack), process groups |
-| I/O multiplexing | `epoll_*`, `poll`, `ppoll`, `pipe2` | epoll over `WSAPoll` with edge-triggered and one-shot emulation (an EAGAIN re-arms the edge, so nginx's ET mode doesn't spin). Waits sleep in `WSAPoll` slices over the registered sockets; other fds are re-checked each slice. Idle nginx uses ~0 CPU | ✅. **Next:** `eventfd` (nginx logs it and carries on), AFD-based waits instead of slices |
+| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigsuspend`, `rt_sigreturn`, `sigaltstack`, `kill`/`tkill`/`tgkill` | Real dispositions and mask. Delivery happens at syscall return, with a Linux-layout frame (`siginfo` + `ucontext`), on the per-thread `sigaltstack` for `SA_ONSTACK` handlers (Go requires it). On the direct path the frame is written straight to the guest stack; on the trap fallback `lx_sig_tramp` places it after `NtContinue`. Handlers return via `rt_sigreturn`. Pending signals are process-wide: the next thread to return from a syscall takes one. SIGCHLD is raised when a child exits; default actions terminate (exit 128+n) or ignore | ✅. **From outside:** each lx process has a mailbox (shared memory `Local\lx-sig-<pid>` + event) and a watcher thread. A default-terminate signal ends the process at once, even mid-loop. Otherwise the watcher raises the signal and wakes blocking waits (`CancelSynchronousIo` for reads/writes, an event for sleep/poll/wait/sigsuspend), and the handler runs at syscall return. An exec proxy forwards signals, so the container pid stays stable. Ctrl-C → SIGINT (untested). `lx ps`, `lx kill`, `lx stop` (TERM, then KILL after 10 s). **Not yet:** running a *handler* while the guest spins without syscalls (needs thread hijack), process groups |
+| I/O multiplexing | `epoll_*`, `poll`, `ppoll`, `pipe2`, `eventfd`/`eventfd2` | epoll over `WSAPoll` with edge-triggered and one-shot emulation (an EAGAIN re-arms the edge, so nginx's ET mode doesn't spin). Waits sleep in `WSAPoll` slices over the registered sockets; other fds (pipes, eventfds) are re-checked each slice. eventfd = counter + condvar, readiness through the same hook (Go's netpoller uses it). Idle nginx uses ~0 CPU | ✅. **Next:** AFD-based waits instead of slices; eventfds aren't carried across fork/exec |
 | Sockets | `socket`, `bind`, `listen`, `accept4`, `connect`, `send*`/`recv*`, `sendmsg`/`recvmsg`, `shutdown`, `get/setsockopt`, `socketpair` | Winsock; every socket is non-blocking underneath and "blocking" calls wait in slices so signals interrupt them. AF_INET6 10↔23 and option numbers translated; IPv6 sockets dual-stack like Linux. `socketpair` = loopback TCP pair. Host networking (like `--network host`); `/etc/resolv.conf` gets the host's DNS servers | ✅. **Not yet:** AF_UNIX, SCM_RIGHTS fd passing, port mapping (`-p`) |
 | Identity | `getpid`, `getuid` and the rest, `uname`, `getrandom` | constants per container; `BCryptGenRandom` | trivial |
 
@@ -76,12 +79,12 @@ Anything unimplemented logs its number and returns `-ENOSYS`, so the trace from 
 
 ## 6. Images and the filesystem
 
-- OCI pull: fetch the manifest and layers from the registry over HTTPS, then unpack the tar layers in order (whiteouts are `.wh.*` files) into `rootfs/<image-id>/`.
+- OCI pull (✅): fetch the manifest and layers from the registry over HTTPS, then unpack the tar layers in order (whiteouts are `.wh.*` files) into `rootfs/images/<registry>/<repo>/<tag>/rootfs`. A re-pull starts from an empty rootfs.
 - Linux semantics NTFS lacks:
-  - **Case sensitivity:** set the per-directory case-sensitive flag (`FILE_CASE_SENSITIVE_INFORMATION`) on unpack. This works without admin on directories we create.
-  - **Symlinks:** NTFS symlinks need Developer Mode or a privilege. Otherwise, store them as small marker files and resolve them in `lx`.
-  - **Modes and ownership:** keep them in an alternate data stream (`:lx.meta`) and return them from `stat`.
-  - **Path resolution:** done in `lx`, component by component, against the guest root. `..` can never climb above the root, and absolute symlink targets are re-rooted.
+  - **Symlinks** (✅): NTFS symlinks need Developer Mode or a privilege, so they're small marker files that `lx` resolves.
+  - **Path resolution** (✅): done in `lx`, component by component, against the guest root. `..` can never climb above the root, and absolute symlink targets are re-rooted.
+  - **Case sensitivity** (planned): set the per-directory case-sensitive flag (`FILE_CASE_SENSITIVE_INFORMATION`) on unpack. This works without admin on directories we create.
+  - **Modes and ownership** (planned): keep them in an alternate data stream (`:lx.meta`) and return them from `stat`. Today every file reads as 0755 root:root.
 
 ## 7. Isolation and safety model (be honest about it)
 
@@ -92,7 +95,7 @@ The translation layer is **not** a security boundary. Guest code runs natively i
 
 **Known risks in the prototype:**
 - **Trap fallback writes the guest stack.** Rewritten sites never touch it (§3), but a fallback site, an int3 redirect, or an FS fault at an unrewritten `%fs:` site still costs a ~2.7 KB NT exception frame below `rsp`. `LX_PATCHLOG` reports how often that happens; it's zero in all current tests.
-- **Linear-sweep desync** can hide a real `syscall` behind data in `.text`. It's logged, and lazy translation fixes it.
+- **Linear-sweep desync** can hide a real `syscall` behind data in `.text`. Disagreement between decoded and raw `0F 05` pairs is logged (`LX_DEBUG`); control-flow-guided decoding fixes it.
 - **Stub areas are RWX**, so stubs can be added while other threads execute code from the same area. Patching writes the 5-byte `jmp` non-atomically: fine for code that is just becoming executable (`mmap`/`mprotect`), not for code another thread is already executing.
 - **Fork from a multithreaded process** copies memory while the other threads keep running (only the forking thread survives, as on Linux). The copy can be torn for data those threads are writing, which is harmless for the common fork-then-exec.
 - **`writev` reads the iovec array directly.** A bad pointer crashes `lx` instead of returning `-EFAULT`. Fix with a guarded copy.
@@ -104,8 +107,21 @@ The translation layer is **not** a security boundary. Guest code runs natively i
 3. ✅ (mostly) Direct-jump syscalls and FS-free TLS: no exception, and no guest-stack writes, on the hot path (§3, §4). Remaining: forward displacement for the last fallback sites, vDSO, control-flow-guided decoding.
 4. ✅ Threads and `futex`: pthreads and the Go runtime (goroutines on 16 OS threads, channels, mutexes, timers, GC), 20/20 each. `eventfd` and `madvise(MADV_DONTNEED)` (zero-fill) came with it.
 5. ✅ Process model: `fork`/`execve`/`wait4`/pipes/signals. Shell entrypoints work, with pipelines, `$(...)`, background jobs + `wait`, `trap`, `#!` scripts and a final `exec` (`guest/entrypoint.sh`).
-6. ✅ Networking: the official `nginx:alpine` image serves HTTP, including its default master + workers mode, with graceful `lx stop`. Measured: about 34 MB working set / 22 MB private for the whole container, and ~0 CPU when idle. Outbound DNS + HTTP works (`wget`, Python sockets). Python's `http.server` needs threads (milestone 4).
-7. ✅ (basic) `lx pull <image>` / `lx run <image> [cmd]`. Registry token auth, multi-arch index → linux/amd64, sha256-verified blobs (BCrypt), layers with whiteouts, and Entrypoint/Cmd/Env/WorkingDir from the image config. HTTPS goes through Windows' own `curl.exe`. Tested with `alpine`, `nginx:alpine` (its entrypoint scripts run) and `python:3.12-alpine`. Missing: private registries (credentials), zstd layers, and a per-container copy-on-write layer (containers currently write into the pulled image).
+6. ✅ Networking: the official `nginx:alpine` image serves HTTP, including its default master + workers mode, with graceful `lx stop`. Measured: about 34 MB working set / 22 MB private for the whole container, and ~0 CPU when idle. Outbound DNS + HTTP works (`wget`, Python sockets), and Python's `ThreadingHTTPServer` serves parallel clients. **Open bug:** in roughly 1 of 5–10 stops, one nginx worker misses its channel shutdown message and is SIGKILLed after ~3 s.
+7. ✅ (basic) `lx pull <image>` / `lx run <image> [cmd]`; `python3 /script.py` (the usual Python entrypoint) works since the `fcntl(F_SETFD)` fix. Registry token auth, multi-arch index → linux/amd64, sha256-verified blobs (BCrypt), layers with whiteouts, and Entrypoint/Cmd/Env/WorkingDir from the image config. HTTPS goes through Windows' own `curl.exe`. Tested with `alpine`, `nginx:alpine` (its entrypoint scripts run) and `python:3.12-alpine`. Missing: private registries (credentials), zstd layers, and a per-container copy-on-write layer (containers currently write into the pulled image).
+
+## Tests
+
+`sh tests/run.sh` (Git Bash, repo root) builds `lx` and every guest program, prepares `rootfs/` (a pinned, checksummed Alpine minirootfs; images pulled if missing), copies the guest scripts in `guest/` into the images only for the run (they're removed on exit, so no image in the store is modified by hand), and runs:
+
+- unit tests; hello, stress (TLS under preemption), crash → 139, `regress.sh` (shell features), `entrypoint.sh`, deep stack + fork, `dltest` (libraries loaded while threads make syscalls);
+- repeated (`REPEAT`, default 20): pthreads static and dynamic, the Go runtime test; the stack-untouched test 10×; all with zero fallback traps and FS faults required;
+- a control (`LX_NOJUMP=1` must make the stack test fail) and the syscall cost of both paths;
+- nginx (5 start/request/stop cycles), `wget`, `python3 /nettest.py` (sockets + threaded server), `lx stop` with a handler, a busy loop and an exec chain; no `lx` process may be left over.
+
+Internet-dependent tests retry once and warn; the known nginx straggler warns. `QUICK=1` skips the network part.
+
+Diagnostics: `LX_DEBUG=1` (everything), `LX_SIGLOG=1` (signal events only, light enough not to change timing), `LX_PATCHLOG=1` (rewritten/fallback sites per region, with disassembly of each fallback site; traps and FS faults at exit), `LX_NOJUMP=1` (no rewriting: everything on the trap path).
 
 ## Build and run
 
@@ -119,7 +135,8 @@ target/release/lx.exe rootfs/alpine ls -la /                               # PAT
 target/release/lx.exe pull python:3.12-alpine                                # from Docker Hub
 target/release/lx.exe run python:3.12-alpine python3 -c 'print(1+1)'
 cp guest/entrypoint.sh rootfs/alpine/ && target/release/lx.exe rootfs/alpine /entrypoint.sh   # shell entrypoint
-LX_DEBUG=1 target/release/lx.exe ...                                       # verbose [lx] diagnostics
+LX_DEBUG=1 target/release/lx.exe ...                                       # verbose [lx] diagnostics (see Tests)
+sh tests/run.sh                                                            # the whole suite
 target/release/lx.exe rootfs /hello        # → "hello from linux ... tls=42", exit 7
 target/release/lx.exe rootfs /stress       # TLS under preemption; with "crash" arg → exit 139
 ```
