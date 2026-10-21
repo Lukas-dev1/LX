@@ -230,13 +230,16 @@ pub fn resolve_user(rootfs: &Path, spec: &str) -> Result<(u32, u32, String), Str
     Ok((uid, gid, home))
 }
 
-/// Entrypoint + (user command, else image Cmd), like `docker run`.
-pub fn run_config(dir: &Path, cmd: &[String]) -> Result<RunConfig, String> {
+/// Entrypoint + (user command, else image Cmd), like `docker run`; `entrypoint` is `--entrypoint` (empty: none).
+pub fn run_config(dir: &Path, cmd: &[String], entrypoint: Option<&str>) -> Result<RunConfig, String> {
     let raw = std::fs::read(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?;
     let v: Value = serde_json::from_slice(&raw).map_err(|e| format!("config.json: {e}"))?;
     let c = &v["config"];
     let strings = |x: &Value| -> Vec<String> { x.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect() };
-    let mut argv = strings(&c["Entrypoint"]);
+    let mut argv = match entrypoint {
+        Some(e) => e.split_whitespace().map(String::from).collect(),
+        None => strings(&c["Entrypoint"]),
+    };
     argv.extend(if cmd.is_empty() { strings(&c["Cmd"]) } else { cmd.to_vec() });
     if argv.is_empty() {
         return Err("image has no Entrypoint or Cmd; give a command".into());

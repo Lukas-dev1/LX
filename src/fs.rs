@@ -279,8 +279,8 @@ pub struct Mount {
 }
 
 // Whiteouts in the upper layer use the OCI layer format, so a container layer is a valid image layer.
-const WHITEOUT: &str = ".wh.";
-const OPAQUE: &str = ".wh..wh..opq";
+pub const WHITEOUT: &str = ".wh.";
+pub const OPAQUE: &str = ".wh..wh..opq";
 
 fn exists(p: &Path) -> bool {
     fs::symlink_metadata(p).is_ok()
@@ -412,7 +412,7 @@ fn ntfs_bad(c: char) -> bool {
     c < ' ' || ":\\*?\"<>|".contains(c)
 }
 
-fn enc(name: &str) -> String {
+pub fn enc(name: &str) -> String {
     name.chars().map(|c| if ntfs_bad(c) { char::from_u32(0xF000 + c as u32).unwrap() } else { c }).collect()
 }
 
@@ -1609,13 +1609,13 @@ fn meta_stream(host: &Path) -> PathBuf {
     p.into()
 }
 
-fn get_meta(host: &Path) -> Option<[u32; 3]> {
+pub fn get_meta(host: &Path) -> Option<[u32; 3]> {
     let b = fs::read(meta_stream(host)).ok()?;
     let v = |i: usize| Some(u32::from_le_bytes(b.get(i * 4..i * 4 + 4)?.try_into().ok()?));
     Some([v(0)?, v(1)?, v(2)?])
 }
 
-fn set_meta(host: &Path, m: [u32; 3]) -> io::Result<()> {
+pub fn set_meta(host: &Path, m: [u32; 3]) -> io::Result<()> {
     fs::write(meta_stream(host), m.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
 }
 

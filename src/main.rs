@@ -1,4 +1,5 @@
 //! lx: run a static x86-64 Linux ELF natively on NT. See DESIGN.md.
+mod build;
 mod elf;
 mod fs;
 mod jump;
@@ -251,6 +252,8 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
                                              -w /dir sets the working directory
                                              -u user[:group] runs as that user (default: the image's USER)
        lx run -d ...                         the same in the background: prints the container's pid
+       lx build -t name[:tag] [-f Dockerfile] <dir>
+                                             builds an image from a Dockerfile (one stage)
        lx logs <pid>                         output of a `lx run -d` container
        lx exec [-e ..] [-w dir] [-u user] <pid> <command> [args...]
                                              runs a command inside a running container
@@ -308,6 +311,24 @@ fn run() -> Result<(), String> {
         eprintln!("[lx] pulled {image} into {}", dir.display());
         return Ok(());
     }
+    if let [cmd, rest @ ..] = args.as_slice() && cmd == "build" {
+        // lx build -t name[:tag] [-f Dockerfile] <context>
+        let (mut rest, mut tag, mut file, mut build_args) = (rest, None, None, Vec::new());
+        while let [flag, value, more @ ..] = rest {
+            match flag.as_str() {
+                "-t" | "--tag" => tag = Some(value.clone()),
+                "-f" | "--file" => file = Some(std::path::PathBuf::from(value)),
+                "--build-arg" => build_args.push(value.split_once('=').map_or((value.clone(), String::new()), |(k, v)| (k.into(), v.into()))),
+                _ => break,
+            }
+            rest = more;
+        }
+        let [context] = rest else { return Err(USAGE.into()) };
+        let tag = tag.ok_or("lx build: -t name[:tag] is required")?;
+        let context = std::path::Path::new(context);
+        let file = file.unwrap_or_else(|| context.join("Dockerfile"));
+        return build::build(&tag, context, &file, build_args);
+    }
     if let [cmd] = args.as_slice() && cmd == "ps" {
         println!("{:<8} COMMAND", "PID");
         for (pid, desc) in proc::ps() {
@@ -339,9 +360,13 @@ fn run() -> Result<(), String> {
         // Flags before the image: -p/--publish [hostip:]hostport:containerport[/udp], repeatable.
         let (mut rest, mut ports) = (rest, Vec::new());
         let (mut volumes, mut envs, mut workdir, mut user) = (Vec::new(), Vec::new(), None, None);
+        let (mut entrypoint, mut keep_layer) = (None, None);
         while let [flag, value, more @ ..] = rest {
             match flag.as_str() {
                 "-u" | "--user" => user = Some(value.clone()),
+                "--entrypoint" => entrypoint = Some(value.clone()),
+                // lx build: the step's writable layer goes here and stays after the container exits.
+                "--layer" => keep_layer = Some(std::path::PathBuf::from(value)),
                 // -e NAME=value, or -e NAME for the host's value (left out if the host has none), like Docker.
                 "-e" | "--env" if value.contains('=') => envs.push(value.clone()),
                 "-e" | "--env" => envs.extend(env::var(value).ok().map(|v| format!("{value}={v}"))),
@@ -356,9 +381,14 @@ fn run() -> Result<(), String> {
         let [image, rest @ ..] = rest else { return Err(USAGE.into()) };
         // Every lx process of this container inherits it (fork and exec start new lx processes).
         unsafe { env::set_var("LX_PORTS", ports.join(",")) };
-        let r = image::Ref::parse(image);
-        let dir = if r.dir().join("config.json").exists() { r.dir() } else { image::pull(&r)? };
-        let mut c = image::run_config(&dir, rest)?;
+        let dir = match image.strip_prefix("dir:") {
+            Some(d) => std::path::PathBuf::from(d), // lx build: an image being built
+            None => {
+                let r = image::Ref::parse(image);
+                if r.dir().join("config.json").exists() { r.dir() } else { image::pull(&r)? }
+            }
+        };
+        let mut c = image::run_config(&dir, rest, entrypoint.as_deref())?;
         for e in envs {
             let name = e.split('=').next().unwrap_or_default().to_string();
             c.env.retain(|x| x.split('=').next() != Some(name.as_str()));
@@ -376,7 +406,13 @@ fn run() -> Result<(), String> {
         // The container gets its own writable layer; the pulled image is never modified.
         // ponytail: removed when the container exits (like `docker run --rm`); no named, restartable containers yet.
         proc::gc_layers();
-        let layer = proc::new_layer().map_err(|e| format!("creating the container layer: {e}"))?;
+        let layer = match keep_layer {
+            Some(d) => {
+                std::fs::create_dir_all(d.join("upper")).map_err(|e| e.to_string())?;
+                std::fs::canonicalize(d).map_err(|e| e.to_string())?
+            }
+            None => proc::new_layer().map_err(|e| format!("creating the container layer: {e}"))?,
+        };
         fs::init(root.clone());
         fs::set_upper(layer.join("upper"));
         // Like Docker: the container resolves names through the host's DNS servers.
