@@ -537,6 +537,13 @@ pub fn restore<'a>(f: &'a [String], parent: isize) -> Result<((u64, u64), &'a [S
                 unsafe { ReadProcessMemory(parent, p as *const _, p as *mut _, PAGE as usize, &mut done) };
             }
         }
+        // The parent's copy-on-write file views (mmap_cow) have WRITECOPY protections, which private
+        // memory can't take (VirtualProtect fails, leaving code READWRITE: not executable): the private kind.
+        let prot = match prot & 0xff {
+            0x08 => prot & !0xff | 0x04, // PAGE_WRITECOPY -> PAGE_READWRITE
+            0x80 => prot & !0xff | 0x40, // PAGE_EXECUTE_WRITECOPY -> PAGE_EXECUTE_READWRITE
+            _ => prot,
+        };
         let mut old = 0;
         unsafe { VirtualProtect(a as *mut _, len as usize, prot, &mut old) };
     }
