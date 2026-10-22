@@ -690,7 +690,8 @@ impl Fs {
             }
             if !todo.is_empty() || follow {
                 let (host, meta) = self.host_meta(&comps);
-                if let Some(target) = meta.and_then(|m| link_target(&host, &m)) {
+                let target = self.proc_self_link(&comps).or_else(|| meta.and_then(|m| link_target(&host, &m)));
+                if let Some(target) = target {
                     hops += 1;
                     if hops > 40 {
                         return Err(ELOOP);
@@ -711,6 +712,21 @@ impl Fs {
         Ok((format!("/{}", comps.join("/")), host))
     }
 
+    /// `/proc/{self,<pid>}/{exe,cwd,root}` as symlinks while resolving, so stat and open follow them
+    /// (gosu stats /proc/self/exe). Only paths of exactly those three components are looked at.
+    fn proc_self_link(&self, comps: &[String]) -> Option<String> {
+        let [p, who, what] = comps else { return None };
+        if p != "proc" || (who != "self" && who.parse::<u32>().ok()? != crate::proc::pid()) {
+            return None;
+        }
+        match what.as_str() {
+            "exe" => Some(EXE.lock().unwrap().clone()),
+            "cwd" => Some(self.cwd.clone()),
+            "root" => Some("/".into()),
+            _ => None,
+        }
+    }
+
     fn dir_of(&self, dirfd: u64) -> Result<String, i64> {
         if dirfd as i32 == AT_FDCWD as i32 { // int argument: only the low 32 bits count (Go zero-extends)
             return Ok(self.cwd.clone());
@@ -723,7 +739,10 @@ impl Fs {
     }
 
     fn at(&self, dirfd: u64, path: u64, follow: bool) -> Result<(String, PathBuf), i64> {
-        self.resolve(&self.dir_of(dirfd)?, &cstr(path)?, follow)
+        let path = cstr(path)?;
+        // An absolute path ignores dirfd, even an invalid one (mariadb passes -1).
+        let dir = if path.starts_with('/') { String::new() } else { self.dir_of(dirfd)? };
+        self.resolve(&dir, &path, follow)
     }
 
     fn fd(&mut self, fd: u64) -> Result<&mut Fd, i64> {
@@ -1223,6 +1242,24 @@ pub fn writev(fd: u64, iov: u64, cnt: u64) -> R {
     Ok(total)
 }
 
+/// A file holding `bytes` that Windows deletes when its last handle closes (forks inherit the handle):
+/// how synthetic /proc files become ordinary fds that read, seek, fstat and mmap.
+fn scratch_file(fs: &Fs, bytes: &[u8]) -> io::Result<(File, PathBuf)> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = fs.upper.as_ref().and_then(|u| u.parent()).map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let host = dir.join(format!("proc-{}-{n}", unsafe { crate::win::GetCurrentProcessId() }));
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
+    let mut f = OpenOptions::new().read(true).write(true).create_new(true)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE).attributes(FILE_ATTRIBUTE_TEMPORARY).open(&host)?;
+    f.write_all(bytes)?;
+    f.rewind()?;
+    Ok((f, host))
+}
+
 pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
     let cloexec = flags & O_CLOEXEC != 0;
     let guest = with(|fs| fs.at(dirfd, path, flags & O_NOFOLLOW == 0))?.0;
@@ -1235,6 +1272,11 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
     with(|fs| {
         if let Some(d) = Dev::of(&guest) {
             return Ok(fs.add(Fd::Dev(d), 0, cloexec));
+        }
+        if let Some(text) = crate::procfs::file(&guest) {
+            if flags & 3 != 0 { return Err(EACCES) } // ponytail: /proc/sys is read-only here
+            let (f, host) = scratch_file(fs, text.as_bytes()).map_err(errno)?;
+            return Ok(fs.add(Fd::File { f, host }, 0, cloexec));
         }
         let (guest, mut host) = fs.at(dirfd, path, flags & O_NOFOLLOW == 0)?;
         if proc_dir(&guest).is_some() {
@@ -1876,6 +1918,11 @@ pub fn fstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> R {
     if let Some(d) = Dev::of(&guest) {
         return put_stat(buf, d.stat());
     }
+    if crate::procfs::file(&guest).is_some() {
+        let mut s = [0u64; 18];
+        (s[1], s[2], s[3], s[7]) = (ino(&host), 1, 0o100444, 4096); // a regular file of size 0, like procfs
+        return put_stat(buf, s);
+    }
     if proc_dir(&guest).is_some() {
         return put_stat(buf, stat_of(&with(|fs| fs.resolve("/", "/", true))?.1)?); // a directory like the root
     }
@@ -1921,7 +1968,7 @@ pub fn statx(dirfd: u64, path: u64, flags: u64, buf: u64) -> R {
 
 pub fn faccessat(dirfd: u64, path: u64) -> R {
     let (guest, host) = with(|fs| fs.at(dirfd, path, true))?;
-    if Dev::of(&guest).is_some() || fd_alias(&guest).is_some() || proc_dir(&guest).is_some() {
+    if Dev::of(&guest).is_some() || fd_alias(&guest).is_some() || proc_dir(&guest).is_some() || crate::procfs::file(&guest).is_some() {
         return Ok(0);
     }
     fs::symlink_metadata(host).map(|_| 0).map_err(errno)
