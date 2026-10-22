@@ -108,6 +108,7 @@ pub mod win {
         pub fn GetFileType(h: isize) -> u32;
         pub fn GetFileInformationByHandle(h: isize, info: *mut [u32; 13]) -> i32;
         pub fn GetFileAttributesW(name: *const u16) -> u32;
+        pub fn SetFileAttributesW(name: *const u16, attrs: u32) -> i32;
         pub fn GetFileAttributesExW(name: *const u16, level: u32, data: *mut [u32; 9]) -> i32;
         pub fn LockFileEx(h: isize, flags: u32, reserved: u32, len_lo: u32, len_hi: u32, ov: *mut c_void) -> i32;
         pub fn UnlockFileEx(h: isize, reserved: u32, len_lo: u32, len_hi: u32, ov: *mut c_void) -> i32;

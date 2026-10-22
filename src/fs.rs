@@ -27,12 +27,58 @@ const FIFO_MAGIC: &[u8] = b"\0lxfifo\0";
 const FIFO_LEN: u64 = 16;
 
 fn fifo_id(host: &Path) -> Option<u64> {
-    if !attrs(host).is_some_and(|m| !m.dir && m.len == FIFO_LEN) {
+    if !attrs(host).is_some_and(|m| !m.dir && m.len == FIFO_LEN && may_be_marker(host, &m)) {
         return None;
     }
     let d = fs::read(host).ok()?;
     Some(u64::from_le_bytes(d.strip_prefix(FIFO_MAGIC)?.try_into().ok()?))
 }
+
+// ---- marker files ----
+// Our marker files (symlinks, sockets, FIFOs) carry FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, so a lookup knows
+// which small files to read: Defender scans a file's contents the first time anything reads them (~30-50
+// ms), and reading every small file to ask "a symlink?" made a cold `find` over 19,000 files take
+// minutes. The attribute only says "may be one": the content still decides, so a stray one costs a read.
+// Areas made before it (image stores without a MARKED stamp beside their rootfs, volumes) are still read.
+
+const MARKER_ATTR: u32 = 0x2000; // FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: no side effects on opens or renames
+/// Beside an image's rootfs: every marker in it carries MARKER_ATTR (pulled or built by this lx).
+pub const MARKED: &str = "marked";
+/// Host trees whose markers all carry it: this container's upper layer, and a stamped image.
+static MARKED_ROOTS: std::sync::RwLock<Vec<PathBuf>> = std::sync::RwLock::new(Vec::new());
+
+fn mark(p: &Path) {
+    let w: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+    let a = unsafe { crate::win::GetFileAttributesW(w.as_ptr()) };
+    if a != u32::MAX {
+        unsafe { crate::win::SetFileAttributesW(w.as_ptr(), a | MARKER_ATTR) };
+    }
+}
+
+/// A copied file that is one of our markers gets the attribute (its source may predate it).
+pub fn mark_if_marker(p: &Path) {
+    let Some(m) = attrs(p) else { return };
+    if m.dir || m.marker || m.len > 4096 || m.len < 8 {
+        return;
+    }
+    if fs::read(p).is_ok_and(|d| [LINK_MAGIC, SOCK_MAGIC, FIFO_MAGIC].iter().any(|g| d.starts_with(g))) {
+        mark(p);
+    }
+}
+
+fn note_marked_roots(root: &Path, upper: Option<&Path>) {
+    let mut roots = MARKED_ROOTS.write().unwrap();
+    roots.clear();
+    roots.extend(upper.map(Path::to_path_buf));
+    if root.parent().is_some_and(|d| d.join(MARKED).exists()) {
+        roots.push(root.to_path_buf());
+    }
+}
+
+fn may_be_marker(host: &Path, m: &Attrs) -> bool {
+    m.marker || !MARKED_ROOTS.read().unwrap().iter().any(|r| host.starts_with(r))
+}
+
 pub const AT_FDCWD: u64 = -100i64 as u64;
 pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_EMPTY_PATH: u64 = 0x1000;
@@ -433,6 +479,8 @@ pub struct Attrs {
     pub len: u64,
     /// Last write time, ns since the Unix epoch.
     pub mtime: u64,
+    /// Carries MARKER_ATTR: may be one of our marker files.
+    pub marker: bool,
 }
 
 pub fn attrs(p: &Path) -> Option<Attrs> {
@@ -447,6 +495,7 @@ pub fn attrs(p: &Path) -> Option<Attrs> {
         dir: d[0] & 0x10 != 0, // FILE_ATTRIBUTE_DIRECTORY
         len: (d[7] as u64) << 32 | d[8] as u64,
         mtime: write.saturating_sub(116_444_736_000_000_000).saturating_mul(100),
+        marker: d[0] & MARKER_ATTR != 0,
     })
 }
 
@@ -464,6 +513,7 @@ pub fn init(root: PathBuf) {
         let owned = (h != 0 && h != -1).then(|| unsafe { BorrowedHandle::borrow_raw(h as _) }.try_clone_to_owned().ok());
         owned.flatten().map(|h| Slot { fd: Fd::Handle(h), cloexec: false })
     };
+    note_marked_roots(&root, None);
     *FS.lock().unwrap() = Some(Fs { root, upper: None, mounts: Vec::new(), cwd: "/".into(), fds: vec![std(-10), std(-11), std(-12)] });
 }
 
@@ -486,7 +536,10 @@ pub fn add_mount(guest: &str, host: PathBuf, ro: bool) -> Result<(), i64> {
 
 /// Give the container a writable layer on top of the image (call right after init).
 pub fn set_upper(upper: PathBuf) {
-    with(|fs| fs.upper = Some(upper));
+    with(|fs| {
+        note_marked_roots(&fs.root, Some(&upper));
+        fs.upper = Some(upper);
+    });
 }
 
 /// An AF_UNIX socket path as the container sees it: (normalized guest path, does it exist, the
@@ -512,7 +565,9 @@ pub fn container() -> String {
 
 /// Leave the socket marker at a bound AF_UNIX path, so ls/stat show a socket there.
 pub fn mark_socket(guest: &str) -> Result<(), i64> {
-    write_guest_file(guest, SOCK_MAGIC)
+    write_guest_file(guest, SOCK_MAGIC)?;
+    mark(&with(|fs| fs.writable(&split(guest).into_iter().collect::<Vec<_>>(), false))?);
+    Ok(())
 }
 
 /// Write a file into the container (through the writable layer), e.g. /etc/resolv.conf.
@@ -561,7 +616,7 @@ pub fn read_link(host: &Path) -> Option<String> {
 /// read_link with the metadata already in hand: only a small file can be a symlink marker, so most
 /// entries cost nothing more.
 fn link_target(host: &Path, m: &Attrs) -> Option<String> {
-    if m.dir || m.len > 4096 || m.len < LINK_MAGIC.len() as u64 {
+    if m.dir || m.len > 4096 || m.len < LINK_MAGIC.len() as u64 || !may_be_marker(host, m) {
         return None;
     }
     let stamp = m.mtime ^ m.len.rotate_left(48);
@@ -602,7 +657,9 @@ fn cached<T: Clone>(facts: &FileFacts<T>, host: &Path, stamp: u64, learn: impl F
 
 fn write_link(host: &Path, target: &str) -> io::Result<()> {
     forget(&LINKS, host);
-    fs::write(host, [LINK_MAGIC, target.as_bytes()].concat())
+    fs::write(host, [LINK_MAGIC, target.as_bytes()].concat())?;
+    mark(host);
+    Ok(())
 }
 
 fn ino(host: &Path) -> u64 {
@@ -1074,6 +1131,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
         rest = more;
     }
     let upper = (!upper.is_empty()).then(|| PathBuf::from(upper));
+    note_marked_roots(Path::new(root), upper.as_deref());
     *FS.lock().unwrap() = Some(Fs { root: PathBuf::from(root), upper, mounts, cwd: cwd.clone(), fds });
     Ok(rest)
 }
@@ -1443,6 +1501,7 @@ pub fn mknodat(dirfd: u64, path: u64, mode: u64) -> R {
             let mut id = DefaultHasher::new();
             (&host, std::process::id(), std::time::SystemTime::now()).hash(&mut id);
             fs::write(&host, [FIFO_MAGIC, &id.finish().to_le_bytes()].concat()).map_err(errno)?;
+            mark(&host);
             if fs.keeps_meta(&comps_of(&guest)) {
                 let _ = set_meta(&host, new_meta(mode));
             }
@@ -2539,7 +2598,7 @@ pub fn fchmeta(fd: u64, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
 fn stat_of(host: &Path) -> Result<[u64; 18], i64> {
     let m = attrs(host).ok_or(ENOENT)?;
     let link = link_target(host, &m);
-    let sock = !m.dir && m.len == SOCK_MAGIC.len() as u64 && fs::read(host).is_ok_and(|d| d == SOCK_MAGIC);
+    let sock = !m.dir && m.len == SOCK_MAGIC.len() as u64 && may_be_marker(host, &m) && fs::read(host).is_ok_and(|d| d == SOCK_MAGIC);
     let (mode, size, nlink) = match &link {
         _ if m.dir => (0o040755, 4096, 2),
         _ if sock => (0o140755, 0, 1), // S_IFSOCK
@@ -3071,7 +3130,9 @@ fn copy_up(from: &Path, to: &Path) -> io::Result<()> {
         }
         Ok(())
     } else {
-        fs::copy(from, to).map(|_| ())
+        fs::copy(from, to)?;
+        mark_if_marker(to); // from an image made before the attribute
+        Ok(())
     }
 }
 
@@ -3099,6 +3160,31 @@ fn resolve_stays_inside_rootfs() {
     assert_eq!(dec("..\u{f05c}..\u{f05c}x\u{f03a}y\u{f041}"), "..\\..\\x:y\u{f041}");
     assert_eq!(fs_.resolve("/", "/bin/sh", false).unwrap().0, "/bin/sh");
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn markers_are_flagged() {
+    let base = std::env::temp_dir().join(format!("lx-markers-{}", std::process::id()));
+    let (lower, upper) = (base.join("img/rootfs"), base.join("upper"));
+    fs::create_dir_all(&lower).unwrap();
+    fs::create_dir_all(&upper).unwrap();
+    let old = [LINK_MAGIC, b"target"].concat();
+    fs::write(lower.join("old"), &old).unwrap(); // an image from before the attribute: no stamp, no flag
+    note_marked_roots(&lower, Some(&upper));
+
+    // Unstamped image: still read, so its old links work.
+    assert_eq!(read_link(&lower.join("old")).as_deref(), Some("target"));
+    // In the upper layer, a link we write is flagged and found...
+    write_link(&upper.join("new"), "t2").unwrap();
+    assert_eq!(read_link(&upper.join("new")).as_deref(), Some("t2"));
+    // ...while an unflagged file with the same bytes is just a file (no read needed).
+    fs::write(upper.join("plain"), &old).unwrap();
+    assert_eq!(read_link(&upper.join("plain")), None);
+    // Copy-up of an old image link flags it, so it stays a link up there.
+    copy_up(&lower.join("old"), &upper.join("copied")).unwrap();
+    assert_eq!(read_link(&upper.join("copied")).as_deref(), Some("target"));
+    MARKED_ROOTS.write().unwrap().clear();
+    fs::remove_dir_all(base).unwrap();
 }
 
 #[test]
