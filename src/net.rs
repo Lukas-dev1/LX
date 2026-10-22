@@ -1082,6 +1082,20 @@ pub fn sys_getsockopt(fd: u64, level: u64, name: u64, val: u64, lenp: u64) -> R 
             return int(t);
         }
         (1, 2) | (1, 15) => return int(0),                     // SO_REUSEADDR / SO_REUSEPORT: as set (ignored)
+        (6, 11) => {
+            // TCP_INFO: the state (LISTEN or ESTABLISHED), counters zero. php-fpm reads its listen queue
+            // from it every second. ponytail: no real statistics.
+            let (mut listening, mut l) = (0i32, 4i32);
+            unsafe { getsockopt(s.s, 0xffff, 0x0002, (&mut listening as *mut i32).cast(), &mut l) }; // SO_ACCEPTCONN
+            let n = unsafe { *(lenp as *const u32) }.min(232) as usize;
+            let out = unsafe { std::slice::from_raw_parts_mut(val as *mut u8, n) };
+            out.fill(0);
+            if n > 0 {
+                out[0] = if listening != 0 { 10 } else { 1 }; // TCP_LISTEN / TCP_ESTABLISHED
+            }
+            unsafe { *(lenp as *mut u32) = n as u32 };
+            return Ok(0);
+        }
         (1, 38) | (1, 39) => {
             // SO_PROTOCOL, SO_DOMAIN (Python's socket(fileno=fd) asks both).
             let mut a = [0u8; 128];
