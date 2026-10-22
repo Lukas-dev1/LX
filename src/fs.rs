@@ -2641,7 +2641,23 @@ pub fn fstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> R {
         (s[1], s[2], s[3], s[6], s[7]) = (ino(&host), 1, 0o120777, t.len() as u64, 4096); // a symlink
         return put_stat(buf, s);
     }
-    put_stat(buf, stat_of(&host)?)
+    let mut s = stat_of(&host)?;
+    if s[3] & 0o170000 == 0o100000 && with(|fs| fs.upper.as_ref().is_some_and(|u| host.starts_with(u)) || fs.mounts.iter().any(|m| host.starts_with(&m.host))) {
+        s[2] = links(&host); // the guest's own hard links (shadow's lock checks for 2)
+    }
+    put_stat(buf, s)
+}
+
+/// A file's NTFS hard links. Only asked in the container's layer and volumes: image files are hard-linked
+/// between image copies, which the guest must not see.
+fn links(host: &Path) -> u64 {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Ok(f) = OpenOptions::new().access_mode(0x80).share_mode(7).open(host) else { return 1 }; // FILE_READ_ATTRIBUTES
+    let mut info = [0u32; 13];
+    if unsafe { crate::win::GetFileInformationByHandle(f.as_raw_handle() as isize, &mut info) } == 0 {
+        return 1;
+    }
+    info[10].max(1) as u64 // nNumberOfLinks
 }
 
 /// statx(dirfd, path, flags, mask, buf): newer coreutils and glibc's stat use it. Filled from the same
