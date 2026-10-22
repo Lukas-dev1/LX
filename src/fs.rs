@@ -2497,7 +2497,7 @@ pub fn set_exe(guest: &str) {
 fn proc_dir(guest: &str) -> Option<bool> {
     let r = guest.strip_prefix("/proc/")?;
     let (pid, rest) = r.split_once('/').unwrap_or((r, ""));
-    if pid != "self" && pid.parse::<u32>().ok()? != unsafe { crate::win::GetCurrentProcessId() } {
+    if pid != "self" && pid.parse::<u32>().ok()? != crate::proc::pid() {
         return None;
     }
     match rest {
