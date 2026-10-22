@@ -55,6 +55,7 @@ fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, 
     let mut root = cur.join("rootfs");
     let mut config = json!({});
     let mut shell = vec!["/bin/sh".to_string(), "-c".to_string()];
+    let ignore = Ignore::load(context);
     for (n, (op, rest)) in instructions(text).into_iter().enumerate() {
         eprintln!("[lx] step {}: {op} {rest}", n + 1);
         let env = env_map(&config);
@@ -121,7 +122,7 @@ fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, 
                     config["config"]["Labels"][k] = json!(v);
                 }
             }
-            "COPY" | "ADD" => copy(&rest, context, &root, &config, &stages)?,
+            "COPY" | "ADD" => copy(&rest, context, &root, &config, &stages, &ignore)?,
             "RUN" => run(&rest, &shell, &cur, &config, &args)?,
             "VOLUME" | "STOPSIGNAL" | "HEALTHCHECK" | "MAINTAINER" | "ONBUILD" => {} // nothing lx acts on yet
             _ => return Err(format!("unknown instruction {op}")),
@@ -339,7 +340,7 @@ fn make_dirs(root: &Path, guest: &str) -> Result<(), String> {
 
 /// COPY/ADD [--chown=u[:g]] [--from=stage|image] <src>... <dest>: from the build context (or, with
 /// --from, absolute paths in an earlier stage or an image), relative to WORKDIR.
-fn copy(rest: &str, context: &Path, root: &Path, config: &Value, stages: &[(Option<String>, PathBuf)]) -> Result<(), String> {
+fn copy(rest: &str, context: &Path, root: &Path, config: &Value, stages: &[(Option<String>, PathBuf)], ignore: &Ignore) -> Result<(), String> {
     let mut words: Vec<String> = if rest.starts_with('[') {
         serde_json::from_str(rest).map_err(|_| "bad COPY array")?
     } else {
@@ -382,15 +383,76 @@ fn copy(rest: &str, context: &Path, root: &Path, config: &Value, stages: &[(Opti
         };
         let parent = to_guest.rsplit_once('/').map_or("/", |(p, _)| if p.is_empty() { "/" } else { p });
         make_dirs(root, parent)?;
-        copy_in(&from, &host_path(root, &to_guest), owner, from_root.is_some()).map_err(|e| format!("COPY {src}: {e}"))?;
+        copy_in(&from, &host_path(root, &to_guest), owner, from_root.is_some(), ignore).map_err(|e| format!("COPY {src}: {e}"))?;
     }
     Ok(())
+}
+
+/// `.dockerignore`: patterns (`*`, `?`, `**`, a leading `!` re-includes) on paths relative to the context;
+/// the last pattern that matches decides. An ignored directory is skipped whole.
+/// ponytail: a `!` exception inside an ignored directory isn't reached.
+pub struct Ignore {
+    ctx: PathBuf,
+    rules: Vec<(bool, Vec<String>)>, // (re-include, pattern segments)
+}
+
+impl Ignore {
+    fn load(context: &Path) -> Ignore {
+        let text = std::fs::read_to_string(context.join(".dockerignore")).unwrap_or_default();
+        let rules = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(|l| {
+            let (neg, p) = l.strip_prefix('!').map_or((false, l), |p| (true, p));
+            (neg, p.trim_start_matches("./").trim_matches('/').split('/').map(String::from).collect())
+        }).collect();
+        Ignore { ctx: std::fs::canonicalize(context).unwrap_or(context.to_path_buf()), rules }
+    }
+
+    fn skips(&self, host: &Path) -> bool {
+        let Ok(rel) = host.strip_prefix(&self.ctx) else { return false };
+        let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        let mut skip = false;
+        for (neg, pat) in &self.rules {
+            if path_matches(pat, &parts) {
+                skip = !neg;
+            }
+        }
+        skip
+    }
+}
+
+fn path_matches(pat: &[String], parts: &[String]) -> bool {
+    match (pat.first(), parts.first()) {
+        (None, None) => true,
+        (Some(p), _) if p == "**" => path_matches(&pat[1..], parts) || (!parts.is_empty() && path_matches(pat, &parts[1..])),
+        (Some(p), Some(s)) => glob(p.as_bytes(), s.as_bytes()) && path_matches(&pat[1..], &parts[1..]),
+        _ => false,
+    }
+}
+
+fn glob(p: &[u8], s: &[u8]) -> bool {
+    match (p.first(), s.first()) {
+        (None, None) => true,
+        (Some(b'*'), _) => glob(&p[1..], s) || (!s.is_empty() && glob(p, &s[1..])),
+        (Some(b'?'), Some(_)) => glob(&p[1..], &s[1..]),
+        (Some(a), Some(b)) if a == b => glob(&p[1..], &s[1..]),
+        _ => false,
+    }
+}
+
+#[test]
+fn dockerignore_patterns() {
+    let m = |p: &str, s: &str| path_matches(&p.split('/').map(String::from).collect::<Vec<_>>(), &s.split('/').map(String::from).collect::<Vec<_>>());
+    assert!(m("node_modules", "node_modules"));
+    assert!(!m("node_modules", "src/node_modules"));
+    assert!(m("**/node_modules", "src/node_modules"));
+    assert!(m("*.log", "debug.log") && !m("*.log", "logs/debug.log"));
+    assert!(m("**/*.log", "logs/debug.log") && m("**/*.log", "debug.log"));
+    assert!(m("src/?.rs", "src/a.rs") && !m("src/?.rs", "src/ab.rs"));
 }
 
 /// Copy a file or tree into the image, replacing (never writing through: hard links) what's there.
 /// From the context: files 0644 (0755 if it starts like a script or an ELF), directories 0755, root's
 /// unless `owner`. From an image (`imaged`): names are already host-encoded, modes and owners kept.
-fn copy_in(from: &Path, to: &Path, owner: Option<(u32, u32)>, imaged: bool) -> std::io::Result<()> {
+fn copy_in(from: &Path, to: &Path, owner: Option<(u32, u32)>, imaged: bool, ignore: &Ignore) -> std::io::Result<()> {
     let meta = |default: u32| {
         let kept = if imaged { get_meta(from) } else { None };
         let [mode, uid, gid] = kept.unwrap_or([default, 0, 0]);
@@ -402,8 +464,11 @@ fn copy_in(from: &Path, to: &Path, owner: Option<(u32, u32)>, imaged: bool) -> s
         set_meta(to, meta(0o755))?;
         for e in std::fs::read_dir(from)? {
             let e = e?;
+            if !imaged && ignore.skips(&e.path()) {
+                continue;
+            }
             let name = e.file_name().to_string_lossy().into_owned();
-            copy_in(&e.path(), &to.join(if imaged { name } else { enc(&name) }), owner, imaged)?;
+            copy_in(&e.path(), &to.join(if imaged { name } else { enc(&name) }), owner, imaged, ignore)?;
         }
         return Ok(());
     }
