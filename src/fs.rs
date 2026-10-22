@@ -116,6 +116,88 @@ pub fn eventfd(init: u64, flags: u64) -> R {
     Ok(add_fd(Fd::Event(Arc::new(EventFd::new(init, flags))), flags & EFD_CLOEXEC != 0))
 }
 
+/// timerfd: an eventfd whose count a timer thread raises by the expirations since the last read, which
+/// is exactly what reading a timerfd returns; poll/epoll readiness comes with it.
+/// ponytail: one thread per armed timer; CLOCK_BOOTTIME/ALARM count as MONOTONIC.
+static TIMERS: Mutex<Vec<(usize, u64, Option<std::time::Instant>, std::time::Duration)>> = Mutex::new(Vec::new());
+
+pub fn timerfd_create(_clock: u64, flags: u64) -> R {
+    eventfd(0, flags) // TFD_NONBLOCK/TFD_CLOEXEC are O_NONBLOCK/O_CLOEXEC, like eventfd's
+}
+
+fn event_of(fd: u64) -> Result<Arc<EventFd>, i64> {
+    with(|fs| match fs.fd(fd)? {
+        Fd::Event(e) => Ok(e.clone()),
+        _ => Err(EINVAL),
+    })
+}
+
+/// The armed state of timerfd `e`: (epoch: bumped by every settime, next expiry, interval).
+fn timer_of(e: &Arc<EventFd>) -> (u64, Option<std::time::Instant>, std::time::Duration) {
+    let key = Arc::as_ptr(e) as usize;
+    TIMERS.lock().unwrap().iter().find(|t| t.0 == key).map_or((0, None, Default::default()), |t| (t.1, t.2, t.3))
+}
+
+fn put_itimerspec(p: u64, next: Option<std::time::Instant>, interval: std::time::Duration) {
+    if p == 0 {
+        return;
+    }
+    let left = next.map_or(Default::default(), |n| n.saturating_duration_since(std::time::Instant::now()));
+    unsafe { *(p as *mut [u64; 4]) = [interval.as_secs(), interval.subsec_nanos() as u64, left.as_secs(), left.subsec_nanos() as u64] };
+}
+
+pub fn timerfd_gettime(fd: u64, cur: u64) -> R {
+    let (_, next, interval) = timer_of(&event_of(fd)?);
+    put_itimerspec(cur, next, interval);
+    Ok(0)
+}
+
+/// timerfd_settime(fd, flags, new, old): arm (or with a zero value disarm) the timer.
+pub fn timerfd_settime(fd: u64, flags: u64, new: u64, old: u64) -> R {
+    const TFD_TIMER_ABSTIME: u64 = 1;
+    let e = event_of(fd)?;
+    let (epoch, next, interval) = timer_of(&e);
+    put_itimerspec(old, next, interval);
+    let [is, ins, vs, vns] = unsafe { *(new as *const [u64; 4]) };
+    let interval = std::time::Duration::new(is, ins as u32);
+    let mut value = std::time::Duration::new(vs, vns as u32);
+    let armed = !value.is_zero();
+    if armed && flags & TFD_TIMER_ABSTIME != 0 {
+        let (s, ns) = crate::syscall::now(1); // ponytail: absolute REALTIME deadlines are taken as monotonic
+        value = value.saturating_sub(std::time::Duration::new(s, ns as u32));
+    }
+    let epoch = epoch + 1;
+    let first = armed.then(|| std::time::Instant::now() + value);
+    let key = Arc::as_ptr(&e) as usize;
+    {
+        let mut t = TIMERS.lock().unwrap();
+        t.retain(|t| t.0 != key);
+        t.push((key, epoch, first, interval));
+    }
+    *e.count.lock().unwrap() = 0; // re-arming discards expirations not read yet, like Linux
+    if let Some(mut at) = first {
+        let weak = Arc::downgrade(&e);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+            let Some(e) = weak.upgrade() else { return }; // the fd was closed
+            if timer_of(&e).0 != epoch {
+                return; // re-armed or disarmed since
+            }
+            let late = std::time::Instant::now().saturating_duration_since(at);
+            let n = if interval.is_zero() { 1 } else { 1 + (late.as_nanos() / interval.as_nanos()) as u64 };
+            *e.count.lock().unwrap() += n;
+            e.changed.notify_all();
+            if interval.is_zero() {
+                TIMERS.lock().unwrap().iter_mut().filter(|t| t.0 == key && t.1 == epoch).for_each(|t| t.2 = None);
+                return;
+            }
+            at += interval * n as u32;
+            TIMERS.lock().unwrap().iter_mut().filter(|t| t.0 == key && t.1 == epoch).for_each(|t| t.2 = Some(at));
+        });
+    }
+    Ok(0)
+}
+
 /// memfd_create(name, flags): an anonymous file, here a scratch file Windows deletes with its last handle,
 /// so it reads, writes, truncates and maps (MAP_SHARED included) like any file. PHP and Chromium use it.
 /// ponytail: sealing (MFD_ALLOW_SEALING, F_ADD_SEALS) is accepted and not enforced.
