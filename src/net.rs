@@ -320,7 +320,8 @@ fn own_ip() -> Option<[u8; 4]> {
 
 /// A loopback address for the container this process is the root of (`lx run` without `--ip`):
 /// 127.1-64.y.z from its Windows pid, which no other running container has.
-/// ponytail: unique while pids stay under 2^24; lx compose takes 127.128-255.y.z (see compose.rs).
+/// ponytail: unique while pids stay under 2^24. The three ranges: lx run 127.1-64 (here), lx engine
+/// 127.65-127 (engine.rs ip_for), lx compose 127.128-255 (compose.rs).
 pub fn auto_ip() -> String {
     let v = std::process::id() >> 2; // Windows pids are multiples of 4
     format!("127.{}.{}.{}", 1 + (v >> 16 & 0x3f), v >> 8 & 0xff, v & 0xff)
