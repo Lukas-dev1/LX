@@ -329,6 +329,7 @@ fn arrive(sig: u64) {
     unsafe {
         crate::win::SetEvent(INTR.load(SeqCst));
     }
+    crate::syscall::wake_futex_waiters();
     cancel_io();
 }
 
@@ -339,6 +340,7 @@ pub fn wake_if_handled(sig: u64) {
         unsafe {
             crate::win::SetEvent(INTR.load(SeqCst));
         }
+        crate::syscall::wake_futex_waiters();
         cancel_io();
     }
 }
