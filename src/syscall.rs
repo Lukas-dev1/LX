@@ -1964,13 +1964,12 @@ pub fn map_image(host: &std::path::Path, segs: &[ImageSeg], fixed: bool, lo: u64
                                PAGE_EXECUTE_WRITECOPY, std::ptr::null_mut(), 0)
             } as u64;
             ok &= v == v0;
-            // Bytes after filesz in its last page belong to bss: zero them (copy-on-write of that page).
+            // A segment with bss: zero the rest of its last file page, to the page's end, as Linux's
+            // loader does (glibc's ld.so hands that memory out as zeroed malloc memory). Without bss the
+            // page keeps the file's bytes, as on Linux. Copy-on-write privatizes just that page.
             let tail = s.addr + bias + s.filesz;
-            if ok && tail < v1 {
-                unsafe { std::ptr::write_bytes(tail as *mut u8, 0, (v1.min(s.addr + bias + s.memsz.max(s.filesz)) - tail) as usize) };
-                if s.memsz <= s.filesz {
-                    unsafe { std::ptr::write_bytes(tail as *mut u8, 0, (v1 - tail) as usize) };
-                }
+            if ok && tail < v1 && s.memsz > s.filesz {
+                unsafe { std::ptr::write_bytes(tail as *mut u8, 0, (v1 - tail) as usize) };
             }
             cursor = v1;
         }
@@ -1989,6 +1988,9 @@ pub fn map_image(host: &std::path::Path, segs: &[ImageSeg], fixed: bool, lo: u64
         return None;
     }
     ALLOCS.lock().unwrap().push((base, len));
+    if debug() {
+        dlog(format_args!("map_image {} at {base:#x}+{len:#x}", host.display()));
+    }
     Some(base)
 }
 
