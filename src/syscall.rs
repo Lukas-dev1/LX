@@ -548,9 +548,6 @@ pub fn install() {
     let scratch = unsafe { TlsAlloc() };
     assert!(scratch < 64, "TLS index {scratch} is past the TEB's inline slots");
     SCRATCH_OFF.store(0x1480 + 8 * scratch as u64, Relaxed);
-    // Linux timers are ~1 ms; NT's default tick is 15.6 ms, so a 1 ms futex or condition wait took 16.
-    // Per-process on Windows 11. ponytail: always on while lx runs; costs some idle power.
-    unsafe { timeBeginPeriod(1) };
     crate::thread::set_main();
     unsafe { AddVectoredExceptionHandler(1, veh) };
     signal::listen();
@@ -1726,4 +1723,14 @@ fn mincore(addr: u64, len: u64, vec: u64) -> R {
 #[link(name = "winmm")]
 unsafe extern "system" {
     fn timeBeginPeriod(ms: u32) -> u32;
+}
+
+/// Linux timers are ~1 ms; NT's default tick is 15.6 ms, so a 1 ms futex or condition wait took 16.
+/// Turned on by the first short timed wait (per-process on Windows 11) and left on: processes that only
+/// wait long, like an idle server, keep the coarse tick and its lower power use.
+pub fn fine_timer() {
+    static ON: std::sync::Once = std::sync::Once::new();
+    ON.call_once(|| unsafe {
+        timeBeginPeriod(1);
+    });
 }
