@@ -1029,6 +1029,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         110 => proc::getppid(),
         111 | 112 | 121 => proc::getpid(), // getpgrp, setsid, getpgid
         158 if a[0] == 0x1002 => { ts().fs = a[1]; Ok(0) } // arch_prctl(ARCH_SET_FS)
+        158 if a[0] == 0x1003 => { unsafe { *(a[1] as *mut u64) = ts().fs }; Ok(0) } // ARCH_GET_FS
+        158 => Err(EINVAL), // the rest (CET, AMX, CPUID faulting): not supported, as glibc's probes expect
         217 => fs::getdents64(a[0], a[1], a[2]),
         202 => thread::futex(a[0], a[1], a[2], a[3], a[5]),
         324 => thread::membarrier(a[0]),
