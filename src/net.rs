@@ -384,7 +384,16 @@ fn bind_addr(s: usize, a: &mut [u8]) {
     if fam == AF_INET && a[4..8] == [0; 4] {
         a[4..8].copy_from_slice(&[127, 0, 0, 1]);
     } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == [0; 16] {
-        a[23] = 1; // ::1
+        // A dual-stack [::] listener answers IPv4 too (php-fpm's `listen = 9000`, clients dial 127.0.0.1):
+        // ::ffff:127.0.0.1. An IPV6_V6ONLY one (nginx's [::]:80 next to its 0.0.0.0:80) takes ::1.
+        // ponytail: a dual-stack listener is then unreachable on ::1.
+        let (mut v6only, mut l) = (0i32, 4i32);
+        unsafe { getsockopt(s, 41, 27, (&mut v6only as *mut i32).cast(), &mut l) }; // IPPROTO_IPV6, IPV6_V6ONLY
+        if v6only != 0 {
+            a[23] = 1; // ::1
+        } else {
+            a[18..24].copy_from_slice(&[0xff, 0xff, 127, 0, 0, 1]);
+        }
     }
 }
 
