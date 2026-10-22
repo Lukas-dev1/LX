@@ -834,7 +834,7 @@ pub fn sys_recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, lenp: u6
 }
 
 /// struct msghdr { name, namelen, iov, iovlen, control, controllen, flags }.
-/// ponytail: data only; control messages (SCM_RIGHTS, credentials) aren't supported.
+/// Control messages: SCM_RIGHTS (see below); credentials aren't supported.
 /// sendmmsg/recvmmsg: an array of struct mmsghdr { msghdr (56 bytes); u32 msg_len; pad } = 64 bytes.
 /// glibc's resolver sends its A and AAAA queries in one sendmmsg. Returns how many went through.
 pub fn sys_mmsg(fd: u64, vec: u64, n: u64, flags: u64, send: bool) -> R {
@@ -860,6 +860,9 @@ pub fn sys_mmsg(fd: u64, vec: u64, n: u64, flags: u64, send: bool) -> R {
 pub fn sys_sendmsg(fd: u64, msg: u64, flags: u64) -> R {
     let m = unsafe { *(msg as *const [u64; 7]) };
     let data = gather(m[2], m[3])?;
+    if m[4] != 0 && m[5] >= 16 {
+        scm_send(&*fs::sock(fd)?, m[4], m[5])?; // the fds go out before the data they ride with
+    }
     sys_sendto(fd, data.as_ptr() as u64, data.len() as u64, flags, m[0], m[1] & 0xffff_ffff)
 }
 
@@ -879,10 +882,130 @@ pub fn sys_recvmsg(fd: u64, msg: u64, flags: u64) -> R {
             break;
         }
     }
-    (m[5], m[6]) = (0, 0); // no control data, no flags
+    const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+    let ctl = if m[4] != 0 && m[5] >= 16 { scm_recv(&*fs::sock(fd)?, m[4], m[5], flags & MSG_CMSG_CLOEXEC != 0) } else { 0 };
+    (m[5], m[6]) = (ctl, 0); // SCM_RIGHTS if any, no flags
     Ok(n as i64)
 }
 
+
+// ---- SCM_RIGHTS ----
+//
+// Passing fds over AF_UNIX: the sender duplicates each handle into the container's first lx process
+// (it lives as long as the container and runs nothing for this), and drops a record naming them in a
+// per-connection queue directory before it sends the data. recvmsg takes the oldest record after its
+// data arrives and pulls the handles out with DUPLICATE_CLOSE_SOURCE. So the fds survive the sender
+// closing them or exiting right after sendmsg (erts does).
+// ponytail: a connection is keyed by the AF_UNIX path it was made through, which is unique for
+// socketpairs; clients of one listening path share a queue (fine unless several pass fds at once).
+// Records aren't tied to byte offsets: the next recvmsg with control space after the data takes them.
+
+/// The handle-holding process: the container's first lx (LX_IN_JOB carries its pid), else ourselves.
+fn holder() -> isize {
+    static H: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+    let h = H.load(Relaxed);
+    if h != 0 {
+        return h;
+    }
+    let pid = std::env::var("LX_IN_JOB").ok().and_then(|v| v.parse().ok()).unwrap_or(std::process::id());
+    let h = unsafe { crate::win::OpenProcess(0x0040, 0, pid) }; // PROCESS_DUP_HANDLE
+    let h = if h == 0 { unsafe { crate::win::GetCurrentProcess() } } else { h };
+    H.store(h, Relaxed);
+    h
+}
+
+/// The queue directory both ends of `s`'s connection agree on.
+fn scm_dir(s: &Sock) -> Option<String> {
+    let path = |f: unsafe extern "system" fn(usize, *mut u8, *mut i32) -> i32| {
+        let mut a = [0u8; 110];
+        let mut len = a.len() as i32;
+        let ok = unsafe { f(s.s, a.as_mut_ptr(), &mut len) } == 0 && a[0] == AF_UNIX as u8 && a[2] != 0;
+        ok.then(|| a[2..].iter().take_while(|&&b| b != 0).copied().collect::<Vec<u8>>())
+    };
+    let p = path(getpeername).or_else(|| path(getsockname))?;
+    let mut h = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&p, &mut h);
+    Some(format!("{SOCK_DIR}\\{}\\scm-{:016x}", fs::container(), std::hash::Hasher::finish(&h)))
+}
+
+/// sendmsg's SCM_RIGHTS control messages: queue the fds for the peer.
+fn scm_send(s: &Sock, control: u64, len: u64) -> Result<(), i64> {
+    use crate::win::*;
+    let mut lines = Vec::new();
+    let mut off = 0;
+    while off + 16 <= len {
+        let (clen, level, ty) = unsafe { (*((control + off) as *const u64), *((control + off + 8) as *const i32), *((control + off + 12) as *const i32)) };
+        if clen < 16 {
+            break;
+        }
+        if level == 1 && ty == 1 { // SOL_SOCKET, SCM_RIGHTS
+            for i in 0..(clen - 16) / 4 {
+                let fd = unsafe { *((control + off + 16 + i * 4) as *const i32) } as u64;
+                let (kind, h, extra) = fs::export_fd(fd)?;
+                let mut out = 0isize;
+                if h != 0 && unsafe { DuplicateHandle(GetCurrentProcess(), h as isize, holder(), &mut out, 0, 0, 2) } == 0 {
+                    return Err(EINVAL);
+                }
+                lines.push(format!("{kind}\t{out}\t{extra}"));
+            }
+        }
+        off += clen.next_multiple_of(8);
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = scm_dir(s).ok_or(EINVAL)?;
+    let _ = std::fs::create_dir_all(&dir);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let name = format!("{dir}\\{t:024}-{}-{:06}", std::process::id(), N.fetch_add(1, Relaxed));
+    std::fs::write(&name, lines.join("\n")).map_err(|_| EINVAL)
+}
+
+/// recvmsg: the oldest queued record for this connection as an SCM_RIGHTS control message.
+/// Returns the control length written (0: none queued, or no room).
+fn scm_recv(s: &Sock, control: u64, cap: u64, cloexec: bool) -> u64 {
+    use crate::win::*;
+    let Some(dir) = scm_dir(s) else { return 0 };
+    let Ok(rd) = std::fs::read_dir(&dir) else { return 0 };
+    let mut names: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_none_or(|e| e != "taken")).collect();
+    names.sort();
+    for p in names {
+        let claimed = p.with_extension("taken");
+        if std::fs::rename(&p, &claimed).is_err() {
+            continue; // another receiver got it first
+        }
+        let text = std::fs::read_to_string(&claimed).unwrap_or_default();
+        let _ = std::fs::remove_file(&claimed);
+        let mut fds = Vec::new();
+        for line in text.lines() {
+            let mut f = line.splitn(3, '\t');
+            let (Some(kind), Some(h), extra) = (f.next(), f.next().and_then(|h| h.parse::<isize>().ok()), f.next().unwrap_or("")) else { continue };
+            let mut mine = 0isize;
+            if h != 0 && unsafe { DuplicateHandle(holder(), h, GetCurrentProcess(), &mut mine, 0, 0, 1 | 2) } == 0 {
+                continue; // DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS
+            }
+            if let Ok(fd) = fs::import_fd(kind, mine as usize, extra, cloexec) {
+                fds.push(fd as i32);
+            }
+        }
+        let need = 16 + 4 * fds.len() as u64;
+        if fds.is_empty() || cap < need {
+            for fd in fds {
+                let _ = fs::close(fd as u64);
+            }
+            return 0;
+        }
+        unsafe {
+            *(control as *mut u64) = need;
+            *((control + 8) as *mut i32) = 1;
+            *((control + 12) as *mut i32) = 1;
+            std::ptr::copy_nonoverlapping(fds.as_ptr(), (control + 16) as *mut i32, fds.len());
+        }
+        return need.next_multiple_of(8).min(cap);
+    }
+    0
+}
 fn iovecs(iov: u64, n: u64) -> Result<Vec<[u64; 2]>, i64> {
     if n > 1024 {
         return Err(EINVAL);

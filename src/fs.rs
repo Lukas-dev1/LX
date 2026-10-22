@@ -813,24 +813,50 @@ pub fn proc_state(fork: bool) -> Vec<String> {
         let mut n = 0;
         for (i, s) in fs.fds.iter().enumerate() {
             let Some(s) = s.as_ref().filter(|s| fork || !s.cloexec) else { continue };
-            let (kind, h, path) = match &s.fd {
-                Fd::Handle(h) => ("h", h.as_raw_handle() as usize, String::new()),
-                Fd::Pipe(p) => ("p", p.raw() as usize, (p.nonblocking() as u8).to_string()),
-                Fd::File { f, host } => ("f", f.as_raw_handle() as usize, host.to_string_lossy().into_owned()),
-                Fd::Dir { guest, .. } => ("d", 0, guest.clone()),
-                Fd::Dev(d) => (d.tag(), 0, String::new()),
-                Fd::Socket(k) => ("s", k.s, k.inherit_tag()),
-                // ponytail: epoll instances aren't carried across fork/exec (servers make one per worker).
-                Fd::Epoll(_) => continue,
-                // ponytail: an eventfd shared across fork isn't carried either; each process starts without it.
-                Fd::Event(_) | Fd::Signal(_) => continue,
-            };
+            let Some((kind, h, path)) = entry(&s.fd) else { continue };
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
             n += 1;
         }
         v[4] = n.to_string();
         v
     })
+}
+
+/// How an fd travels to another lx process: (kind, handle, extra), the handle still ours.
+fn entry(fd: &Fd) -> Option<(&'static str, usize, String)> {
+    Some(match fd {
+        Fd::Handle(h) => ("h", h.as_raw_handle() as usize, String::new()),
+        Fd::Pipe(p) => ("p", p.raw() as usize, (p.nonblocking() as u8).to_string()),
+        Fd::File { f, host } => ("f", f.as_raw_handle() as usize, host.to_string_lossy().into_owned()),
+        Fd::Dir { guest, .. } => ("d", 0, guest.clone()),
+        Fd::Dev(d) => (d.tag(), 0, String::new()),
+        Fd::Socket(k) => ("s", k.s, k.inherit_tag()),
+        // ponytail: epoll instances aren't carried across fork/exec (servers make one per worker).
+        Fd::Epoll(_) => return None,
+        // ponytail: an eventfd shared across fork isn't carried either; each process starts without it.
+        Fd::Event(_) | Fd::Signal(_) => return None,
+    })
+}
+
+/// SCM_RIGHTS, sending side: fd's (kind, handle, extra); the handle stays ours (the caller duplicates it).
+pub fn export_fd(fd: u64) -> Result<(&'static str, usize, String), i64> {
+    with(|fs| fs.fds.get(fd as usize).and_then(|s| s.as_ref()).ok_or(EBADF).and_then(|s| entry(&s.fd).ok_or(EINVAL)))
+}
+
+/// SCM_RIGHTS, receiving side: a new fd for an `export_fd` record whose handle is now ours.
+pub fn import_fd(kind: &str, h: usize, extra: &str, cloexec: bool) -> R {
+    let fd = match kind {
+        "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(h as _) }),
+        "p" => Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (extra == "1").into() })),
+        "f" => Fd::File { f: unsafe { File::from_raw_handle(h as _) }, host: PathBuf::from(extra) },
+        "d" => Fd::Dir { guest: extra.to_string(), pos: 0 },
+        "null" => Fd::Dev(Dev::Null),
+        "zero" => Fd::Dev(Dev::Zero),
+        "random" => Fd::Dev(Dev::Random),
+        "s" => Fd::Socket(Arc::new(Sock::inherited(h, extra))),
+        _ => return Err(EINVAL),
+    };
+    Ok(add_fd(fd, cloexec))
 }
 
 /// Rebuild the fd table from `proc_state` fields (in the new lx). Returns the unparsed rest.
