@@ -215,6 +215,29 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicIsize, Ordering::SeqCst};
 static INTR: AtomicIsize = AtomicIsize::new(0);
 /// The guest's thread, so CancelSynchronousIo can break a blocked ReadFile/WriteFile.
 static GUEST_THREAD: AtomicIsize = AtomicIsize::new(0);
+static GUEST_TID: AtomicU32 = AtomicU32::new(0);
+/// Whether the guest thread is inside a ReadFile/WriteFile a signal may cancel. Only then: the cancel
+/// aborts whatever host call is running, and chdir's CreateFile failing would be a bogus EINTR.
+static IN_IO: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Run a blocking read/write that a signal may cut short (ERROR_OPERATION_ABORTED -> EINTR).
+/// Clearing the flag waits for a cancel in progress, so a cancel never lands after `f`.
+pub fn interruptible<T>(f: impl FnOnce() -> T) -> T {
+    if unsafe { crate::win::GetCurrentThreadId() } != GUEST_TID.load(SeqCst) {
+        return f(); // the cancel targets the guest thread only
+    }
+    *IN_IO.lock().unwrap() = true;
+    let r = f();
+    *IN_IO.lock().unwrap() = false;
+    r
+}
+
+fn cancel_io() {
+    let in_io = IN_IO.lock().unwrap();
+    if *in_io {
+        unsafe { crate::win::CancelSynchronousIo(GUEST_THREAD.load(SeqCst)) };
+    }
+}
 /// While this process only waits for an exec'd successor: pass signals on to it (same Linux pid).
 pub static FORWARD_TO: AtomicU32 = AtomicU32::new(0);
 
@@ -259,6 +282,7 @@ pub fn listen() {
         let mut t = 0isize;
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &mut t, 0, 0, 2); // SAME_ACCESS
         GUEST_THREAD.store(t, SeqCst);
+        GUEST_TID.store(GetCurrentThreadId(), SeqCst);
         INTR.store(CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()), SeqCst);
         SetConsoleCtrlHandler(Some(console_ctrl), 1);
     }
@@ -304,8 +328,8 @@ fn arrive(sig: u64) {
     }
     unsafe {
         crate::win::SetEvent(INTR.load(SeqCst));
-        crate::win::CancelSynchronousIo(GUEST_THREAD.load(SeqCst));
     }
+    cancel_io();
 }
 
 /// Break a blocking wait for a signal raised from another thread of ours, if the guest has a handler for
@@ -314,8 +338,8 @@ pub fn wake_if_handled(sig: u64) {
     if S.lock().unwrap().actions[sig as usize].handler > 1 { // not SIG_DFL (0) or SIG_IGN (1)
         unsafe {
             crate::win::SetEvent(INTR.load(SeqCst));
-            crate::win::CancelSynchronousIo(GUEST_THREAD.load(SeqCst));
         }
+        cancel_io();
     }
 }
 
