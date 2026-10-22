@@ -209,7 +209,7 @@ else
   else
     stuck=0 served=0 runs=5
     for i in $(seq $runs); do
-      $LX run --name "lxnginx-$$" nginx:alpine > "$OUT/nginx" 2>&1 < /dev/null & # named: only ours is stopped
+      $LX run --name "lxnginx-$$" -p 80:80 nginx:alpine > "$OUT/nginx" 2>&1 < /dev/null & # named: only ours is stopped
       for t in $(seq 50); do
         [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1/)" = 200 ] && break
         sleep 0.2

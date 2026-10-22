@@ -285,10 +285,11 @@ fn addr_out(a: &[u8], p: u64, lenp: u64) {
 // Containers share the host's network stack, so publishing is done by rewriting addresses at the
 // socket calls instead of with a proxy: bind() of a published container port binds the host port,
 // getsockname() reports the container port back, and the container's own connections to that port on
-// loopback are redirected. An `lx run` container's unpublished listeners on "any address" are moved to
-// loopback: reachable from this machine, not from the network, which is the closest we get to Docker's
-// isolation without network namespaces (and keeps Windows Firewall from prompting).
-// ponytail: two containers still can't both listen on the same unpublished port.
+// loopback are redirected. An `lx run` container's unpublished listeners on "any address" or 127.0.0.1
+// are moved to its own loopback address (127.x.y.z, `LX_IP`), and so are its connections to 127.0.0.1:
+// reachable from this machine, not from the network, which is the closest we get to Docker's isolation
+// without network namespaces (and keeps Windows Firewall from prompting), and two containers can listen
+// on the same port. IPv6 loopback is only ::1, so the container's ::1 is its IPv4 address too.
 
 struct Publish {
     udp: bool,
@@ -309,6 +310,20 @@ fn published() -> Option<&'static [Publish]> {
             Some(Publish { udp: f[0] == "udp", container: f.get(1)?.parse().ok()?, host: f.get(2)?.parse().ok()?, host_ip: ip })
         }).collect())
     }).as_deref()
+}
+
+/// The container's own loopback address: `LX_IP` (set by `lx run`, inherited like LX_PORTS).
+fn own_ip() -> Option<[u8; 4]> {
+    static IP: std::sync::OnceLock<Option<[u8; 4]>> = std::sync::OnceLock::new();
+    *IP.get_or_init(|| Some(std::env::var("LX_IP").ok()?.parse::<std::net::Ipv4Addr>().ok()?.octets()))
+}
+
+/// A loopback address for the container this process is the root of (`lx run` without `--ip`):
+/// 127.1-64.y.z from its Windows pid, which no other running container has.
+/// ponytail: unique while pids stay under 2^24; lx compose takes 127.128-255.y.z (see compose.rs).
+pub fn auto_ip() -> String {
+    let v = std::process::id() >> 2; // Windows pids are multiples of 4
+    format!("127.{}.{}.{}", 1 + (v >> 16 & 0x3f), v >> 8 & 0xff, v & 0xff)
 }
 
 /// `-p [hostip:]hostport:containerport[/udp]` -> an LX_PORTS entry.
@@ -381,31 +396,56 @@ fn bind_addr(s: usize, a: &mut [u8]) {
         }
         return;
     }
-    if fam == AF_INET && a[4..8] == [0; 4] {
-        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
-    } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == [0; 16] {
+    let ip = own_ip().unwrap_or([127, 0, 0, 1]);
+    if fam == AF_INET && (a[4..8] == [0; 4] || a[4..8] == [127, 0, 0, 1]) {
+        a[4..8].copy_from_slice(&ip);
+    } else if fam == AF_INET6_WIN && a.len() >= 24 && (a[8..24] == [0; 16] || a[8..24] == LOOPBACK6) {
         // A dual-stack [::] listener answers IPv4 too (php-fpm's `listen = 9000`, clients dial 127.0.0.1):
-        // ::ffff:127.0.0.1. An IPV6_V6ONLY one (nginx's [::]:80 next to its 0.0.0.0:80) takes ::1.
-        // ponytail: a dual-stack listener is then unreachable on ::1.
-        let (mut v6only, mut l) = (0i32, 4i32);
-        unsafe { getsockopt(s, 41, 27, (&mut v6only as *mut i32).cast(), &mut l) }; // IPPROTO_IPV6, IPV6_V6ONLY
-        if v6only != 0 {
-            a[23] = 1; // ::1
+        // ::ffff:<ip>. An IPV6_V6ONLY one (nginx's [::]:80 next to its 0.0.0.0:80), or one on ::1, would
+        // take ::1, which every container shares: it gets a free port there instead, and the container's
+        // clients of ::1 reach its IPv4 address (dest_addr).
+        // ponytail: so a server listening on ::1 alone is unreachable.
+        if v6only(s) || a[8..24] == LOOPBACK6 {
+            a[8..24].copy_from_slice(&LOOPBACK6);
+            if own_ip().is_some() {
+                set_port(a, 0);
+            }
         } else {
-            a[18..24].copy_from_slice(&[0xff, 0xff, 127, 0, 0, 1]);
+            a[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
         }
     }
 }
 
-/// connect()/sendto(): the container reaching its own published port on loopback goes to the host port.
+const LOOPBACK6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+fn v6only(s: usize) -> bool {
+    let (mut v6only, mut l) = (0i32, 4i32);
+    unsafe { getsockopt(s, 41, 27, (&mut v6only as *mut i32).cast(), &mut l) }; // IPPROTO_IPV6, IPV6_V6ONLY
+    v6only != 0
+}
+
+/// connect()/sendto(): the container reaching its own published port on loopback goes to the host port,
+/// and its other connections to 127.0.0.1 or ::1 to its own loopback address.
 fn dest_addr(s: usize, a: &mut [u8]) {
     let Some(ports) = published() else { return };
     if a.len() < 8 || !is_loopback(a) {
         return;
     }
+    let fam = u16::from_le_bytes([a[0], a[1]]);
+    if fam == AF_INET && a[4..8] != [127, 0, 0, 1] && own_ip() != Some([a[4], a[5], a[6], a[7]]) {
+        return; // another container's address: its ports are its own
+    }
     let udp = is_udp(s);
     if let Some(m) = ports.iter().find(|m| m.udp == udp && m.container == port_of(a)) {
         set_port(a, m.host);
+        return;
+    }
+    // A host resolver on loopback (a VPN's, dnscrypt) stays the host's.
+    let (Some(ip), false) = (own_ip(), port_of(a) == 53) else { return };
+    if fam == AF_INET && a[4..8] == [127, 0, 0, 1] {
+        a[4..8].copy_from_slice(&ip);
+    } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == LOOPBACK6 && !v6only(s) {
+        a[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
     }
 }
 

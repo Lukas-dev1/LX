@@ -262,7 +262,8 @@ fn enter_job() -> Result<(), String> {
 const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull nginx:alpine
        lx run [-p [ip:]hostport:port[/udp]]... <image> [command args...]
                                              runs the image's entrypoint/cmd, or the given command;
-                                             -p publishes a container port (others stay on localhost)
+                                             -p publishes a container port (others stay on its own
+                                             loopback address, 127.x.y.z: --ip sets it)
                                              -v C:\\data:/data[:ro] mounts a host folder (repeatable)
                                              -m 2g caps each process's memory (default: the machine's RAM)
                                              -e NAME=value (or -e NAME: the host's) sets an env var
@@ -427,6 +428,9 @@ fn run() -> Result<(), String> {
                     let (n, ip) = value.split_once(':').ok_or(format!("bad --add-host {value:?}: want name:ip"))?;
                     extra_hosts.push((n.to_string(), ip.to_string()));
                 }
+                // Its own loopback address (lx compose gives each service one its others know).
+                "--ip" if value.parse::<std::net::Ipv4Addr>().is_ok_and(|a| a.is_loopback()) => unsafe { env::set_var("LX_IP", value) },
+                "--ip" => return Err(format!("bad --ip {value:?}: want a 127.x.y.z address")),
                 "-u" | "--user" => user = Some(value.clone()),
                 "--name" => {
                     if let Some(pid) = proc::container_pid(value) {
@@ -451,6 +455,9 @@ fn run() -> Result<(), String> {
         let [image, rest @ ..] = rest else { return Err(USAGE.into()) };
         // Every lx process of this container inherits it (fork and exec start new lx processes).
         unsafe { env::set_var("LX_PORTS", ports.join(",")) };
+        if env::var("LX_IP").is_err() {
+            unsafe { env::set_var("LX_IP", net::auto_ip()) };
+        }
         let dir = match image.strip_prefix("dir:") {
             Some(d) => std::path::PathBuf::from(d), // lx build: an image being built
             None => {
@@ -504,7 +511,7 @@ fn run() -> Result<(), String> {
         // What `lx exec` needs to step into this container.
         let config = serde_json::json!({
             "root": root, "layer": layer, "env": c.env, "workdir": c.workdir, "uid": uid, "gid": gid,
-            "ports": ports.join(","), "mounts": volumes.iter().map(|(h, g, ro)| serde_json::json!([h, g, ro])).collect::<Vec<_>>(),
+            "ports": ports.join(","), "ip": env::var("LX_IP").unwrap_or_default(), "mounts": volumes.iter().map(|(h, g, ro)| serde_json::json!([h, g, ro])).collect::<Vec<_>>(),
             "name": name,
         });
         proc::register_container(&format!("{image}  {}", c.argv.join(" ")), &config.to_string());
@@ -604,6 +611,7 @@ fn exec(args: &[String]) -> Result<(), String> {
         win::CloseHandle(job); // kill-on-close fires when the container's own handle goes: ours mustn't hold it open
         env::set_var("LX_IN_JOB", pid.to_string()); // the container's first lx, as enter_job records it
         env::set_var("LX_PORTS", cfg["ports"].as_str().unwrap_or(""));
+        env::set_var("LX_IP", cfg["ip"].as_str().unwrap_or(""));
     }
     let mut envv: Vec<String> = cfg["env"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(String::from)).collect();
     for e in envs {
