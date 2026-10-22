@@ -537,6 +537,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
     if !bytes.starts_with(b"\x7fELF") && !bytes.starts_with(b"#!") {
         return Err(ENOEXEC); // the shell then runs it as a script itself
     }
+    drop(bytes); // we only wait from here on: don't keep the whole program (traefik: 176 MB) while it runs
     let spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner()); // see fork
     let (mut state, handles) = fs::proc_state(false);
     state.push(PARENT.load(Relaxed).to_string()); // exec keeps the pid relationship
