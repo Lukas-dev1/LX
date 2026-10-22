@@ -219,7 +219,8 @@ else
   # The package managers a Dockerfile's RUN lines use most.
   online "alpine: apk add" "jq says 1" run alpine sh -c 'apk add -q --no-cache jq && echo "jq says $(echo "{\"a\": 1}" | jq .a)"'
   online "pip install" "requests 2" run python:3.12-alpine sh -c 'pip install -q --root-user-action=ignore requests 2> /dev/null; python3 -c "import requests; print(\"requests\", requests.__version__)"'
-  online "npm install" "left-pad --x" run node:alpine sh -c 'cd /tmp && npm init -y > /dev/null && npm install -s left-pad && node -e "console.log(\"left-pad\", require(\"left-pad\")(\"x\", 3, \"-\"))"'
+  # --no-audit: the registry's audit endpoint can stall on npm's User-Agent (seen 2026-10-22); it's not what this tests.
+  online "npm install" "left-pad --x" run node:alpine sh -c 'cd /tmp && npm init -y > /dev/null && npm install --no-audit --no-fund -s left-pad && node -e "console.log(\"left-pad\", require(\"left-pad\")(\"x\", 3, \"-\"))"'
   # glibc should stay off the trap path too: no fallback traps, no FS faults in a full threaded run.
   LX_PATCHLOG=1 timeout 120 $LX run -v "$GUEST" python:3.12 python3 /t/nettest.py < /dev/null > "$OUT/deb" 2>&1
   if grep -q " 0 fallback traps;.* 0 FS-base faults" "$OUT/deb"; then ok "debian: no trap fallbacks"; else bad "debian: trap fallbacks taken"; grep "exit:" "$OUT/deb"; fi
