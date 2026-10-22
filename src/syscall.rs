@@ -69,6 +69,8 @@ pub struct ThreadState {
     /// This thread's blocked signals, and the one to restore after rt_sigsuspend's handler.
     pub sigmask: u64,
     pub suspended_mask: Option<u64>,
+    /// The syscall that just returned EINTR, + 1, if a handler with SA_RESTART should restart it (0: no).
+    pub restart: u64,
     /// Signals sent to this thread alone (tkill/tgkill), and the futex address it sleeps on (0 = none),
     /// so a sender can wake it. Read and written by other threads.
     pub tpending: std::sync::atomic::AtomicU64,
@@ -146,7 +148,7 @@ pub fn ts() -> &'static mut ThreadState {
     assert!(host != 0, "no memory for a thread's lx stack");
     let st = Box::leak(Box::new(ThreadState {
         fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host + HOST_STACK as u64,
-        frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None,
+        frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None, restart: 0,
         tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
         on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]), in_direct: false,
     }));
@@ -323,6 +325,15 @@ pub static FALLBACK_TRAPS: AtomicU64 = AtomicU64::new(0);
 /// FS-base reload faults (NT dropped FS base on a context switch; the next %fs: access faulted).
 pub static FS_FAULTS: AtomicU64 = AtomicU64::new(0);
 
+/// A syscall that returned EINTR and that Linux restarts after a handler with SA_RESTART (ERESTARTSYS):
+/// its number + 1, else 0. Not poll/select/epoll_wait, sleeps or sigsuspend, which return EINTR anyway.
+fn restartable(nr: u64, ret: i64) -> u64 {
+    // read write pread pwrite readv writev sendfile connect accept sendto recvfrom sendmsg recvmsg wait4
+    // fcntl (F_SETLKW) flock futex waitid openat accept4 preadv pwritev splice tee
+    const NRS: [u64; 25] = [0, 1, 17, 18, 19, 20, 40, 42, 43, 44, 45, 46, 47, 61, 72, 73, 202, 247, 257, 288, 295, 296, 275, 276, 16];
+    if ret == -EINTR && NRS.contains(&nr) { nr + 1 } else { 0 }
+}
+
 /// Rust half of the direct path, on the thread's lx stack. Same semantics as the exception path.
 #[unsafe(no_mangle)]
 unsafe extern "system" fn lx_direct(f: *mut DirectFrame) {
@@ -343,7 +354,9 @@ unsafe extern "system" fn lx_direct(f: *mut DirectFrame) {
     } else {
         let next = c.rip;
         c.rip = next - 2; // what the trap path sees: the address of the syscall instruction
+        let nr = c.rax;
         let ret = dispatch(c);
+        t.restart = restartable(nr, ret);
         (c.rax, c.rcx, c.r11, c.rip) = (ret as u64, next, c.eflags as u64, next);
     }
     if let Some(frame) = signal::deliver(c) {
@@ -847,7 +860,9 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
         }
         STATUS_ILLEGAL_INSTRUCTION if is_site => {
             FALLBACK_TRAPS.fetch_add(1, Relaxed);
+            let nr = c.rax;
             let ret = dispatch(c);
+            ts().restart = restartable(nr, ret);
             let next = c.rip + 2;
             (c.rax, c.rcx, c.r11, c.rip) = (ret as u64, next, c.eflags as u64, next); // kernel ABI: rcx=rip, r11=rflags
             resume_with_signals(c)
