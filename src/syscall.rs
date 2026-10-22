@@ -762,7 +762,15 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
         let mut m = 0isize;
         (unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, c.rip as *const _, &mut m) }) == 0
     };
-    let Some((_, end)) = region.or(jit.then_some((c.rip, c.rip + 15))) else {
+    // For JIT code, decode only what's committed at rip: a guest that jumped into unmapped memory faults
+    // there, and reading 15 bytes past it made our own handler crash.
+    let jit_end = || {
+        let mut m = MemoryBasicInformation::default();
+        let ok = unsafe { VirtualQuery(c.rip as *const _, &mut m, size_of::<MemoryBasicInformation>()) } != 0;
+        let readable = ok && m.state == MEM_COMMIT && m.protect & 0xff & !0x01 != 0; // not PAGE_NOACCESS
+        if readable { (m.base as u64 + m.region_size as u64).min(c.rip + 15) } else { c.rip }
+    };
+    let Some((_, end)) = region.or(jit.then(|| (c.rip, jit_end()))) else {
         if debug() && rec.code == STATUS_ACCESS_VIOLATION {
             let base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
             let msg = format!("[lx] host fault at rip {:#x} (lx.exe+{:#x}) addr {:#x} tid {}
