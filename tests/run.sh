@@ -63,7 +63,7 @@ if [ -x $GO ]; then
 fi
 
 # ---- images: pull what's missing; guest scripts reach containers through a read-only volume ----
-for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine node:alpine golang:alpine mariadb:11 rabbitmq:3-alpine; do
+for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine node:alpine golang:alpine mariadb:11 rabbitmq:3-alpine mongo:7; do
   dir=$STORE/library_${img%%:*}/${img#*:}/rootfs
   # Pulled before lx kept file modes, every file reads 0755 (no real image has /etc/passwd so): re-pull.
   if [ -d "$dir" ] && [ "$($LX run "$img" stat -c %a /etc/passwd 2> /dev/null < /dev/null)" = 755 ]; then
@@ -104,6 +104,7 @@ expect "per-thread signal masks (threads, fork)" 0 "OK" -- run -v "$GUEST" pytho
 expect "sigwait / sigwaitinfo / sigtimedwait" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/sigwait.py
 expect "dup'd fds survive fork/exec (socket, pipe)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/dupfds.py
 expect "SCM_RIGHTS: pipe + file to a forked child" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/scmtest.py
+expect "timerfd: one-shot, periodic, poll, disarm" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/timerfd.py
 expect "short timed waits sleep ~1 ms (no spin, no 15 ms tick)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/timedwait.py
 expect "erlang: VM, 1000 processes, os:cmd port" 0 "sum=6 procs=1000 port-ok" -- run rabbitmq:3-alpine erl -noshell -eval 'io:format("sum=~p procs=~p ~s~n",[lists:sum([1,2,3]), length([spawn(fun() -> ok end) || _ <- lists:seq(1,1000)]), os:cmd("echo port-ok")]), halt().'
 expect "/proc/self/fd lists open fds" 0 "0 1 2 3" -- run alpine sh -c 'ls /proc/self/fd | tr "\n" " "'
@@ -112,6 +113,7 @@ expect "httpd: config check (ErrorLog /proc/self/fd/2)" 0 "Syntax OK" -- run htt
 expect "java -version (HotSpot's SIGSEGV use)" 0 "OpenJDK 64-Bit Server VM" -- run eclipse-temurin:21-jre-alpine java -version
 # mariadb through its official entrypoint (gosu, install-db, InnoDB). -p: the host may run its own 3306.
 expect "mariadb: entrypoint + InnoDB query" 0 "hello,lx" -- run -p 13306:3306 -e MARIADB_ROOT_PASSWORD=x mariadb:11 sh -c 'docker-entrypoint.sh mariadbd > /tmp/log 2>&1 & for i in $(seq 1 100); do mariadb -uroot -px -e "select 1" > /dev/null 2>&1 && break; sleep 1; done; mariadb -uroot -px -e "create database t; create table t.a (id int primary key, s text) engine=innodb; insert into t.a values (1, \"hello\"), (2, \"lx\"); select group_concat(s) from t.a"; mariadb-admin -uroot -px shutdown; wait'
+expect "mongodb: mongod + mongosh aggregate" 0 "sum=42" -- run -p 27018:27017 mongo:7 sh -c 'mongod --bind_ip_all > /tmp/log 2>&1 & for i in $(seq 1 60); do grep -q "Waiting for connections" /tmp/log && break; sleep 1; done; mongosh --quiet --eval "db.t.insertOne({a:1}); db.t.insertOne({a:41}); print(\"sum=\" + db.t.aggregate([{\$group:{_id:null,s:{\$sum:\"\$a\"}}}]).toArray()[0].s)"; mongosh --quiet admin --eval "db.shutdownServer()" > /dev/null 2>&1; wait'
 # -e adds and overrides the image's env (PYTHON_VERSION is set by the image), -w sets the directory.
 expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERSION=9 -w /usr python:3.12-alpine sh -c 'echo A=$A V=$PYTHON_VERSION $(pwd)'
 expect "run -u / USER + HOME"      0 "65534:65533 HOME=/." -- run -u nobody:nogroup alpine sh -c 'echo $(id -u):$(id -g) HOME=$HOME.'
