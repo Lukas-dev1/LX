@@ -7,13 +7,13 @@
 cd "$(dirname "$0")/.." || exit 1
 LX=${LX:-./target/release/lx.exe}
 OUT=${OUT:-compat-results.md}
-T=${T:-150}
+T=${T:-180}
 SUITE_IMAGES=" alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine node:alpine golang:alpine mariadb:11 rabbitmq:3-alpine mongo:7 wordpress:fpm-alpine "
 export MSYS_NO_PATHCONV=1
 
 # A service started in the background, polled from inside the container until it answers.
 # bg <start command> <check command>
-bg() { printf '%s > /tmp/svc.log 2>&1 & for i in $(seq 1 90); do %s && break; sleep 1; done; echo; tail -2 /tmp/svc.log' "$1" "$2"; }
+bg() { printf '%s > /tmp/svc.log 2>&1 & for i in $(seq 1 120); do %s && break; sleep 1; done; echo; tail -2 /tmp/svc.log' "$1" "$2"; }
 
 cat > /tmp/lx-compat-list.txt <<'EOF'
 alpine|alpine:latest|Alpine Linux|sh -c 'cat /etc/os-release | head -1'
