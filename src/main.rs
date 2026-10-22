@@ -264,7 +264,7 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
        lx logs <name|pid>                     output of a `lx run -d` container
        lx exec [-e ..] [-w dir] [-u user] <name|pid> <command> [args...]
                                              runs a command inside a running container
-       lx compose [-f file] up|down|ps|logs  the services of a compose file (up starts them detached)
+       lx compose [-f file] up [-d]|down|ps|logs   the services of a compose file
        lx images                             pulled and built images
        lx rmi <image>...                     remove images
        lx ps                                 running containers

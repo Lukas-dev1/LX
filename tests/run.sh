@@ -281,7 +281,7 @@ if [ "$out" = by-name ] && echo "$dup" | grep -q "already in use"; then ok "lx r
 
 # lx compose: a built service reaches another by its service name; down stops both.
 CF=guest/composetest/compose.yaml
-$LX compose -f $CF up > "$OUT/compose" 2>&1
+$LX compose -f $CF up -d > "$OUT/compose" 2>&1
 for _ in $(seq 40); do got=$($LX exec composetest-cache redis-cli -p 6391 get greeting 2>/dev/null); [ "$got" = "hello from app" ] && break; sleep 0.5; done
 $LX compose -f $CF down > /dev/null 2>&1
 left=$($LX ps | grep -c composetest)
