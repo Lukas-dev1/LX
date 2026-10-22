@@ -2104,6 +2104,14 @@ pub fn chmeta_at(dirfd: u64, path: u64, follow: bool, mode: Option<u64>, owner: 
     })
 }
 
+/// fchmodat2: fchmodat with its flags (AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH for the dirfd itself).
+pub fn fchmodat2(dirfd: u64, path: u64, mode: u64, flags: u64) -> R {
+    if flags & AT_EMPTY_PATH != 0 && cstr(path)?.is_empty() {
+        return fchmeta(dirfd, Some(mode), None);
+    }
+    chmeta_at(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0, Some(mode), None)
+}
+
 /// fchmod, fchown: by the file's path in the container. Pipes, sockets and the like: accepted.
 pub fn fchmeta(fd: u64, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
     with(|fs| {

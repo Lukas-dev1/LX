@@ -920,6 +920,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         90 => fs::chmeta_at(CWD, a[0], true, Some(a[1]), None),                     // chmod
         91 => fs::fchmeta(a[0], Some(a[1]), None),                                  // fchmod
         268 => fs::chmeta_at(a[0], a[1], true, Some(a[2]), None),                   // fchmodat (no flags)
+        452 => fs::fchmodat2(a[0], a[1], a[2], a[3]),
         92 => fs::chmeta_at(CWD, a[0], true, None, Some((a[1], a[2]))),             // chown
         93 => fs::fchmeta(a[0], None, Some((a[1], a[2]))),                          // fchown
         94 => fs::chmeta_at(CWD, a[0], false, None, Some((a[1], a[2]))),            // lchown
