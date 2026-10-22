@@ -1091,6 +1091,14 @@ pub fn sys_getsockopt(fd: u64, level: u64, name: u64, val: u64, lenp: u64) -> R 
             return int(t);
         }
         (1, 2) | (1, 15) => return int(0),                     // SO_REUSEADDR / SO_REUSEPORT: as set (ignored)
+        (1, 17) => {
+            // SO_PEERCRED: struct ucred { pid, uid, gid } (s6's getpeereid, s6-sudod). ponytail: the peer isn't
+            // known; both ends are in this container, usually as the same user, so it's our own credentials.
+            let ids = [crate::proc::getpid().unwrap_or(0) as u32, crate::proc::UID.load(Relaxed), crate::proc::GID.load(Relaxed)];
+            unsafe { *(val as *mut [u32; 3]) = ids };
+            unsafe { *(lenp as *mut u32) = 12 };
+            return Ok(0);
+        }
         (6, 11) => {
             // TCP_INFO: the state (LISTEN or ESTABLISHED), counters zero. php-fpm reads its listen queue
             // from it every second. ponytail: no real statistics.
