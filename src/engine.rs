@@ -436,6 +436,7 @@ struct Container {
     name: String,
     created: SystemTime,
     body: Value, // the create request: Image, Cmd, Env, HostConfig, Labels, ...
+    ip: String,  // its own loopback address (lx run --ip): others reach it there by name
     run: Arc<Run>,
 }
 
@@ -463,6 +464,26 @@ fn find(key: &str) -> Option<Arc<Container>> {
     }
 }
 
+/// A loopback address for the n-th container: 127.65-127.y.z, apart from lx run's own (127.1-64) and
+/// lx compose's (127.128-255).
+fn ip_for(n: u32) -> String {
+    format!("127.{}.{}.{}", 65 + (n >> 16) % 63, (n >> 8) & 255, (n & 255).max(1))
+}
+
+/// The networks a container is on, and the names it answers to there (its name, compose's aliases).
+fn nets(c: &Container) -> Vec<(String, Vec<String>)> {
+    let mut v: Vec<(String, Vec<String>)> = c.body["NetworkingConfig"]["EndpointsConfig"].as_object().into_iter().flatten()
+        .map(|(net, ep)| (net.clone(), strs(&ep["Aliases"]))).collect();
+    if v.is_empty() {
+        let mode = c.body["HostConfig"]["NetworkMode"].as_str().unwrap_or("default");
+        v.push((if mode == "default" { "bridge".into() } else { mode.into() }, Vec::new()));
+    }
+    for (_, names) in &mut v {
+        names.insert(0, c.name.clone());
+    }
+    v
+}
+
 fn image_exists(name: &str) -> bool {
     crate::image::Ref::parse(name).dir().join("config.json").exists()
 }
@@ -474,7 +495,18 @@ fn strs(v: &Value) -> Vec<String> {
 /// The `lx run` command line for a create request.
 fn run_args(c: &Container) -> Vec<String> {
     let (b, hc) = (&c.body, &c.body["HostConfig"]);
-    let mut a = vec!["run".to_string(), "--name".into(), c.name.clone()];
+    let mut a = vec!["run".to_string(), "--name".into(), c.name.clone(), "--ip".into(), c.ip.clone()];
+    // The other containers on its networks, by name, like Docker's DNS. ponytail: as of this start.
+    let mine: Vec<String> = nets(c).into_iter().map(|(n, _)| n).collect();
+    for other in CONTAINERS.lock().unwrap().iter().filter(|o| o.id != c.id) {
+        for (net, names) in nets(other) {
+            if mine.contains(&net) && net != "bridge" {
+                for n in names {
+                    a.extend(["--add-host".into(), format!("{n}:{}", other.ip)]);
+                }
+            }
+        }
+    }
     for e in strs(&b["Env"]) {
         a.extend(["-e".into(), e]);
     }
@@ -602,13 +634,7 @@ fn summary(c: &Container) -> Value {
 }
 
 fn networks_of(c: &Container) -> Value {
-    let mode = c.body["HostConfig"]["NetworkMode"].as_str().unwrap_or("bridge");
-    let mut nets = serde_json::Map::new();
-    let names: Vec<String> = c.body["NetworkingConfig"]["EndpointsConfig"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
-    for n in if names.is_empty() { vec![if mode == "default" { "bridge".to_string() } else { mode.to_string() }] } else { names } {
-        nets.insert(n.clone(), json!({ "IPAddress": "127.0.0.1", "Gateway": "", "NetworkID": n, "Aliases": [c.name] }));
-    }
-    Value::Object(nets)
+    Value::Object(nets(c).into_iter().map(|(n, names)| (n.clone(), json!({ "IPAddress": c.ip, "Gateway": "", "NetworkID": n, "Aliases": names }))).collect())
 }
 
 fn inspect(c: &Container) -> Value {
@@ -625,7 +651,7 @@ fn inspect(c: &Container) -> Value {
                    "StartedAt": rfc3339(s.started), "FinishedAt": rfc3339(s.finished) },
         "Image": image_id(c.body["Image"].as_str().unwrap_or("")), "Name": format!("/{}", c.name), "RestartCount": 0, "Driver": "lx", "Platform": "linux",
         "Config": config, "HostConfig": c.body["HostConfig"], "Mounts": [],
-        "NetworkSettings": { "Ports": {}, "Networks": networks_of(c), "IPAddress": "127.0.0.1" },
+        "NetworkSettings": { "Ports": {}, "Networks": networks_of(c), "IPAddress": c.ip },
     })
 }
 
@@ -726,9 +752,11 @@ fn route(r: &Req, c: &mut Conn) -> bool {
             } else if !name.is_empty() && find(&name).is_some_and(|c| c.name == name) {
                 fail(&p, 409, &format!("Conflict. The container name \"/{name}\" is already in use"));
             } else {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 let id = new_id();
                 let name = if name.is_empty() { format!("lx_{}", &id[..8]) } else { name };
-                CONTAINERS.lock().unwrap().push(Arc::new(Container { id: id.clone(), name, created: SystemTime::now(), body, run: Arc::default() }));
+                let ip = ip_for(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+                CONTAINERS.lock().unwrap().push(Arc::new(Container { id: id.clone(), name, created: SystemTime::now(), body, ip, run: Arc::default() }));
                 reply(&p, 201, json!({ "Id": id, "Warnings": [] }));
             }
         }
@@ -964,5 +992,7 @@ mod tests {
         assert_eq!(unescape("a+b%2"), "a b%2");
         assert_eq!(frame(1, b"hi", false), [1, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
         assert_eq!(rfc3339(Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))), "2023-11-14T22:13:20Z");
+        assert_eq!(ip_for(1), "127.65.0.1");
+        assert_eq!(ip_for(258), "127.65.1.2");
     }
 }
