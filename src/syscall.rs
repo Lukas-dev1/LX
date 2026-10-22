@@ -434,9 +434,18 @@ fn alloc_ex(fixed: Option<u64>, len: u64, commit: bool) -> Option<u64> {
 /// The guest stack stays: our own code is running on it.
 pub fn release_guest_memory() {
     let (lo, _) = ts().stack;
+    // We may still be running on the guest's stack (a trapped execve's handler), so the allocation that
+    // holds it stays reserved, but only the pages near where we are stay committed: Go's thread stacks
+    // live in its heap arenas, and keeping all of that made every waiting exec proxy hold its copy of
+    // the parent's heap (Grafana: 13 proxies, ~1 GB).
+    let here = &lo as *const u64 as u64;
+    let (keep_lo, keep_hi) = ((here & !(PAGE - 1)).saturating_sub(256 << 10), (here & !(PAGE - 1)) + (1 << 20));
     let mut allocs = ALLOCS.lock().unwrap();
     allocs.retain(|&(base, len)| {
-        if (base..base + len).contains(&lo) {
+        if (base..base + len).contains(&lo) || (base..base + len).contains(&here) {
+            let end = base + len;
+            decommit(base, keep_lo.clamp(base, end) - base);
+            decommit(keep_hi.clamp(base, end), end - keep_hi.clamp(base, end));
             return true;
         }
         release_span(base, len); // a shared image (map_image) is several allocations
