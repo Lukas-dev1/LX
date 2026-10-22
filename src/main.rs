@@ -2,6 +2,7 @@
 mod build;
 mod compose;
 mod elf;
+mod engine;
 mod fs;
 mod jump;
 mod image;
@@ -328,6 +329,9 @@ fn run() -> Result<(), String> {
         syscall::install();
         let (regs, (lo, hi)) = proc::receive_fork(state, parent, ready)?;
         syscall::enter(regs, lo, hi)
+    }
+    if let [cmd, rest @ ..] = args.as_slice() && cmd == "engine" {
+        return engine::serve(rest.first().map(String::as_str));
     }
     if let [cmd, image] = args.as_slice() && cmd == "pull" {
         let dir = image::pull(&image::Ref::parse(image))?;
