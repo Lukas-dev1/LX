@@ -1,0 +1,3 @@
+# lx build in the suite: these must not reach the image (checked by a RUN in the Dockerfile).
+ignored.txt
+**/*.log
