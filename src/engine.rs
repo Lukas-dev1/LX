@@ -260,6 +260,9 @@ fn open_stream(p: &Pipe, code: u16, ctype: &str, upgrade: bool) {
 fn connection(p: Arc<Pipe>) {
     let mut c = Conn { p: p.clone(), buf: Vec::new() };
     while let Some(req) = c.request() {
+        if std::env::var_os("LX_ENGINE_LOG").is_some() {
+            eprintln!("[lx engine] {} {} {:?}", req.method, req.path, req.query);
+        }
         if !route(&req, &mut c) {
             break; // hijacked or streamed: the connection is done
         }
@@ -436,12 +439,35 @@ struct Container {
     name: String,
     created: SystemTime,
     body: Value, // the create request: Image, Cmd, Env, HostConfig, Labels, ...
+    ip: String,  // its own loopback address (lx run --ip): others reach it there by name
     run: Arc<Run>,
 }
 
 static CONTAINERS: Mutex<Vec<Arc<Container>>> = Mutex::new(Vec::new());
 static EXECS: Mutex<Vec<(String, Arc<Container>, Value, Arc<Run>)>> = Mutex::new(Vec::new());
 static NETWORKS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+/// Clients following /events, with their filters.
+static WATCHERS: Mutex<Vec<(Arc<Pipe>, Value)>> = Mutex::new(Vec::new());
+
+/// A container event (create, start, die, destroy) to everyone watching /events whose filters match.
+fn emit(action: &str, c: &Container, exit_code: Option<i32>) {
+    let mut attrs = c.body["Labels"].as_object().cloned().unwrap_or_default();
+    attrs.insert("name".into(), json!(c.name));
+    attrs.insert("image".into(), c.body["Image"].clone());
+    if let Some(code) = exit_code {
+        attrs.insert("exitCode".into(), json!(code.to_string()));
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let ev = json!({ "Type": "container", "Action": action, "status": action, "id": c.id, "from": c.body["Image"],
+                     "Actor": { "ID": c.id, "Attributes": attrs }, "scope": "local", "time": now.as_secs(), "timeNano": now.as_nanos() as u64 });
+    let line = format!("{ev}
+");
+    WATCHERS.lock().unwrap().retain(|(p, f)| {
+        let allows = |key: &str, v: &str| filter_vals(&f[key]).is_empty() || filter_vals(&f[key]).iter().any(|x| x == v);
+        let wanted = allows("type", "container") && allows("event", action) && matches_filters(c, &json!({ "label": f["label"] }));
+        !wanted || p.send(line.as_bytes()).is_ok()
+    });
+}
 
 fn new_id() -> String {
     let mut b = [0u8; 32];
@@ -463,8 +489,33 @@ fn find(key: &str) -> Option<Arc<Container>> {
     }
 }
 
+/// A loopback address for the n-th container: 127.65-127.y.z, apart from lx run's own (127.1-64) and
+/// lx compose's (127.128-255).
+fn ip_for(n: u32) -> String {
+    format!("127.{}.{}.{}", 65 + (n >> 16) % 63, (n >> 8) & 255, (n & 255).max(1))
+}
+
+/// The networks a container is on, and the names it answers to there (its name, compose's aliases).
+fn nets(c: &Container) -> Vec<(String, Vec<String>)> {
+    let mut v: Vec<(String, Vec<String>)> = c.body["NetworkingConfig"]["EndpointsConfig"].as_object().into_iter().flatten()
+        .map(|(net, ep)| (net.clone(), strs(&ep["Aliases"]))).collect();
+    if v.is_empty() {
+        let mode = c.body["HostConfig"]["NetworkMode"].as_str().unwrap_or("default");
+        v.push((if mode == "default" { "bridge".into() } else { mode.into() }, Vec::new()));
+    }
+    for (_, names) in &mut v {
+        names.insert(0, c.name.clone());
+    }
+    v
+}
+
 fn image_exists(name: &str) -> bool {
     crate::image::Ref::parse(name).dir().join("config.json").exists()
+}
+
+/// A filter's values: clients send `{"key": ["a"]}` or `{"key": {"a": true}}`.
+fn filter_vals(v: &Value) -> Vec<String> {
+    v.as_object().map_or_else(|| strs(v), |m| m.keys().cloned().collect())
 }
 
 fn strs(v: &Value) -> Vec<String> {
@@ -474,7 +525,18 @@ fn strs(v: &Value) -> Vec<String> {
 /// The `lx run` command line for a create request.
 fn run_args(c: &Container) -> Vec<String> {
     let (b, hc) = (&c.body, &c.body["HostConfig"]);
-    let mut a = vec!["run".to_string(), "--name".into(), c.name.clone()];
+    let mut a = vec!["run".to_string(), "--name".into(), c.name.clone(), "--ip".into(), c.ip.clone()];
+    // The other containers on its networks, by name, like Docker's DNS. ponytail: as of this start.
+    let mine: Vec<String> = nets(c).into_iter().map(|(n, _)| n).collect();
+    for other in CONTAINERS.lock().unwrap().iter().filter(|o| o.id != c.id) {
+        for (net, names) in nets(other) {
+            if mine.contains(&net) && net != "bridge" {
+                for n in names {
+                    a.extend(["--add-host".into(), format!("{n}:{}", other.ip)]);
+                }
+            }
+        }
+    }
     for e in strs(&b["Env"]) {
         a.extend(["-e".into(), e]);
     }
@@ -531,10 +593,14 @@ fn start(c: &Arc<Container>) -> Result<(), String> {
     let auto_remove = c.body["HostConfig"]["AutoRemove"].as_bool().unwrap_or(false);
     let me = c.clone();
     spawn(&c.run, &run_args(c), stdin, move || {
+        emit("die", &me, me.run.s.lock().unwrap().code);
         if auto_remove {
             CONTAINERS.lock().unwrap().retain(|x| !Arc::ptr_eq(x, &me));
+            emit("destroy", &me, None);
         }
-    })
+    })?;
+    emit("start", c, None);
+    Ok(())
 }
 
 fn rfc3339(t: Option<SystemTime>) -> String {
@@ -602,13 +668,7 @@ fn summary(c: &Container) -> Value {
 }
 
 fn networks_of(c: &Container) -> Value {
-    let mode = c.body["HostConfig"]["NetworkMode"].as_str().unwrap_or("bridge");
-    let mut nets = serde_json::Map::new();
-    let names: Vec<String> = c.body["NetworkingConfig"]["EndpointsConfig"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
-    for n in if names.is_empty() { vec![if mode == "default" { "bridge".to_string() } else { mode.to_string() }] } else { names } {
-        nets.insert(n.clone(), json!({ "IPAddress": "127.0.0.1", "Gateway": "", "NetworkID": n, "Aliases": [c.name] }));
-    }
-    Value::Object(nets)
+    Value::Object(nets(c).into_iter().map(|(n, names)| (n.clone(), json!({ "IPAddress": c.ip, "Gateway": "", "NetworkID": n, "Aliases": names }))).collect())
 }
 
 fn inspect(c: &Container) -> Value {
@@ -625,7 +685,7 @@ fn inspect(c: &Container) -> Value {
                    "StartedAt": rfc3339(s.started), "FinishedAt": rfc3339(s.finished) },
         "Image": image_id(c.body["Image"].as_str().unwrap_or("")), "Name": format!("/{}", c.name), "RestartCount": 0, "Driver": "lx", "Platform": "linux",
         "Config": config, "HostConfig": c.body["HostConfig"], "Mounts": [],
-        "NetworkSettings": { "Ports": {}, "Networks": networks_of(c), "IPAddress": "127.0.0.1" },
+        "NetworkSettings": { "Ports": {}, "Networks": networks_of(c), "IPAddress": c.ip },
     })
 }
 
@@ -638,8 +698,7 @@ fn image_id(name: &str) -> String {
 
 fn matches_filters(c: &Container, filters: &Value) -> bool {
     let labels = &c.body["Labels"];
-    let ok = |key: &str, test: &dyn Fn(&str) -> bool| strs(&filters[key]).iter().all(|v| test(v))
-        && filters[key].as_object().is_none_or(|m| m.keys().all(|v| test(v))); // both filter encodings
+    let ok = |key: &str, test: &dyn Fn(&str) -> bool| filter_vals(&filters[key]).iter().all(|v| test(v));
     ok("label", &|l| match l.split_once('=') {
         Some((k, v)) => labels[k].as_str() == Some(v),
         None => !labels[l].is_null(),
@@ -726,9 +785,13 @@ fn route(r: &Req, c: &mut Conn) -> bool {
             } else if !name.is_empty() && find(&name).is_some_and(|c| c.name == name) {
                 fail(&p, 409, &format!("Conflict. The container name \"/{name}\" is already in use"));
             } else {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 let id = new_id();
                 let name = if name.is_empty() { format!("lx_{}", &id[..8]) } else { name };
-                CONTAINERS.lock().unwrap().push(Arc::new(Container { id: id.clone(), name, created: SystemTime::now(), body, run: Arc::default() }));
+                let ip = ip_for(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+                let ct = Arc::new(Container { id: id.clone(), name, created: SystemTime::now(), body, ip, run: Arc::default() });
+                CONTAINERS.lock().unwrap().push(ct.clone());
+                emit("create", &ct, None);
                 reply(&p, 201, json!({ "Id": id, "Warnings": [] }));
             }
         }
@@ -821,12 +884,15 @@ fn route(r: &Req, c: &mut Conn) -> bool {
         }
         ("POST", ["networks", _, "connect" | "disconnect"]) => respond(&p, 200, "text/plain", b""),
         ("GET", ["volumes"]) => reply(&p, 200, json!({ "Volumes": [], "Warnings": [] })),
-        // ponytail: an events stream that stays open and quiet (clients that watch it still work).
+        // Container events as they happen (compose waits for "die"). ponytail: no since/until replay.
         ("GET", ["events"]) => {
             open_stream(&p, 200, "application/json", false);
+            let filters: Value = serde_json::from_str(r.q("filters")).unwrap_or(Value::Null);
+            WATCHERS.lock().unwrap().push((p.clone(), filters));
             while c.fill() {
                 c.buf.clear();
             }
+            WATCHERS.lock().unwrap().retain(|(x, _)| !Arc::ptr_eq(x, &p));
             return false;
         }
         _ => fail(&p, 404, &format!("page not found: {} {} (not in lx's Engine API yet)", r.method, r.path)),
@@ -937,6 +1003,7 @@ fn container_route(m: &str, action: &[&str], r: &Req, c: &mut Conn, ct: &Arc<Con
                 ct.run.wait();
             }
             CONTAINERS.lock().unwrap().retain(|x| !Arc::ptr_eq(x, ct));
+            emit("destroy", ct, None);
             respond(&p, 204, "text/plain", b"");
         }
         ("POST", ["resize"]) => respond(&p, 200, "text/plain", b""),
@@ -964,5 +1031,7 @@ mod tests {
         assert_eq!(unescape("a+b%2"), "a b%2");
         assert_eq!(frame(1, b"hi", false), [1, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
         assert_eq!(rfc3339(Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))), "2023-11-14T22:13:20Z");
+        assert_eq!(ip_for(1), "127.65.0.1");
+        assert_eq!(ip_for(258), "127.65.1.2");
     }
 }
