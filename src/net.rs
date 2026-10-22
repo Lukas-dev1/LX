@@ -1127,6 +1127,22 @@ pub struct Epoll {
     entries: Vec<Entry>,
 }
 
+/// An epoll's registrations for a fork/exec child: "fd:events:data:disabled" joined by ';'. Linux shares
+/// the instance across fork; the child gets an equal one over the same fd numbers (php-fpm's workers use
+/// the master's). ponytail: edge state starts fresh, and later changes on either side aren't shared.
+pub fn epoll_export(ep: &Mutex<Epoll>) -> String {
+    ep.lock().unwrap().entries.iter().map(|e| format!("{}:{}:{}:{}", e.fd, e.events, e.data, e.disabled as u8)).collect::<Vec<_>>().join(";")
+}
+
+pub fn epoll_import(s: &str) -> Epoll {
+    let entries = s.split(';').filter_map(|e| {
+        let f: Vec<&str> = e.split(':').collect();
+        let [fd, events, data, disabled] = f.as_slice() else { return None };
+        Some(Entry { fd: fd.parse().ok()?, events: events.parse().ok()?, data: data.parse().ok()?, reported: 0, disabled: *disabled == "1" })
+    }).collect();
+    Epoll { entries }
+}
+
 pub fn sys_epoll_create(flags: u64) -> R {
     Ok(fs::add_fd(Fd::Epoll(Arc::new(Mutex::new(Epoll::default()))), flags & 0o2000000 != 0))
 }
