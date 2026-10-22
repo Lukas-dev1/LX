@@ -109,6 +109,7 @@ expect "eventfd keeps its fd number in a forked child" 0 "eventfd fork OK" -- ru
 expect "seccomp: a filter here and in an exec'd child" 0 "seccomp OK child filtered 2" -- run -v "$GUEST" python:3.12 python3 /t/seccomptest.py
 expect "debian: pty (openpty, pty.fork)" 0 "pty OK" -- run -v "$GUEST" python:3.12 python3 /t/ptytest.py
 expect "FIFOs: mkfifo, open waits, ENXIO, poll" 0 "fifo OK 0o600 through the fifo" -- run -v "$GUEST" python:3.12 python3 /t/fifotest.py
+expect "exec with a 5000-byte argument (MAX_ARG_STRLEN, not PATH_MAX)" 0 "5001" -- run alpine sh -c 'a=$(printf "%05000d" 0); /bin/echo "$a" | wc -c'
 expect "FIFOs in a shell loop" 0 "got round 2" -- run alpine sh -c 'mkfifo /tmp/p; for i in 1 2; do (echo round $i > /tmp/p &); read line < /tmp/p; echo "got $line"; done'
 expect "names differing only in case are two files" 0 "case 2 lower UPPER" -- run alpine sh -c 'cd /tmp && echo lower > make && echo UPPER > MAKE && mkdir d && touch d/x d/X && echo case $(ls d | wc -l) $(cat make) $(cat MAKE)'
 expect "run -it --rm (Docker's no-op flags)" 0 "1 /tmp"     -- run -it -e A=1 --rm -w /tmp alpine sh -c 'echo $A $(pwd)'
