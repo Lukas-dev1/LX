@@ -168,7 +168,9 @@ impl SignalFd {
         Some(sig)
     }
 
-    /// Fills whole struct signalfd_siginfo (128 bytes); only ssi_signo is set.
+    /// Fills whole struct signalfd_siginfo (128 bytes): ssi_signo, and ssi_code CLD_EXITED for SIGCHLD
+    /// (only a child's exit raises it; util-linux's script reaps only on such codes).
+    /// ponytail: no ssi_pid or ssi_status; reapers waitpid for those.
     pub fn read(&self, buf: u64, len: u64) -> R {
         if len < 128 {
             return Err(EINVAL);
@@ -179,6 +181,9 @@ impl SignalFd {
                 Some(sig) => {
                     let mut info = [0u8; 128];
                     info[..4].copy_from_slice(&(sig as u32).to_le_bytes());
+                    if sig == SIGCHLD {
+                        info[8..12].copy_from_slice(&1i32.to_le_bytes()); // CLD_EXITED
+                    }
                     unsafe { std::ptr::copy_nonoverlapping(info.as_ptr(), (buf + n * 128) as *mut u8, 128) };
                     n += 1;
                 }
