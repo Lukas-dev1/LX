@@ -118,6 +118,18 @@ pub fn ts_of(tid: u32) -> Option<&'static ThreadState> {
     THREAD_TS.lock().unwrap().iter().find(|e| e.0 == tid).map(|e| unsafe { &*(e.1 as *const ThreadState) })
 }
 
+/// A signal for the whole process: wake every thread parked in a futex, so one that doesn't block it
+/// takes it (EINTR, then delivery). Go parks all its threads in futexes while idle, and its signal
+/// handling waits for any thread to take the signal; the others just wait again (a spurious wakeup).
+pub fn wake_futex_waiters() {
+    for &(_, ts) in THREAD_TS.lock().unwrap().iter() {
+        let addr = unsafe { &*(ts as *const ThreadState) }.futex_addr.load(Relaxed);
+        if addr != 0 {
+            unsafe { crate::win::WakeByAddressAll(addr as *const _) };
+        }
+    }
+}
+
 pub fn forget_ts() {
     let me = unsafe { GetCurrentThreadId() };
     THREAD_TS.lock().unwrap().retain(|e| e.0 != me);
