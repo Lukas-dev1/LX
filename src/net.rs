@@ -302,14 +302,33 @@ struct Publish {
 /// Present (even empty) = this is an `lx run` container.
 fn published() -> Option<&'static [Publish]> {
     static P: std::sync::OnceLock<Option<Vec<Publish>>> = std::sync::OnceLock::new();
-    P.get_or_init(|| {
-        let v = std::env::var("LX_PORTS").ok()?;
-        Some(v.split(',').filter(|e| !e.is_empty()).filter_map(|e| {
-            let f: Vec<&str> = e.split(':').collect();
-            let ip = f.get(3).and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()).map(|a| a.octets());
-            Some(Publish { udp: f[0] == "udp", container: f.get(1)?.parse().ok()?, host: f.get(2)?.parse().ok()?, host_ip: ip })
-        }).collect())
-    }).as_deref()
+    P.get_or_init(|| Some(parse_ports(&std::env::var("LX_PORTS").ok()?))).as_deref()
+}
+
+fn parse_ports(v: &str) -> Vec<Publish> {
+    v.split(',').filter(|e| !e.is_empty()).filter_map(|e| {
+        let f: Vec<&str> = e.split(':').collect();
+        let ip = f.get(3).and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()).map(|a| a.octets());
+        Some(Publish { udp: f[0] == "udp", container: f.get(1)?.parse().ok()?, host: f.get(2)?.parse().ok()?, host_ip: ip })
+    }).collect()
+}
+
+/// The published ports of the running container at loopback address `ip` (another service of a
+/// compose project): from the containers' registered configs, remembered once found.
+/// ponytail: a container that later takes the same address keeps the first one's ports.
+fn ports_at(ip: [u8; 4]) -> Option<Vec<Publish>> {
+    static SEEN: Mutex<Vec<([u8; 4], String)>> = Mutex::new(Vec::new());
+    let want = std::net::Ipv4Addr::from(ip).to_string();
+    let mut seen = SEEN.lock().unwrap();
+    if let Some((_, v)) = seen.iter().find(|(a, _)| *a == ip) {
+        return Some(parse_ports(v));
+    }
+    let v = crate::proc::ps().into_iter().find_map(|(pid, _)| {
+        let cfg: serde_json::Value = serde_json::from_str(&crate::proc::container_config(pid)?).ok()?;
+        (cfg["ip"].as_str() == Some(want.as_str())).then(|| cfg["ports"].as_str().unwrap_or("").to_string())
+    })?;
+    seen.push((ip, v.clone()));
+    Some(parse_ports(&v))
 }
 
 /// The container's own loopback address: `LX_IP` (set by `lx run`, inherited like LX_PORTS).
@@ -453,8 +472,16 @@ fn dest_addr(s: usize, a: &mut [u8]) {
         a[4..8].copy_from_slice(&[127, 0, 0, 1]);
         return;
     }
-    if fam == AF_INET && a[4..8] != [127, 0, 0, 1] && own_ip() != Some([a[4], a[5], a[6], a[7]]) {
-        return; // another container's address: its ports are its own
+    let at = [a[4], a[5], a[6], a[7]];
+    if fam == AF_INET && at != [127, 0, 0, 1] && own_ip() != Some(at) {
+        // Another container's address: a port it publishes listens on the host port (bind_addr), so a
+        // service reaching `web:80` of a `-p 8091:80` container goes there, like Docker's container ports.
+        let udp = is_udp(s);
+        if let Some(m) = ports_at(at).and_then(|p| p.into_iter().find(|m| m.udp == udp && m.container == port_of(a))) {
+            set_port(a, m.host);
+            a[4..8].copy_from_slice(&m.host_ip.unwrap_or([127, 0, 0, 1]));
+        }
+        return;
     }
     let udp = is_udp(s);
     if let Some(m) = ports.iter().find(|m| m.udp == udp && m.container == port_of(a)) {
