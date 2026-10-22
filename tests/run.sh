@@ -174,7 +174,7 @@ else
   else
     stuck=0 served=0 runs=5
     for i in $(seq $runs); do
-      $LX run nginx:alpine > "$OUT/nginx" 2>&1 < /dev/null &
+      $LX run --name "lxnginx-$$" nginx:alpine > "$OUT/nginx" 2>&1 < /dev/null & # named: only ours is stopped
       for t in $(seq 50); do
         [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1/)" = 200 ] && break
         sleep 0.2
@@ -182,7 +182,7 @@ else
       for r in $(seq 40); do
         [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1/)" = 200 ] && served=$((served + 1))
       done
-      $LX stop "$($LX ps | awk 'NR==2 {print $1}')" > /dev/null
+      $LX stop "lxnginx-$$" > /dev/null
       wait
       grep -q "exited with code 137" "$OUT/nginx" && stuck=$((stuck + 1))
     done
