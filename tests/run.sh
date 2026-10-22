@@ -106,6 +106,8 @@ expect "sigwait / sigwaitinfo / sigtimedwait" 0 "OK" -- run -v "$GUEST" python:3
 expect "dup'd fds survive fork/exec (socket, pipe)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/dupfds.py
 expect "SCM_RIGHTS: pipe + file to a forked child" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/scmtest.py
 expect "timerfd: one-shot, periodic, poll, disarm" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/timerfd.py
+expect "sqlite: connections in one process share fcntl locks" 0 "sqlite locks OK 1" -- run -v "$GUEST" python:3.12 python3 /t/sqlitelocks.py
+expect "flock/lockf on an append-only fd" 0 "flock held free" -- run -v "$GUEST" python:3.12 python3 /t/appendlock.py
 expect "short timed waits sleep ~1 ms (no spin, no 15 ms tick)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/timedwait.py
 expect "erlang: VM, 1000 processes, os:cmd port" 0 "sum=6 procs=1000 port-ok" -- run rabbitmq:3-alpine erl -noshell -eval 'io:format("sum=~p procs=~p ~s~n",[lists:sum([1,2,3]), length([spawn(fun() -> ok end) || _ <- lists:seq(1,1000)]), os:cmd("echo port-ok")]), halt().'
 expect "/proc/self/fd lists open fds" 0 "0 1 2 3" -- run alpine sh -c 'ls /proc/self/fd | tr "\n" " "'
