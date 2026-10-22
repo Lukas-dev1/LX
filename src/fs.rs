@@ -6,7 +6,7 @@
 //! absolute targets can't leave the rootfs.
 use crate::syscall::{R, cstr, guest_mut, read_handle, write_handle};
 use crate::syscall::{EROFS, EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ERANGE, ESPIPE, ENOTEMPTY, EACCES, EBUSY, EIO};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -282,8 +282,37 @@ pub struct Mount {
 pub const WHITEOUT: &str = ".wh.";
 pub const OPAQUE: &str = ".wh..wh..opq";
 
+/// Without opening the file: std's metadata calls open a handle, which costs several times as much
+/// (more with a virus scanner looking at every open), and path lookups ask this for every layer.
 fn exists(p: &Path) -> bool {
-    fs::symlink_metadata(p).is_ok()
+    use std::os::windows::ffi::OsStrExt;
+    let w: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+    let attrs = unsafe { crate::win::GetFileAttributesW(w.as_ptr()) };
+    attrs != u32::MAX // INVALID_FILE_ATTRIBUTES
+}
+
+/// What path lookups and stat need of an entry, read without opening it (see exists()).
+#[derive(Clone, Copy)]
+pub struct Attrs {
+    pub dir: bool,
+    pub len: u64,
+    /// Last write time, ns since the Unix epoch.
+    pub mtime: u64,
+}
+
+pub fn attrs(p: &Path) -> Option<Attrs> {
+    use std::os::windows::ffi::OsStrExt;
+    let w: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+    let mut d = [0u32; 9]; // WIN32_FILE_ATTRIBUTE_DATA: attributes, 3 FILETIMEs, size high, size low
+    if unsafe { crate::win::GetFileAttributesExW(w.as_ptr(), 0, &mut d) } == 0 {
+        return None;
+    }
+    let write = (d[6] as u64) << 32 | d[5] as u64; // 100 ns ticks since 1601
+    Some(Attrs {
+        dir: d[0] & 0x10 != 0, // FILE_ATTRIBUTE_DIRECTORY
+        len: (d[7] as u64) << 32 | d[8] as u64,
+        mtime: write.saturating_sub(116_444_736_000_000_000).saturating_mul(100),
+    })
 }
 
 /// An fd owns its Windows handle (dup duplicates it), so closing the last fd of a pipe end really
@@ -388,15 +417,53 @@ fn split(p: &str) -> VecDeque<String> {
 }
 
 pub fn read_link(host: &Path) -> Option<String> {
-    let m = fs::symlink_metadata(host).ok()?;
-    if !m.is_file() || m.len() > 4096 || m.len() < LINK_MAGIC.len() as u64 {
+    link_target(host, &attrs(host)?)
+}
+
+/// read_link with the metadata already in hand: only a small file can be a symlink marker, so most
+/// entries cost nothing more.
+fn link_target(host: &Path, m: &Attrs) -> Option<String> {
+    if m.dir || m.len > 4096 || m.len < LINK_MAGIC.len() as u64 {
         return None;
     }
-    let d = fs::read(host).ok()?;
-    d.strip_prefix(LINK_MAGIC).map(|t| String::from_utf8_lossy(t).into_owned())
+    let stamp = m.mtime ^ m.len.rotate_left(48);
+    cached(&LINKS, host, stamp, || {
+        let d = fs::read(host).ok()?;
+        d.strip_prefix(LINK_MAGIC).map(|t| String::from_utf8_lossy(t).into_owned())
+    })
+}
+
+/// Facts that cost an open to learn (is this small file a symlink marker, its :lx stream), remembered per
+/// (path, mtime): a write to the file or to its stream bumps its LastWriteTime, so a change made by another
+/// process misses. The clock behind file times ticks only every 1-15 ms, so our own writes (set_meta,
+/// write_link) also forget the path. Each fact costs ~60 us, most of a stat.
+/// ponytail: 64k entries, then all forgotten.
+type FileFacts<T> = Mutex<Option<HashMap<PathBuf, (u64, T)>>>;
+static LINKS: FileFacts<Option<String>> = Mutex::new(None);
+static METAS: FileFacts<Option<[u32; 3]>> = Mutex::new(None);
+
+fn forget<T>(facts: &FileFacts<T>, host: &Path) {
+    if let Some(m) = facts.lock().unwrap().as_mut() {
+        m.remove(host);
+    }
+}
+
+fn cached<T: Clone>(facts: &FileFacts<T>, host: &Path, stamp: u64, learn: impl FnOnce() -> T) -> T {
+    if let Some((s, v)) = facts.lock().unwrap().as_ref().and_then(|m| m.get(host)) && *s == stamp {
+        return v.clone();
+    }
+    let v = learn();
+    let mut g = facts.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() >= 1 << 16 {
+        m.clear();
+    }
+    m.insert(host.to_path_buf(), (stamp, v.clone()));
+    v
 }
 
 fn write_link(host: &Path, target: &str) -> io::Result<()> {
+    forget(&LINKS, host);
     fs::write(host, [LINK_MAGIC, target.as_bytes()].concat())
 }
 
@@ -425,20 +492,35 @@ impl Fs {
     /// Where `comps` lives now: the upper layer if it's there, else the image unless a whiteout or an
     /// opaque directory hides it. A path that exists nowhere maps into the upper layer.
     fn host(&self, comps: &[String]) -> PathBuf {
+        self.host_meta(comps).0
+    }
+
+    /// host(), plus the metadata of the entry there if it exists: resolve() needs both for every
+    /// component, and stat-ing once instead of twice is most of a path lookup's cost.
+    fn host_meta(&self, comps: &[String]) -> (PathBuf, Option<Attrs>) {
         if let Some((m, rest)) = self.mount_of(comps) {
             let mut p = m.host.clone();
             p.extend(rest.iter().map(|c| enc(c)));
-            return p;
+            let meta = attrs(&p);
+            return (p, meta);
         }
         let mut lower = self.root.clone();
         lower.extend(comps.iter().map(|c| enc(c)));
-        let Some(up) = &self.upper else { return lower };
+        let Some(up) = &self.upper else {
+            let meta = attrs(&lower);
+            return (lower, meta);
+        };
         let mut upper = up.clone();
         upper.extend(comps.iter().map(|c| enc(c)));
-        if exists(&upper) || self.hidden(comps) || !exists(&lower) {
-            upper
-        } else {
-            lower
+        if let Some(m) = attrs(&upper) {
+            return (upper, Some(m));
+        }
+        if self.hidden(comps) {
+            return (upper, None);
+        }
+        match attrs(&lower) {
+            Some(m) => (lower, Some(m)),
+            None => (upper, None),
         }
     }
 
@@ -452,6 +534,10 @@ impl Fs {
         let Some(up) = &self.upper else { return false };
         let mut dir = up.clone();
         for (i, c) in comps.iter().enumerate() {
+            // A directory the upper layer doesn't have holds no whiteouts, nor does anything below it.
+            if i > 0 && !exists(&dir) {
+                return false;
+            }
             if exists(&dir.join(format!("{WHITEOUT}{}", enc(c)))) || (i > 0 && exists(&dir.join(OPAQUE))) {
                 return true;
             }
@@ -591,7 +677,9 @@ impl Fs {
         let mut todo = split(path);
         let mut comps: Vec<String> = if path.starts_with('/') { vec![] } else { split(dir).into() };
         let mut hops = 0;
+        let mut last: Option<PathBuf> = None; // host(comps), when the loop already worked it out
         while let Some(c) = todo.pop_front() {
+            last = None;
             match c.as_str() {
                 "." => continue,
                 ".." => { comps.pop(); continue }
@@ -601,7 +689,9 @@ impl Fs {
                 _ => comps.push(c),
             }
             if !todo.is_empty() || follow {
-                if let Some(target) = self.proc_self_link(&comps).or_else(|| read_link(&self.host(&comps))) {
+                let (host, meta) = self.host_meta(&comps);
+                let target = self.proc_self_link(&comps).or_else(|| meta.and_then(|m| link_target(&host, &m)));
+                if let Some(target) = target {
                     hops += 1;
                     if hops > 40 {
                         return Err(ELOOP);
@@ -613,10 +703,13 @@ impl Fs {
                     let mut next = split(&target);
                     next.extend(todo.drain(..));
                     todo = next;
+                } else {
+                    last = Some(host);
                 }
             }
         }
-        Ok((format!("/{}", comps.join("/")), self.host(&comps)))
+        let host = last.unwrap_or_else(|| self.host(&comps));
+        Ok((format!("/{}", comps.join("/")), host))
     }
 
     /// `/proc/{self,<pid>}/{exe,cwd,root}` as symlinks while resolving, so stat and open follow them
@@ -1657,6 +1750,7 @@ pub fn get_meta(host: &Path) -> Option<[u32; 3]> {
 }
 
 pub fn set_meta(host: &Path, m: [u32; 3]) -> io::Result<()> {
+    forget(&METAS, host);
     fs::write(meta_stream(host), m.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
 }
 
@@ -1674,7 +1768,9 @@ pub fn umask(mask: u64) -> R {
 
 /// Fill st_mode's permission bits, st_uid and st_gid from the stored metadata.
 fn with_meta(s: &mut [u64; 18], host: &Path) {
-    let [perm, uid, gid] = get_meta(host).unwrap_or([s[3] as u32 & 0o7777, 0, 0]);
+    let stamp = s[11].wrapping_mul(1_000_000_000).wrapping_add(s[12]); // mtime
+    let meta = cached(&METAS, host, stamp, || get_meta(host));
+    let [perm, uid, gid] = meta.unwrap_or([s[3] as u32 & 0o7777, 0, 0]);
     s[3] = (s[3] & !0o7777) | (perm & 0o7777) as u64 | (uid as u64) << 32;
     s[4] = gid as u64;
 }
@@ -1735,16 +1831,16 @@ pub fn fchmeta(fd: u64, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
 }
 
 fn stat_of(host: &Path) -> Result<[u64; 18], i64> {
-    let m = fs::symlink_metadata(host).map_err(errno)?;
-    let link = if m.is_file() { read_link(host) } else { None };
-    let sock = m.len() == SOCK_MAGIC.len() as u64 && fs::read(host).is_ok_and(|d| d == SOCK_MAGIC);
+    let m = attrs(host).ok_or(ENOENT)?;
+    let link = link_target(host, &m);
+    let sock = !m.dir && m.len == SOCK_MAGIC.len() as u64 && fs::read(host).is_ok_and(|d| d == SOCK_MAGIC);
     let (mode, size, nlink) = match &link {
-        _ if m.is_dir() => (0o040755, 4096, 2),
+        _ if m.dir => (0o040755, 4096, 2),
         _ if sock => (0o140755, 0, 1), // S_IFSOCK
         Some(t) => (0o120777, t.len() as u64, 1),
-        None => (0o100755, m.len(), 1),
+        None => (0o100755, m.len, 1),
     };
-    let t = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).unwrap_or_default();
+    let t = std::time::Duration::from_nanos(m.mtime);
     let mut s = [0u64; 18];
     s[0] = 0x803;
     s[1] = ino(host);
