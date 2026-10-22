@@ -226,7 +226,8 @@ fn enter_job() -> Result<(), String> {
     if env::var_os("LX_IN_JOB").is_some() {
         return Ok(());
     }
-    unsafe { env::set_var("LX_IN_JOB", "1") }; // inherited by every later lx process
+    // Inherited by every later lx process; the pid also names the process that holds SCM_RIGHTS handles.
+    unsafe { env::set_var("LX_IN_JOB", std::process::id().to_string()) };
     const LIMIT_PROCESS_MEMORY: u32 = 0x100;
     const KILL_ON_JOB_CLOSE: u32 = 0x2000;
     let limits = JobLimits {

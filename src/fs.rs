@@ -813,24 +813,50 @@ pub fn proc_state(fork: bool) -> Vec<String> {
         let mut n = 0;
         for (i, s) in fs.fds.iter().enumerate() {
             let Some(s) = s.as_ref().filter(|s| fork || !s.cloexec) else { continue };
-            let (kind, h, path) = match &s.fd {
-                Fd::Handle(h) => ("h", h.as_raw_handle() as usize, String::new()),
-                Fd::Pipe(p) => ("p", p.raw() as usize, (p.nonblocking() as u8).to_string()),
-                Fd::File { f, host } => ("f", f.as_raw_handle() as usize, host.to_string_lossy().into_owned()),
-                Fd::Dir { guest, .. } => ("d", 0, guest.clone()),
-                Fd::Dev(d) => (d.tag(), 0, String::new()),
-                Fd::Socket(k) => ("s", k.s, k.inherit_tag()),
-                // ponytail: epoll instances aren't carried across fork/exec (servers make one per worker).
-                Fd::Epoll(_) => continue,
-                // ponytail: an eventfd shared across fork isn't carried either; each process starts without it.
-                Fd::Event(_) | Fd::Signal(_) => continue,
-            };
+            let Some((kind, h, path)) = entry(&s.fd) else { continue };
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
             n += 1;
         }
         v[4] = n.to_string();
         v
     })
+}
+
+/// How an fd travels to another lx process: (kind, handle, extra), the handle still ours.
+fn entry(fd: &Fd) -> Option<(&'static str, usize, String)> {
+    Some(match fd {
+        Fd::Handle(h) => ("h", h.as_raw_handle() as usize, String::new()),
+        Fd::Pipe(p) => ("p", p.raw() as usize, (p.nonblocking() as u8).to_string()),
+        Fd::File { f, host } => ("f", f.as_raw_handle() as usize, host.to_string_lossy().into_owned()),
+        Fd::Dir { guest, .. } => ("d", 0, guest.clone()),
+        Fd::Dev(d) => (d.tag(), 0, String::new()),
+        Fd::Socket(k) => ("s", k.s, k.inherit_tag()),
+        // ponytail: epoll instances aren't carried across fork/exec (servers make one per worker).
+        Fd::Epoll(_) => return None,
+        // ponytail: an eventfd shared across fork isn't carried either; each process starts without it.
+        Fd::Event(_) | Fd::Signal(_) => return None,
+    })
+}
+
+/// SCM_RIGHTS, sending side: fd's (kind, handle, extra); the handle stays ours (the caller duplicates it).
+pub fn export_fd(fd: u64) -> Result<(&'static str, usize, String), i64> {
+    with(|fs| fs.fds.get(fd as usize).and_then(|s| s.as_ref()).ok_or(EBADF).and_then(|s| entry(&s.fd).ok_or(EINVAL)))
+}
+
+/// SCM_RIGHTS, receiving side: a new fd for an `export_fd` record whose handle is now ours.
+pub fn import_fd(kind: &str, h: usize, extra: &str, cloexec: bool) -> R {
+    let fd = match kind {
+        "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(h as _) }),
+        "p" => Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (extra == "1").into() })),
+        "f" => Fd::File { f: unsafe { File::from_raw_handle(h as _) }, host: PathBuf::from(extra) },
+        "d" => Fd::Dir { guest: extra.to_string(), pos: 0 },
+        "null" => Fd::Dev(Dev::Null),
+        "zero" => Fd::Dev(Dev::Zero),
+        "random" => Fd::Dev(Dev::Random),
+        "s" => Fd::Socket(Arc::new(Sock::inherited(h, extra))),
+        _ => return Err(EINVAL),
+    };
+    Ok(add_fd(fd, cloexec))
 }
 
 /// Rebuild the fd table from `proc_state` fields (in the new lx). Returns the unparsed rest.
@@ -846,19 +872,36 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
     }).collect::<Result<Vec<_>, _>>()?;
     let mut fds: Vec<Option<Slot>> = Vec::new();
     let mut rest = rest;
+    // dup'd fds arrive with the same handle: they must share it again, or closing one closes the
+    // handle under the others (erl_child_setup closes its pair end's dup, killing the connection).
+    // Pipes and sockets share their Arc; files and plain handles get a duplicate handle each.
+    let mut pipes: std::collections::HashMap<usize, Arc<Pipe>> = Default::default();
+    let mut socks: std::collections::HashMap<usize, Arc<Sock>> = Default::default();
+    let mut seen = std::collections::HashSet::new();
+    let own = |h: usize, seen: &mut std::collections::HashSet<usize>| -> usize {
+        if seen.insert(h) {
+            return h;
+        }
+        use crate::win::*;
+        let mut d = 0isize;
+        unsafe { DuplicateHandle(GetCurrentProcess(), h as isize, GetCurrentProcess(), &mut d, 0, 0, 2) }; // SAME_ACCESS
+        d as usize
+    };
     for _ in 0..n.parse::<usize>().map_err(|_| bad())? {
         let [fd, kind, h, path, cloexec, more @ ..] = rest else { return Err(bad()) };
         let fd: usize = fd.parse().map_err(|_| bad())?;
         let h: usize = h.parse().map_err(|_| bad())?;
         let fd_ = match kind.as_str() {
-            "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(h as _) }),
-            "p" => Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (path == "1").into() })),
-            "f" => Fd::File { f: unsafe { File::from_raw_handle(h as _) }, host: PathBuf::from(path) },
+            "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(own(h, &mut seen) as _) }),
+            "p" => Fd::Pipe(pipes.entry(h).or_insert_with(|| {
+                Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (path == "1").into() })
+            }).clone()),
+            "f" => Fd::File { f: unsafe { File::from_raw_handle(own(h, &mut seen) as _) }, host: PathBuf::from(path) },
             "d" => Fd::Dir { guest: path.clone(), pos: 0 },
             "null" => Fd::Dev(Dev::Null),
             "zero" => Fd::Dev(Dev::Zero),
             "random" => Fd::Dev(Dev::Random),
-            "s" => Fd::Socket(Arc::new(Sock::inherited(h, path))),
+            "s" => Fd::Socket(socks.entry(h).or_insert_with(|| Arc::new(Sock::inherited(h, path))).clone()),
             _ => return Err(bad()),
         };
         while fds.len() <= fd {
@@ -1976,6 +2019,11 @@ pub fn faccessat(dirfd: u64, path: u64) -> R {
 
 /// The guest path of the running ELF, for /proc/self/exe (ld.so resolves $ORIGIN with it).
 static EXE: Mutex<String> = Mutex::new(String::new());
+
+/// The running program's file name, for /proc/self/status.
+pub fn exe_name() -> String {
+    EXE.lock().unwrap().rsplit('/').next().unwrap_or("").chars().take(15).collect()
+}
 
 pub fn set_exe(guest: &str) {
     *EXE.lock().unwrap() = guest.to_string();
