@@ -960,6 +960,10 @@ pub fn proc_state(fork: bool) -> (Vec<String>, Vec<OwnedHandle>) {
         let mut n = 0;
         for (i, s) in fs.fds.iter().enumerate() {
             let Some(s) = s.as_ref().filter(|s| fork || !s.cloexec) else { continue };
+            // Only epolls that would survive exec travel: php-fpm's workers share the master's (no CLOEXEC);
+            // copying Go's CLOEXEC netpoller epoll into its fork children made `go run` hang.
+            // ponytail: why the copy hangs Go is not understood yet.
+            if s.cloexec && matches!(s.fd, Fd::Epoll(_)) { continue }
             let Some((kind, h, path)) = entry(&s.fd) else { continue };
             let h = if h == 0 { 0 } else { dup(h) };
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
@@ -979,8 +983,8 @@ fn entry(fd: &Fd) -> Option<(&'static str, usize, String)> {
         Fd::Dir { guest, .. } => ("d", 0, guest.clone()),
         Fd::Dev(d) => (d.tag(), 0, String::new()),
         Fd::Socket(k) => ("s", k.s, k.inherit_tag()),
-        // ponytail: epoll instances aren't carried across fork/exec (servers make one per worker).
-        Fd::Epoll(_) => return None,
+        // An equal epoll over the same fd numbers (Linux shares the instance; see net::epoll_export).
+        Fd::Epoll(e) => ("e", 0, crate::net::epoll_export(e)),
         // ponytail: an eventfd shared across fork isn't carried either; each process starts without it.
         Fd::Event(_) | Fd::Signal(_) => return None,
     })
@@ -1001,6 +1005,7 @@ pub fn import_fd(kind: &str, h: usize, extra: &str, cloexec: bool) -> R {
         "null" => Fd::Dev(Dev::Null),
         "zero" => Fd::Dev(Dev::Zero),
         "random" => Fd::Dev(Dev::Random),
+        "e" => Fd::Epoll(Arc::new(Mutex::new(crate::net::epoll_import(extra)))),
         "s" => Fd::Socket(Arc::new(Sock::inherited(h, extra))),
         _ => return Err(EINVAL),
     };
@@ -1047,6 +1052,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
             "null" => Fd::Dev(Dev::Null),
             "zero" => Fd::Dev(Dev::Zero),
             "random" => Fd::Dev(Dev::Random),
+            "e" => Fd::Epoll(Arc::new(Mutex::new(crate::net::epoll_import(path)))),
             "s" => Fd::Socket(socks.entry(h).or_insert_with(|| Arc::new(Sock::inherited(h, path))).clone()),
             _ => return Err(bad()),
         };

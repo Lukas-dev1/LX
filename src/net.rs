@@ -384,7 +384,16 @@ fn bind_addr(s: usize, a: &mut [u8]) {
     if fam == AF_INET && a[4..8] == [0; 4] {
         a[4..8].copy_from_slice(&[127, 0, 0, 1]);
     } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == [0; 16] {
-        a[23] = 1; // ::1
+        // A dual-stack [::] listener answers IPv4 too (php-fpm's `listen = 9000`, clients dial 127.0.0.1):
+        // ::ffff:127.0.0.1. An IPV6_V6ONLY one (nginx's [::]:80 next to its 0.0.0.0:80) takes ::1.
+        // ponytail: a dual-stack listener is then unreachable on ::1.
+        let (mut v6only, mut l) = (0i32, 4i32);
+        unsafe { getsockopt(s, 41, 27, (&mut v6only as *mut i32).cast(), &mut l) }; // IPPROTO_IPV6, IPV6_V6ONLY
+        if v6only != 0 {
+            a[23] = 1; // ::1
+        } else {
+            a[18..24].copy_from_slice(&[0xff, 0xff, 127, 0, 0, 1]);
+        }
     }
 }
 
@@ -1082,6 +1091,20 @@ pub fn sys_getsockopt(fd: u64, level: u64, name: u64, val: u64, lenp: u64) -> R 
             return int(t);
         }
         (1, 2) | (1, 15) => return int(0),                     // SO_REUSEADDR / SO_REUSEPORT: as set (ignored)
+        (6, 11) => {
+            // TCP_INFO: the state (LISTEN or ESTABLISHED), counters zero. php-fpm reads its listen queue
+            // from it every second. ponytail: no real statistics.
+            let (mut listening, mut l) = (0i32, 4i32);
+            unsafe { getsockopt(s.s, 0xffff, 0x0002, (&mut listening as *mut i32).cast(), &mut l) }; // SO_ACCEPTCONN
+            let n = unsafe { *(lenp as *const u32) }.min(232) as usize;
+            let out = unsafe { std::slice::from_raw_parts_mut(val as *mut u8, n) };
+            out.fill(0);
+            if n > 0 {
+                out[0] = if listening != 0 { 10 } else { 1 }; // TCP_LISTEN / TCP_ESTABLISHED
+            }
+            unsafe { *(lenp as *mut u32) = n as u32 };
+            return Ok(0);
+        }
         (1, 38) | (1, 39) => {
             // SO_PROTOCOL, SO_DOMAIN (Python's socket(fileno=fd) asks both).
             let mut a = [0u8; 128];
@@ -1125,6 +1148,22 @@ struct Entry {
 #[derive(Default)]
 pub struct Epoll {
     entries: Vec<Entry>,
+}
+
+/// An epoll's registrations for a fork/exec child: "fd:events:data:disabled" joined by ';'. Linux shares
+/// the instance across fork; the child gets an equal one over the same fd numbers (php-fpm's workers use
+/// the master's). ponytail: edge state starts fresh, and later changes on either side aren't shared.
+pub fn epoll_export(ep: &Mutex<Epoll>) -> String {
+    ep.lock().unwrap().entries.iter().map(|e| format!("{}:{}:{}:{}", e.fd, e.events, e.data, e.disabled as u8)).collect::<Vec<_>>().join(";")
+}
+
+pub fn epoll_import(s: &str) -> Epoll {
+    let entries = s.split(';').filter_map(|e| {
+        let f: Vec<&str> = e.split(':').collect();
+        let [fd, events, data, disabled] = f.as_slice() else { return None };
+        Some(Entry { fd: fd.parse().ok()?, events: events.parse().ok()?, data: data.parse().ok()?, reported: 0, disabled: *disabled == "1" })
+    }).collect();
+    Epoll { entries }
 }
 
 pub fn sys_epoll_create(flags: u64) -> R {
