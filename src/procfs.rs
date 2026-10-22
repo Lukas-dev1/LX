@@ -15,8 +15,13 @@ Pss: {:>16} kB
 ", rss >> 10, rss >> 10) }),
             "mounts" => Some(mounts()),
             "mountinfo" => Some(MOUNTINFO.into()),
-            _ => None,
+            _ => table_file(crate::proc::getpid().unwrap_or(0) as u32, rest),
         };
+    }
+    // Another process of the container: from the process table.
+    let numeric = guest.strip_prefix("/proc/").and_then(|r| r.split_once('/')).and_then(|(p, r)| Some((p.parse::<u32>().ok()?, r)));
+    if let Some((pid, rest)) = numeric {
+        return table_file(pid, rest);
     }
     Some(match guest {
         "/proc/mounts" => mounts(),
@@ -38,6 +43,23 @@ Pss: {:>16} kB
         "/proc/sys/net/core/somaxconn" => "4096\n".into(),
         "/proc/sys/fs/file-max" => "1048576\n".into(),
         "/proc/sys/fs/nr_open" => "1048576\n".into(),
+        _ => return None,
+    })
+}
+
+/// /proc/<pid>/{cmdline,comm,stat,status} from the container's process table (ps, pgrep, pidof).
+fn table_file(pid: u32, rest: &str) -> Option<String> {
+    let p = crate::ptable::get(pid)?;
+    Some(match rest {
+        "cmdline" => String::from_utf8_lossy(&p.cmdline).into_owned(),
+        "comm" => format!("{}\n", p.comm),
+        // pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime
+        // cutime cstime priority nice threads itrealvalue starttime vsize rss ... (52 fields)
+        "stat" => format!("{} ({}) S {} {} {} 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 {} 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            p.pid, p.comm, p.ppid, p.pid, p.pid, p.start_ms / 10),
+        "status" => format!("Name:\t{}\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
+                             Uid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t1\n",
+            p.comm, p.pid, p.pid, p.ppid, u = p.uid, g = p.gid),
         _ => return None,
     })
 }

@@ -2890,7 +2890,8 @@ fn proc_dir(guest: &str) -> Option<bool> {
     let r = guest.strip_prefix("/proc/")?;
     let (pid, rest) = r.split_once('/').unwrap_or((r, ""));
     if pid != "self" && crate::proc::host_pid(pid.parse().ok()?) != crate::proc::pid() {
-        return None;
+        // Another process of the container: its directory (no fd/ for it: ponytail).
+        return (rest.is_empty() && crate::ptable::get(pid.parse().ok()?).is_some()).then_some(false);
     }
     match rest {
         "" => Some(false),
@@ -2901,16 +2902,26 @@ fn proc_dir(guest: &str) -> Option<bool> {
 
 /// What getdents lists in a `proc_dir`: (name, d_type).
 fn proc_entries(fd_dir: bool, fds: &[Option<Slot>]) -> Vec<(String, u8)> {
+    const DT_REG: u8 = 8;
     const DT_DIR: u8 = 4;
     const DT_LNK: u8 = 10;
     if !fd_dir {
-        return vec![("fd".into(), DT_DIR), ("exe".into(), DT_LNK), ("cwd".into(), DT_LNK), ("root".into(), DT_LNK)];
+        let mut v: Vec<(String, u8)> = vec![("fd".into(), DT_DIR), ("exe".into(), DT_LNK), ("cwd".into(), DT_LNK), ("root".into(), DT_LNK)];
+        v.extend(["cmdline", "comm", "stat", "status"].map(|f| (f.to_string(), DT_REG)));
+        return v;
     }
     fds.iter().enumerate().filter(|(_, s)| s.is_some()).map(|(i, _)| (i.to_string(), DT_LNK)).collect()
 }
 
 /// The few /proc links programs actually read. ponytail: no /proc filesystem otherwise (DESIGN.md §5).
 fn proc_link(guest: &str) -> Option<String> {
+    // Another process's exe (pidof, ps -o comm on some builds), from the process table.
+    if let Some((pid, "exe")) = guest.strip_prefix("/proc/").and_then(|r| r.split_once('/'))
+        && let Ok(pid) = pid.parse::<u32>()
+        && crate::proc::host_pid(pid) != crate::proc::pid()
+    {
+        return crate::ptable::get(pid).map(|p| p.exe);
+    }
     let rest = guest.strip_prefix("/proc/self/").or_else(|| {
         let r = guest.strip_prefix("/proc/")?;
         let (pid, rest) = r.split_once('/')?;
@@ -3109,6 +3120,11 @@ pub fn getdents64(fd: u64, buf: u64, count: u64) -> R {
             names.extend(proc_entries(fd_dir, &fs.fds));
         } else {
             names.extend(fs.list(&comps_of(&guest))?);
+            if guest == "/proc" {
+                // The container's processes, and self (ps and friends list /proc for numeric names).
+                names.extend(crate::ptable::all().into_iter().map(|p| (p.pid.to_string(), 4)));
+                names.push(("self".into(), 10));
+            }
         }
         let out = unsafe { guest_mut(buf, count as usize) };
         let (mut n, mut i) = (0, start);
