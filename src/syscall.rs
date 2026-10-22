@@ -78,6 +78,9 @@ pub struct ThreadState {
     /// The TEB's own stack fields (StackBase, StackLimit, DeallocationStack) before the guest took over.
     /// ExitThread frees whatever DeallocationStack names, so they go back before a thread exits.
     pub host_teb: Option<[u64; 3]>,
+    /// The guest's extended register state (x87/SSE/AVX...) while a direct syscall runs: Linux preserves
+    /// every vector register across syscall, and our handler code doesn't. 64-byte aligned for xsave.
+    xsave: Xsave,
 }
 
 const TS_RESUME: usize = std::mem::offset_of!(ThreadState, resume);
@@ -85,6 +88,12 @@ const TS_FRAME_LEN: usize = std::mem::offset_of!(ThreadState, frame_len);
 const TS_FRAME: usize = std::mem::offset_of!(ThreadState, frame);
 const TS_GUEST_RSP: usize = std::mem::offset_of!(ThreadState, guest_rsp);
 const TS_HOST_STACK: usize = std::mem::offset_of!(ThreadState, host_stack);
+const TS_XSAVE: usize = std::mem::offset_of!(ThreadState, xsave);
+
+/// Room for the largest XSAVE area of the enabled features (AVX-512 is 2,696 bytes); checked at start.
+const XSAVE_MAX: usize = 4096;
+#[repr(C, align(64))]
+struct Xsave([u8; XSAVE_MAX]);
 const _: () = assert!(std::mem::offset_of!(ThreadState, fs) == 0);
 
 /// TEB offset of our TLS slot (gs:[0x1480 + 8*index]); the trampolines load the ThreadState pointer from it.
@@ -125,7 +134,7 @@ pub fn ts() -> &'static mut ThreadState {
         fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host + HOST_STACK as u64,
         frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None,
         tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
-        on_host: false, host_teb: None,
+        on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]),
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
     THREAD_TS.lock().unwrap().push((unsafe { GetCurrentThreadId() }, st as *const ThreadState as usize));
@@ -227,10 +236,23 @@ std::arch::global_asm!(
     "mov rax, qword ptr [rsp + 0x108]",
     "mov qword ptr [rsp + 0xd0], rax",    // r11 = rflags, as the kernel leaves it
     "mov dword ptr [rsp + 0x44], eax",    // Context.EFlags
+    // The guest's vector state: our Rust and Windows code below clobbers xmm/ymm, Linux preserves them.
+    "mov r8, qword ptr [rip + LX_TLS_OFF]",
+    "mov r8, qword ptr gs:[r8]",
+    "lea r8, [r8 + {xsave}]",
+    "mov eax, -1",
+    "mov edx, -1",
+    ".byte 0x49, 0x0f, 0xae, 0x30",       // xsaveopt64 [r8]: every enabled component, unchanged ones skipped
     "mov rcx, rsp",
     "sub rsp, 32",
     "call lx_direct",
     "add rsp, 32",
+    "mov r8, qword ptr [rip + LX_TLS_OFF]",
+    "mov r8, qword ptr gs:[r8]",
+    "lea r8, [r8 + {xsave}]",
+    "mov eax, -1",
+    "mov edx, -1",
+    ".byte 0x49, 0x0f, 0xae, 0x28",       // xrstor64 [r8]
     "mov rax, qword ptr [rip + LX_TLS_OFF]",
     "mov rax, qword ptr gs:[rax]",
     "mov rax, qword ptr [rax]",           // fs
@@ -261,6 +283,7 @@ std::arch::global_asm!(
     "iretq",
     guest_rsp = const TS_GUEST_RSP,
     host_stack = const TS_HOST_STACK,
+    xsave = const TS_XSAVE,
 );
 unsafe extern "C" {
     fn lx_fs_tramp();
@@ -550,6 +573,10 @@ pub fn debug() -> bool {
 
 pub fn install() {
     START.lock().unwrap().get_or_insert_with(Instant::now);
+    // CPUID.(EAX=0Dh,ECX=0).EBX: the XSAVE area size for what the OS enabled (XCR0).
+    let need = std::arch::x86_64::__cpuid_count(0xd, 0).ebx as usize;
+    assert!(need <= XSAVE_MAX, "XSAVE area of {need} bytes doesn't fit the {XSAVE_MAX} reserved");
+    assert!(std::arch::x86_64::__cpuid_count(0xd, 1).eax & 1 != 0, "this CPU lacks XSAVEOPT"); // every Windows 11 CPU has it
     let idx = unsafe { TlsAlloc() };
     assert!(idx < 64, "TLS index {idx} is past the TEB's inline slots"); // inline slots: gs:[0x1480 + 8*i]
     TLS_INDEX.store(idx as u64, Relaxed);
