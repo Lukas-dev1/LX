@@ -1572,6 +1572,19 @@ fn pts_pipe(n: u32) -> Vec<u16> {
     format!("\\\\.\\pipe\\lx-pts-{root}-{n}").encode_utf16().chain([0]).collect()
 }
 
+/// A pty as stat shows it: /dev/pts/N is char device 136:N, the master (or None) /dev/ptmx, 5:2. The same
+/// for a path and an open fd, so ttyname's check that the two match holds.
+/// ponytail: /dev/pts/N stats as present whether or not that pty exists.
+fn pty_stat(pty: Option<(u32, bool)>) -> [u64; 18] {
+    let mut s = [0u64; 18];
+    let (rdev, mode) = match pty {
+        Some((n, false)) => ((136 << 8) | n as u64, 0o020620),
+        _ => ((5 << 8) | 2, 0o020666),
+    };
+    (s[1], s[2], s[3], s[5], s[7]) = (0x10000 + rdev, 1, mode, rdev, 4096);
+    s
+}
+
 fn add_pty(h: isize, n: u32, master: bool, flags: u64) -> R {
     let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: Some((n, master)) };
     Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
@@ -1594,7 +1607,14 @@ fn open_pts(n: u32, flags: u64) -> R {
     // GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING, FILE_FLAG_OVERLAPPED
     let h = unsafe { CreateFileW(pts_pipe(n).as_ptr(), 0xC000_0000, 0, std::ptr::null_mut(), 3, 0x4000_0000, 0) };
     if h == -1 {
-        return Err(if unsafe { GetLastError() } == 2 { ENOENT } else { EIO });
+        let err = unsafe { GetLastError() };
+        // The one slave connection is taken. If it's ours (apt opens the slave, forks, and the child
+        // opens it again to make it its terminal), the new fd shares it.
+        return with(|fs| {
+            let mine = fs.fds.iter().flatten().find(|s| matches!(&s.fd, Fd::Pipe(p) if p.pty == Some((n, false))));
+            let new = dup_fd(&mine.ok_or(if err == 2 { ENOENT } else { EIO })?.fd)?;
+            Ok(fs.add(new, 0, flags & O_CLOEXEC != 0))
+        });
     }
     add_pty(h, n, false, flags)
 }
@@ -2773,6 +2793,7 @@ pub fn fstat(fd: u64, buf: u64) -> R {
             Ok(s)
         }
         Fd::Dev(d) => Ok(d.stat()),
+        Fd::Pipe(p) if p.pty.is_some() => Ok(pty_stat(p.pty)),
         Fd::Pipe(p) => {
             let mut s = [0u64; 18];
             (s[1], s[2], s[3], s[7]) = (p.raw() as u64, 1, 0o010600, 4096); // fifo
@@ -2799,6 +2820,12 @@ pub fn fstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> R {
     let (guest, host) = with(|fs| fs.at(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0))?;
     if let Some(d) = Dev::of(&guest) {
         return put_stat(buf, d.stat());
+    }
+    if guest == "/dev/ptmx" {
+        return put_stat(buf, pty_stat(None));
+    }
+    if let Some(n) = guest.strip_prefix("/dev/pts/").and_then(|n| n.parse().ok()) {
+        return put_stat(buf, pty_stat(Some((n, false))));
     }
     if crate::procfs::file(&guest).is_some() {
         let mut s = [0u64; 18];
@@ -2941,7 +2968,11 @@ fn proc_link(guest: &str) -> Option<String> {
                     Some(rel.iter().map(|c| format!("/{}", dec(&c.to_string_lossy()))).collect())
                 }
                 Fd::Handle(_) => Some("pipe:[0]".into()),
-                Fd::Pipe(p) => Some(format!("pipe:[{}]", p.raw())),
+                Fd::Pipe(p) => Some(match p.pty {
+                    Some((n, false)) => format!("/dev/pts/{n}"), // ttyname reads this
+                    Some((_, true)) => "/dev/ptmx".into(),
+                    None => format!("pipe:[{}]", p.raw()),
+                }),
                 Fd::Socket(k) => Some(format!("socket:[{}]", k.s)),
                 Fd::Epoll(_) => Some("anon_inode:[eventpoll]".into()),
                 Fd::Event(_) => Some("anon_inode:[eventfd]".into()),

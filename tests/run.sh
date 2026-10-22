@@ -143,6 +143,7 @@ expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERS
 expect "/proc/<getpid()> after exec" 0 "own pid ['0', '1', '2']" -- run python:3.12-alpine sh -c 'exec python3 -c "import os; p=f\"/proc/{os.getpid()}\"; os.stat(p); print(\"own pid\", sorted(os.listdir(p + \"/fd\"))[:3])"'
 expect "hard link counts (container files; image files stay 1)" 0 "nlink 2 1 image 1" -- run alpine sh -c 'touch /tmp/a; ln /tmp/a /tmp/b; x=$(stat -c %h /tmp/a); rm /tmp/b; echo "nlink $x $(stat -c %h /tmp/a) image $(stat -c %h /bin/busybox)"'
 expect "procps ps, vmstat (/proc/stat, /proc/vmstat)" 0 "ps ok vmstat ok" -- run python:3.12 sh -c 'ps aux > /dev/null && p="ps ok"; vmstat > /dev/null && echo "$p vmstat ok"'
+expect "pty: ttyname, slave opened twice" 0 "pts ok x" -- run python:3.12-alpine python3 -c 'import os,pty; m,s=pty.openpty(); n=os.ttyname(s); f=os.open(n, os.O_RDWR); os.write(f, b"x"); print("pts ok", os.read(m, 1).decode())'
 expect "#! script run through a link sees the link's name" 0 "/tmp/l ./l" -- run alpine sh -c 'printf "#!/bin/sh\necho \$0\n" > /tmp/s; chmod +x /tmp/s; ln -s /tmp/s /tmp/l; cd /tmp; echo $(/tmp/l) $(./l)'
 expect "run -u / USER + HOME"      0 "65534:65533 HOME=/." -- run -u nobody:nogroup alpine sh -c 'echo $(id -u):$(id -g) HOME=$HOME.'
 # lx build: an image from guest/buildctx/Dockerfile, then run (and the base image keeps its /etc/motd).
