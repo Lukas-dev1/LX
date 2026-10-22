@@ -821,18 +821,23 @@ impl Fs {
         let mut comps: Vec<String> = if path.starts_with('/') { vec![] } else { split(dir).into() };
         let mut hops = 0;
         let mut last: Option<PathBuf> = None; // host(comps), when the loop already worked it out
+        // Whether the upper layer has no directory at comps (the parent of the next component): then it
+        // holds nothing below it either, no entries and no whiteouts, and only the image needs asking.
+        // Most lookups are of image files, and this saves ~3 of ~4 host calls per component.
+        let mut not_in_upper = false;
         while let Some(c) = todo.pop_front() {
             last = None;
             match c.as_str() {
                 "." => continue,
-                ".." => { comps.pop(); continue }
+                ".." => { comps.pop(); not_in_upper = false; continue }
                 _ if c.contains('\0') => return Err(ENOENT), // `:` and `\` are fine: enc() maps them
                 // Layer bookkeeping names are ours; the guest can't see or forge whiteouts.
                 _ if c.starts_with(WHITEOUT) && self.upper.is_some() => return Err(ENOENT),
                 _ => comps.push(c),
             }
             if !todo.is_empty() || follow {
-                let (host, meta) = self.host_meta(&comps);
+                let (host, meta) = self.host_meta_below(&comps, not_in_upper);
+                not_in_upper = self.upper.as_ref().is_some_and(|u| !host.starts_with(u)) && self.mount_of(&comps).is_none();
                 let target = self.proc_self_link(&comps).or_else(|| meta.and_then(|m| link_target(&host, &m)));
                 if let Some(target) = target {
                     hops += 1;
@@ -843,6 +848,7 @@ impl Fs {
                     if target.starts_with('/') {
                         comps.clear();
                     }
+                    not_in_upper = false; // the link's parent may well be in the upper layer
                     let mut next = split(&target);
                     next.extend(todo.drain(..));
                     todo = next;
@@ -851,8 +857,24 @@ impl Fs {
                 }
             }
         }
-        let host = last.unwrap_or_else(|| self.host(&comps));
+        let host = last.unwrap_or_else(|| self.host_meta_below(&comps, not_in_upper).0);
         Ok((format!("/{}", comps.join("/")), host))
+    }
+
+    /// host_meta(), knowing whether the upper layer lacks the parent directory: then only the image is
+    /// asked (and a path in neither still maps into the upper layer, for creating it).
+    fn host_meta_below(&self, comps: &[String], parent_not_in_upper: bool) -> (PathBuf, Option<Attrs>) {
+        let Some(up) = self.upper.as_ref().filter(|_| parent_not_in_upper && self.mount_of(comps).is_none()) else {
+            return self.host_meta(comps);
+        };
+        let mut lower = self.root.clone();
+        lower.extend(comps.iter().map(|c| enc(c)));
+        if let Some(m) = attrs(&lower) {
+            return (lower, Some(m));
+        }
+        let mut upper = up.clone();
+        upper.extend(comps.iter().map(|c| enc(c)));
+        (upper, None)
     }
 
     /// `/proc/{self,<pid>}/{exe,cwd,root}` as symlinks while resolving, so stat and open follow them
@@ -3108,6 +3130,8 @@ fn layer_never_touches_the_image() {
     fs::create_dir_all(lower.join("etc/conf.d")).unwrap();
     fs::write(lower.join("etc/a.conf"), "image").unwrap();
     fs::write(lower.join("etc/conf.d/x"), "x").unwrap();
+    fs::create_dir_all(lower.join("usr/lib/py")).unwrap();
+    fs::write(lower.join("usr/lib/py/m.py"), "m").unwrap();
     fs::create_dir_all(&upper).unwrap();
     let f = Fs { root: lower.clone(), upper: Some(upper.clone()), mounts: vec![], cwd: "/".into(), fds: vec![] };
     let c = |p: &str| comps_of(p);
@@ -3115,6 +3139,9 @@ fn layer_never_touches_the_image() {
 
     // Reads come from the image; a write copies up and leaves the image alone.
     assert_eq!(f.host(&c("/etc/a.conf")), lower.join("etc/a.conf"));
+    // A deep image path the upper layer has none of resolves through the image alone.
+    assert_eq!(f.resolve("/", "/usr/lib/py/m.py", true).unwrap().1, lower.join("usr/lib/py/m.py"));
+    assert_eq!(f.resolve("/usr/lib", "py/m.py", false).unwrap().1, lower.join("usr/lib/py/m.py"));
     let w = f.writable(&c("/etc/a.conf"), true).unwrap();
     fs::write(&w, "container").unwrap();
     assert_eq!(fs::read_to_string(f.host(&c("/etc/a.conf"))).unwrap(), "container");
@@ -3128,6 +3155,7 @@ fn layer_never_touches_the_image() {
     // Deleting an image entry is a whiteout: hidden in the container, still in the image.
     f.remove(&c("/etc/conf.d"), true).unwrap();
     assert!(!exists(&f.host(&c("/etc/conf.d/x"))));
+    assert!(!exists(&f.resolve("/", "/etc/conf.d/x", true).unwrap().1));
     assert_eq!(names("/etc"), ["a.conf", "new"]);
     assert!(lower.join("etc/conf.d/x").exists());
 
@@ -3137,6 +3165,7 @@ fn layer_never_touches_the_image() {
     fs::write(d.join(OPAQUE), b"").unwrap();
     assert_eq!(names("/etc/conf.d"), Vec::<String>::new());
     assert!(!exists(&f.host(&c("/etc/conf.d/x"))));
+    assert!(!exists(&f.resolve("/etc", "conf.d/x", false).unwrap().1));
 
     // A deleted image file opened for writing again (copy-up asked) is new, not the image's copy.
     f.remove(&c("/etc/a.conf"), false).unwrap();
