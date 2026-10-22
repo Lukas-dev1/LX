@@ -50,6 +50,7 @@ cc_static 1 rootfs/stress guest/stress.c
 cc_static 2 rootfs/threads guest/threads.c
 cc_static 2 rootfs/stacktest guest/stacktest.c
 cc_static 2 rootfs/sigfdtest guest/sigfdtest.c
+cc_static 2 rootfs/sigfutex guest/sigfutex.c
 cc_static 2 rootfs/sysbench guest/sysbench.c
 cc_static 2 rootfs/xmmtest guest/xmmtest.c
 cc_static 2 rootfs/sigxmm guest/sigxmm.c
@@ -91,6 +92,7 @@ expect "xmm0-15 survive syscalls (direct path)" 0 "xmm OK" -- rootfs /xmmtest
 expect "a signal handler's xmm use doesn't leak into the interrupted code" 0 "sigxmm OK" -- rootfs /sigxmm
 expect "crash -> SIGSEGV" 139 "guest fault"              -- rootfs /stress crash
 expect "signalfd in epoll, woken by a child's signal" 0 "OK" -- rootfs /sigfdtest
+expect "SIGTERM reaches threads parked in futexes (Go idle)" 0 "sigfutex OK" -- rootfs /sigfutex
 expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regress.sh
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
 expect "the first process is pid 1"  0 "pid1 OK" -- run -v "$GUEST" alpine sh /t/pid1.sh
@@ -141,6 +143,7 @@ expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERS
 expect "/proc/<getpid()> after exec" 0 "own pid ['0', '1', '2']" -- run python:3.12-alpine sh -c 'exec python3 -c "import os; p=f\"/proc/{os.getpid()}\"; os.stat(p); print(\"own pid\", sorted(os.listdir(p + \"/fd\"))[:3])"'
 expect "hard link counts (container files; image files stay 1)" 0 "nlink 2 1 image 1" -- run alpine sh -c 'touch /tmp/a; ln /tmp/a /tmp/b; x=$(stat -c %h /tmp/a); rm /tmp/b; echo "nlink $x $(stat -c %h /tmp/a) image $(stat -c %h /bin/busybox)"'
 expect "procps ps, vmstat (/proc/stat, /proc/vmstat)" 0 "ps ok vmstat ok" -- run python:3.12 sh -c 'ps aux > /dev/null && p="ps ok"; vmstat > /dev/null && echo "$p vmstat ok"'
+expect "#! script run through a link sees the link's name" 0 "/tmp/l ./l" -- run alpine sh -c 'printf "#!/bin/sh\necho \$0\n" > /tmp/s; chmod +x /tmp/s; ln -s /tmp/s /tmp/l; cd /tmp; echo $(/tmp/l) $(./l)'
 expect "run -u / USER + HOME"      0 "65534:65533 HOME=/." -- run -u nobody:nogroup alpine sh -c 'echo $(id -u):$(id -g) HOME=$HOME.'
 # lx build: an image from guest/buildctx/Dockerfile, then run (and the base image keeps its /etc/motd).
 expect "lx build"                  0 "built lxtest-build:1" -- build -t lxtest-build:1 --build-arg FLAVOR=spicy guest/buildctx
