@@ -227,12 +227,11 @@ pub fn pull(r: &Ref) -> Result<PathBuf, String> {
     let rootfs = dir.join("rootfs");
     let _ = std::fs::remove_dir_all(&rootfs); // a re-pull starts clean
     for (i, (digest, media)) in layers.iter().enumerate() {
-        if media.contains("zstd") {
-            return Err(format!("layer {digest}: zstd layers aren't supported yet"));
-        }
         eprintln!("[lx] layer {}/{}: {}", i + 1, layers.len(), &digest[..19.min(digest.len())]);
         let blob = fetch_blob(&mut reg, digest)?;
-        fs::unpack(&blob, &rootfs)?;
+        let plain = if media.contains("zstd") { zstd_to_tar(&blob)? } else { blob.clone() };
+        fs::unpack(&plain, &rootfs)?;
+        let _ = std::fs::remove_file(&plain);
         let _ = std::fs::remove_file(blob);
     }
     std::fs::rename(&config, dir.join("config.json")).map_err(|e| e.to_string())?;
@@ -307,4 +306,36 @@ fn refs() {
     assert_eq!((r.registry.as_str(), r.repo.as_str(), r.tag.as_str()), ("localhost:5000", "app", "1"));
     assert!(Ref::parse("../../x:..").dir().starts_with(STORE));
     assert!(!Ref::parse("../../x:..").dir().components().any(|c| c == std::path::Component::ParentDir));
+}
+
+/// A zstd layer as a plain tar beside it: Windows' own tar.exe (libarchive, with libzstd since
+/// Windows 10 1803's successors) re-archives it without extracting anything, and fs::unpack does the
+/// rest (whiteouts, modes, NTFS name encoding) as for gzip layers.
+fn zstd_to_tar(blob: &Path) -> Result<PathBuf, String> {
+    let out = blob.with_extension("tar");
+    let o = Command::new(r"C:\Windows\System32\tar.exe")
+        .arg("-c").arg("-f").arg(&out).arg(format!("@{}", blob.display()))
+        .output().map_err(|e| format!("running tar.exe: {e}"))?;
+    if !o.status.success() {
+        let _ = std::fs::remove_file(&out);
+        return Err(format!("decompressing a zstd layer: {}", String::from_utf8_lossy(&o.stderr).trim()));
+    }
+    Ok(out)
+}
+
+#[test]
+fn zstd_layer_unpacks() {
+    let base = std::env::temp_dir().join(format!("lx-zstd-{}", std::process::id()));
+    let src = base.join("src");
+    std::fs::create_dir_all(src.join("etc")).unwrap();
+    std::fs::write(src.join("etc/hello"), "from zstd").unwrap();
+    let blob = base.join("layer");
+    let ok = Command::new(r"C:\Windows\System32\tar.exe").arg("--zstd").arg("-c").arg("-f").arg(&blob)
+        .arg("-C").arg(&src).arg("etc").status().unwrap().success();
+    assert!(ok, "tar.exe can't write zstd here");
+    let plain = zstd_to_tar(&blob).unwrap();
+    let root = base.join("root");
+    fs::unpack(&plain, &root).unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("etc/hello")).unwrap(), "from zstd");
+    std::fs::remove_dir_all(base).unwrap();
 }
