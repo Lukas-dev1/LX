@@ -113,6 +113,7 @@ pub mod win {
         pub fn UnmapViewOfFile(base: *mut c_void) -> i32;
         pub fn FlushViewOfFile(base: *const c_void, len: usize) -> i32;
         pub fn CreateNamedPipeW(name: *const u16, mode: u32, pipe_mode: u32, instances: u32, out: u32, inp: u32, timeout: u32, attr: *mut c_void) -> isize;
+        pub fn ConnectNamedPipe(h: isize, ov: *mut c_void) -> i32;
         pub fn CreateFileW(name: *const u16, access: u32, share: u32, attr: *mut c_void, disposition: u32, flags: u32, template: isize) -> isize;
         pub fn GetOverlappedResult(h: isize, ov: *mut c_void, done: *mut u32, wait: i32) -> i32;
         pub fn CancelIoEx(h: isize, ov: *mut c_void) -> i32;

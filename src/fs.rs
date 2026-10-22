@@ -21,6 +21,7 @@ use crate::net::{Epoll, Sock};
 const LINK_MAGIC: &[u8] = b"\0lxlink\0";
 /// Marker at a bound AF_UNIX path (the real socket file lives at a short hashed host path, see net.rs).
 const SOCK_MAGIC: &[u8] = b"\0lxsock\0";
+const FIFO_MAGIC: &[u8] = b"\0lxfifo\0"; // as long as SOCK_MAGIC: stat reads such a small file once
 pub const AT_FDCWD: u64 = -100i64 as u64;
 pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_EMPTY_PATH: u64 = 0x1000;
@@ -352,8 +353,11 @@ impl Pipe {
         // ponytail: write ends always report POLLOUT (a full pipe makes the write wait instead).
         match self.available() {
             // A write end has no read access, so PeekNamedPipe is denied there: it's writable.
-            None if unsafe { crate::win::GetLastError() } == 5 => events & POLLOUT,
-            None => POLLHUP | (events & POLLIN),
+            None => match unsafe { crate::win::GetLastError() } {
+                5 => events & POLLOUT,
+                230 | 536 => 0, // ERROR_BAD_PIPE, ERROR_PIPE_LISTENING: a FIFO reader whose writer hasn't come yet
+                _ => POLLHUP | (events & POLLIN),
+            },
             Some(0) => events & POLLOUT,
             Some(_) => events & (POLLIN | POLLOUT),
         }
@@ -1404,6 +1408,92 @@ fn open_pts(n: u32, flags: u64) -> R {
     add_pty(h, n, false, flags)
 }
 
+// ---- FIFOs ----
+// mknod S_IFIFO leaves a marker file (stat shows a FIFO). Opening one is a named pipe named after the
+// marker: a reader creates an instance and, unless O_NONBLOCK, waits for a writer, as on Linux; a writer
+// connects to a waiting reader, waiting for one (O_NONBLOCK: ENXIO).
+// ponytail: each reader pairs with one writer at a time; after that writer closes, the reader gets EOF and
+// later writers need a new reader (shell loops reopen anyway). O_RDWR is a reader that doesn't wait.
+
+/// mknod/mknodat: regular files and FIFOs; device nodes and sockets: EPERM.
+pub fn mknodat(dirfd: u64, path: u64, mode: u64) -> R {
+    match mode & 0o170000 {
+        0 | 0o100000 => close(openat(dirfd, path, O_CREAT | O_EXCL | 1 | O_CLOEXEC, mode)? as u64),
+        0o010000 => with(|fs| {
+            let (guest, host) = fs.at(dirfd, path, false)?;
+            if exists(&host) {
+                return Err(EEXIST);
+            }
+            let host = fs.writable(&comps_of(&guest), false)?;
+            fs::write(&host, FIFO_MAGIC).map_err(errno)?;
+            if fs.keeps_meta(&comps_of(&guest)) {
+                let _ = set_meta(&host, new_meta(mode));
+            }
+            Ok(0)
+        }),
+        _ => Err(crate::syscall::EPERM),
+    }
+}
+
+fn open_fifo(host: &Path, flags: u64) -> R {
+    use crate::win::*;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    let name: Vec<u16> = format!("\\\\.\\pipe\\lx-fifo-{:x}", ino(host)).encode_utf16().chain([0]).collect();
+    let nonblock = flags & O_NONBLOCK != 0;
+    let wait = || {
+        if crate::signal::deliverable() {
+            return Err(crate::syscall::EINTR);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        Ok(())
+    };
+    let h = if flags & 3 == 1 {
+        loop {
+            // GENERIC_WRITE, OPEN_EXISTING: not found or busy until a reader waits.
+            let h = unsafe { CreateFileW(name.as_ptr(), 0x4000_0000, 0, std::ptr::null_mut(), 3, FILE_FLAG_OVERLAPPED, 0) };
+            if h != -1 {
+                break h;
+            }
+            if nonblock {
+                return Err(crate::syscall::ENXIO);
+            }
+            wait()?;
+        }
+    } else {
+        // PIPE_ACCESS_INBOUND, byte mode, unlimited instances.
+        let h = unsafe { CreateNamedPipeW(name.as_ptr(), 0x1 | FILE_FLAG_OVERLAPPED, 0, 255, 65536, 65536, 0, std::ptr::null_mut()) };
+        if h == -1 {
+            return Err(EIO);
+        }
+        if flags & 3 == 0 && !nonblock {
+            // Wait for a writer to connect (it may have come and gone already: ERROR_PIPE_CONNECTED,
+            // ERROR_NO_DATA), or a signal.
+            let ev = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+            let mut o = Overlapped { internal: [0; 2], offset: 0, offset_high: 0, event: ev };
+            let op = (&mut o as *mut Overlapped).cast();
+            let pending = unsafe { ConnectNamedPipe(h, op) == 0 && GetLastError() == 997 }; // ERROR_IO_PENDING
+            let mut r = Ok(());
+            while pending && unsafe { WaitForMultipleObjects(1, &ev, 0, 0) } != 0 {
+                if let Err(e) = wait() {
+                    unsafe { CancelIoEx(h, op) };
+                    let mut done = 0u32;
+                    unsafe { GetOverlappedResult(h, op, &mut done, 1) };
+                    r = Err(e);
+                    break;
+                }
+            }
+            unsafe { CloseHandle(ev) };
+            if let Err(e) = r {
+                unsafe { CloseHandle(h) };
+                return Err(e);
+            }
+        }
+        h
+    };
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None };
+    Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
+}
+
 fn pty_ioctl(p: &Pipe, req: u64, arg: u64) -> R {
     const TCGETS: u64 = 0x5401;
     const TIOCGWINSZ: u64 = 0x5413;
@@ -1680,9 +1770,12 @@ fn scratch_file(fs: &Fs, bytes: &[u8]) -> io::Result<(File, PathBuf)> {
 
 pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
     let cloexec = flags & O_CLOEXEC != 0;
-    let guest = with(|fs| fs.at(dirfd, path, flags & O_NOFOLLOW == 0))?.0;
+    let (guest, host) = with(|fs| fs.at(dirfd, path, flags & O_NOFOLLOW == 0))?;
     if let Some(n) = fd_alias(&guest) {
         return dup(n, 0, cloexec);
+    }
+    if attrs(&host).is_some_and(|m| !m.dir && m.len == FIFO_MAGIC.len() as u64) && fs::read(&host).is_ok_and(|d| d == FIFO_MAGIC) {
+        return open_fifo(&host, flags); // outside the fs lock: it may wait for the other end
     }
     if guest == "/dev/tty" {
         return Err(crate::syscall::ENXIO); // no controlling terminal, like `docker run` without -t
@@ -2339,10 +2432,11 @@ pub fn fchmeta(fd: u64, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
 fn stat_of(host: &Path) -> Result<[u64; 18], i64> {
     let m = attrs(host).ok_or(ENOENT)?;
     let link = link_target(host, &m);
-    let sock = !m.dir && m.len == SOCK_MAGIC.len() as u64 && fs::read(host).is_ok_and(|d| d == SOCK_MAGIC);
+    let marker = if !m.dir && m.len == SOCK_MAGIC.len() as u64 { fs::read(host).ok() } else { None };
     let (mode, size, nlink) = match &link {
         _ if m.dir => (0o040755, 4096, 2),
-        _ if sock => (0o140755, 0, 1), // S_IFSOCK
+        _ if marker.as_deref() == Some(SOCK_MAGIC) => (0o140755, 0, 1), // S_IFSOCK
+        _ if marker.as_deref() == Some(FIFO_MAGIC) => (0o010644, 0, 1), // S_IFIFO
         Some(t) => (0o120777, t.len() as u64, 1),
         None => (0o100755, m.len, 1),
     };

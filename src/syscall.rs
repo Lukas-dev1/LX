@@ -997,6 +997,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         81 => fs::fchdir(a[0]),
         82 => fs::renameat(CWD, a[0], CWD, a[1]),
         83 => fs::mkdirat(CWD, a[0], a[1]),
+        133 => fs::mknodat(CWD, a[0], a[1]),
         84 => fs::unlinkat(CWD, a[0], 0x200),
         87 => fs::unlinkat(CWD, a[0], 0),
         76 => fs::truncate(CWD, a[0], None, a[1]),
@@ -1050,6 +1051,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         307 => net::sys_mmsg(a[0], a[1], a[2], a[3], true),  // sendmmsg
         257 => fs::openat(a[0], a[1], a[2], a[3]),
         258 => fs::mkdirat(a[0], a[1], a[2]),
+        259 => fs::mknodat(a[0], a[1], a[2]),
         262 => fs::fstatat(a[0], a[1], a[2], a[3]),
         332 => fs::statx(a[0], a[1], a[2], a[4]),
         263 => fs::unlinkat(a[0], a[1], a[2]),
