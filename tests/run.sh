@@ -117,6 +117,7 @@ expect "mariadb: entrypoint + InnoDB query" 0 "hello,lx" -- run -p 13306:3306 -e
 expect "mongodb: mongod + mongosh aggregate" 0 "sum=42" -- run -p 27018:27017 mongo:7 sh -c 'mongod --bind_ip_all > /tmp/log 2>&1 & for i in $(seq 1 60); do grep -q "Waiting for connections" /tmp/log && break; sleep 1; done; mongosh --quiet --eval "db.t.insertOne({a:1}); db.t.insertOne({a:41}); print(\"sum=\" + db.t.aggregate([{\$group:{_id:null,s:{\$sum:\"\$a\"}}}]).toArray()[0].s)"; mongosh --quiet admin --eval "db.shutdownServer()" > /dev/null 2>&1; wait'
 # -e adds and overrides the image's env (PYTHON_VERSION is set by the image), -w sets the directory.
 expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERSION=9 -w /usr python:3.12-alpine sh -c 'echo A=$A V=$PYTHON_VERSION $(pwd)'
+expect "/proc/<getpid()> after exec" 0 "own pid ['0', '1', '2']" -- run python:3.12-alpine sh -c 'exec python3 -c "import os; p=f\"/proc/{os.getpid()}\"; os.stat(p); print(\"own pid\", sorted(os.listdir(p + \"/fd\"))[:3])"'
 expect "run -u / USER + HOME"      0 "65534:65533 HOME=/." -- run -u nobody:nogroup alpine sh -c 'echo $(id -u):$(id -g) HOME=$HOME.'
 # lx build: an image from guest/buildctx/Dockerfile, then run (and the base image keeps its /etc/motd).
 expect "lx build"                  0 "built lxtest-build:1" -- build -t lxtest-build:1 --build-arg FLAVOR=spicy guest/buildctx
