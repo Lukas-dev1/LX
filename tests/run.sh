@@ -127,6 +127,8 @@ expect "lx rmi"                    0 "removed lxtest-multi:1" -- rmi lxtest-mult
 expect "lx rmi: gone from images"  127 "no such image" -- rmi lxtest-multi:1
 # A daemon outlives the process that started it (redis --daemonize forks; its parent exits at once).
 expect "redis: daemonized server"  0 "PONG" -- run redis:alpine sh -c 'redis-server --port 6390 --daemonize yes > /dev/null; sleep 2; redis-cli -p 6390 ping; redis-cli -p 6390 shutdown nosave'
+# The image's own entrypoint (it drops to the redis user with setpriv, which reads the capability set).
+expect "redis: stock entrypoint"   0 "PONG" -- run redis:alpine sh -c 'docker-entrypoint.sh redis-server --port 6392 --daemonize yes > /dev/null; sleep 2; redis-cli -p 6392 ping; redis-cli -p 6392 shutdown nosave'
 expect "postgres: initdb, pg_ctl start, query, stop" 0 "answer 42" -- run -v "$GUEST" postgres:alpine sh /t/pgtest.sh
 # node: musl's pthread_getattr_np measures the main stack with mremap; an HTTP round trip in one process.
 expect "node: http server + client" 0 "node ok 2" -- run node:alpine node -e 'const h=require("http");const s=h.createServer((q,r)=>r.end("ok")).listen(0,()=>h.get("http://127.0.0.1:"+s.address().port,r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>{console.log("node",d,1+1);s.close()})}))'
