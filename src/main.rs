@@ -459,6 +459,12 @@ fn run() -> Result<(), String> {
         if !c.env.iter().any(|e| e.starts_with("HOME=")) {
             c.env.push(format!("HOME={}", if uid == 0 && home == "/" { "/root" } else { &home }));
         }
+        // .NET's W^X double-maps JIT code with 4K MAP_SHARED|MAP_FIXED views inside its own reservation,
+        // which NT can't place (views sit on 64K boundaries). Its documented switch turns that off; an
+        // image or -e that sets it wins. Saved with the env below, so `lx exec` gets it too.
+        if !c.env.iter().any(|e| e.starts_with("DOTNET_EnableWriteXorExecute=")) {
+            c.env.push("DOTNET_EnableWriteXorExecute=0".into());
+        }
         // The container gets its own writable layer; the pulled image is never modified.
         // ponytail: removed when the container exits (like `docker run --rm`); no named, restartable containers yet.
         proc::gc_layers();
