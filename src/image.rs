@@ -42,6 +42,48 @@ impl Ref {
         };
         Path::new(STORE).join(safe(&self.registry)).join(safe(&self.repo)).join(safe(&self.tag))
     }
+
+    /// As people write it: `nginx`, `user/app`, `ghcr.io/org/app`; and the tag.
+    fn name(&self) -> (String, String) {
+        let repo = match self.registry.as_str() {
+            "registry-1.docker.io" => self.repo.strip_prefix("library/").unwrap_or(&self.repo).to_string(),
+            reg => format!("{reg}/{}", self.repo),
+        };
+        (repo, self.tag.clone())
+    }
+
+    /// Keep the name beside the image (`dir()` can't be read back: `/` and `_` both become `_`).
+    pub fn record_name(&self, dir: &Path) {
+        let (repo, tag) = self.name();
+        let _ = std::fs::write(dir.join("name"), format!("{repo}:{tag}"));
+    }
+}
+
+/// Every image in the store: (repository, tag), from the recorded name, else a best guess from the
+/// directory (images pulled before names were kept).
+pub fn list() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let dirs = |p: &Path| std::fs::read_dir(p).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect::<Vec<_>>();
+    for reg in dirs(Path::new(STORE)) {
+        for repo in dirs(&reg) {
+            for tag in dirs(&repo) {
+                if !tag.join("config.json").exists() {
+                    continue;
+                }
+                let file = |p: &Path| p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let guess = || {
+                    let r = file(&repo);
+                    let r = r.strip_prefix("library_").map(String::from).unwrap_or(r);
+                    format!("{}:{}", if file(&reg) == "registry-1.docker.io" { r } else { format!("{}/{r}", file(&reg)) }, file(&tag))
+                };
+                let name = std::fs::read_to_string(tag.join("name")).unwrap_or_else(|_| guess());
+                let (r, t) = name.rsplit_once(':').map(|(r, t)| (r.to_string(), t.to_string())).unwrap_or((name.clone(), String::new()));
+                out.push((r, t));
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 struct Registry {
@@ -195,6 +237,7 @@ pub fn pull(r: &Ref) -> Result<PathBuf, String> {
     }
     std::fs::rename(&config, dir.join("config.json")).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_dir_all(&tmp);
+    r.record_name(&dir);
     Ok(dir)
 }
 
@@ -230,13 +273,16 @@ pub fn resolve_user(rootfs: &Path, spec: &str) -> Result<(u32, u32, String), Str
     Ok((uid, gid, home))
 }
 
-/// Entrypoint + (user command, else image Cmd), like `docker run`.
-pub fn run_config(dir: &Path, cmd: &[String]) -> Result<RunConfig, String> {
+/// Entrypoint + (user command, else image Cmd), like `docker run`; `entrypoint` is `--entrypoint` (empty: none).
+pub fn run_config(dir: &Path, cmd: &[String], entrypoint: Option<&str>) -> Result<RunConfig, String> {
     let raw = std::fs::read(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?;
     let v: Value = serde_json::from_slice(&raw).map_err(|e| format!("config.json: {e}"))?;
     let c = &v["config"];
     let strings = |x: &Value| -> Vec<String> { x.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect() };
-    let mut argv = strings(&c["Entrypoint"]);
+    let mut argv = match entrypoint {
+        Some(e) => e.split_whitespace().map(String::from).collect(),
+        None => strings(&c["Entrypoint"]),
+    };
     argv.extend(if cmd.is_empty() { strings(&c["Cmd"]) } else { cmd.to_vec() });
     if argv.is_empty() {
         return Err("image has no Entrypoint or Cmd; give a command".into());
