@@ -1003,7 +1003,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         114 | 119 => proc::set_id(&proc::GID, a[1]),      // setregid, setresgid
         118 => proc::get_res(&proc::UID, [a[0], a[1], a[2]]), // getresuid
         120 => proc::get_res(&proc::GID, [a[0], a[1], a[2]]), // getresgid
-        157 => Ok(0),                  // prctl (PR_SET_NAME, PR_SET_DUMPABLE, PR_SET_PDEATHSIG, ...): accepted
+        157 => prctl(a[0], a[1]),
         115 => Ok(0),                  // getgroups: no supplementary groups
         116 => Ok(0),                  // setgroups: accepted
         109 => Ok(0),                  // setpgid. ponytail: no process groups / job control
@@ -1408,14 +1408,32 @@ fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
     Ok(new as i64)
 }
 
+// CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID SETPCAP NET_BIND_SERVICE NET_RAW SYS_CHROOT MKNOD
+// AUDIT_WRITE SETFCAP: what `docker run` grants by default (and its bounding set).
+const DOCKER_CAPS: u32 = 1 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 8 | 1 << 10 | 1 << 13
+    | 1 << 18 | 1 << 27 | 1 << 29 | 1 << 31;
+const CAP_LAST_CAP: u64 = 40;
+
+/// prctl(option, arg2): the capability queries answer like Docker's default set, everything else is
+/// accepted (PR_SET_NAME, PR_SET_DUMPABLE, PR_SET_PDEATHSIG, ...). setpriv and libcap find the highest
+/// capability by asking PR_CAPBSET_READ for 0, 1, 2, ... until EINVAL; answering 0 forever hung the stock
+/// redis image's entrypoint (`setpriv -d`).
+fn prctl(option: u64, arg2: u64) -> R {
+    const PR_CAPBSET_READ: u64 = 23;
+    const PR_CAP_AMBIENT: u64 = 47;
+    match option {
+        PR_CAPBSET_READ if arg2 > CAP_LAST_CAP => Err(EINVAL),
+        PR_CAPBSET_READ => Ok((arg2 < 32 && DOCKER_CAPS & 1 << arg2 != 0) as i64),
+        PR_CAP_AMBIENT => Ok(0), // nothing ambient (IS_SET answers 0; raising one is accepted)
+        _ => Ok(0),
+    }
+}
+
 /// capget(header, data): Docker's default capability set for root, none for other users (node asks at
 /// startup). A null `data` just reports the version (v3, two 32-bit words per set).
 fn capget(header: u64, data: u64) -> R {
     const V3: u32 = 0x2008_0522;
-    // CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID SETPCAP NET_BIND_SERVICE NET_RAW SYS_CHROOT MKNOD
-    // AUDIT_WRITE SETFCAP: what `docker run` grants by default.
-    const DOCKER: u32 = 1 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 8 | 1 << 10 | 1 << 13
-        | 1 << 18 | 1 << 27 | 1 << 29 | 1 << 31;
+    const DOCKER: u32 = DOCKER_CAPS;
     if header == 0 {
         return Err(EFAULT);
     }
