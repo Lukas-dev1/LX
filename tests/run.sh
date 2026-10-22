@@ -101,6 +101,7 @@ expect "debian: python3 -c"         0 "hi"               -- run python:3.12 pyth
 expect "debian: python3 /script.py" 0 "script ran: 3.12" -- run -v "$GUEST" python:3.12 python3 /t/hello.py
 expect "debian: AF_UNIX echo (path + abstract)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/unixtest.py
 expect "SO_PEERCRED on a unix socket" 0 "peercred OK" -- run -v "$GUEST" python:3.12 python3 /t/peercred.py
+expect "inotify: container dir and image dir" 0 "inotify OK etc delete motd" -- run -v "$GUEST" python:3.12-alpine python3 /t/inotifytest.py
 expect "seccomp: a filter here and in an exec'd child" 0 "seccomp OK child filtered 2" -- run -v "$GUEST" python:3.12 python3 /t/seccomptest.py
 expect "debian: pty (openpty, pty.fork)" 0 "pty OK" -- run -v "$GUEST" python:3.12 python3 /t/ptytest.py
 expect "FIFOs: mkfifo, open waits, ENXIO, poll" 0 "fifo OK 0o600 through the fifo" -- run -v "$GUEST" python:3.12 python3 /t/fifotest.py

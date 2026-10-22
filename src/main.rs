@@ -5,6 +5,7 @@ mod elf;
 mod fs;
 mod jump;
 mod image;
+mod inotify;
 mod net;
 mod proc;
 mod procfs;
@@ -120,6 +121,8 @@ pub mod win {
         pub fn CreateFileW(name: *const u16, access: u32, share: u32, attr: *mut c_void, disposition: u32, flags: u32, template: isize) -> isize;
         pub fn GetOverlappedResult(h: isize, ov: *mut c_void, done: *mut u32, wait: i32) -> i32;
         pub fn CancelIoEx(h: isize, ov: *mut c_void) -> i32;
+        pub fn ReadDirectoryChangesW(h: isize, buf: *mut c_void, len: u32, subtree: i32, filter: u32, returned: *mut u32,
+            ov: *mut c_void, completion: *mut c_void) -> i32;
         pub fn GetPhysicallyInstalledSystemMemory(kb: *mut u64) -> i32;
         pub fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
         pub fn CreateFileMappingW(file: isize, attr: *mut c_void, prot: u32, hi: u32, lo: u32, name: *const u16) -> isize;

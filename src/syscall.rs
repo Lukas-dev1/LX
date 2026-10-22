@@ -1117,6 +1117,10 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         234 => if crate::proc::host_pid(a[0] as u32) == crate::proc::pid() { signal::send_thread(a[1], a[2]) } else { proc::kill(a[0] as i32 as i64, a[2]) }, // tgkill
         292 => fs::dup3(a[0], a[1], a[2]),
         293 => fs::pipe2(a[0], a[1]),
+        253 => crate::inotify::init(0),
+        294 => crate::inotify::init(a[0]),
+        254 => crate::inotify::add_watch(a[0], a[1], a[2]),
+        255 => crate::inotify::rm_watch(a[0], a[1]),
         318 => getrandom(a[0], a[1]),
         334 => Err(ENOSYS),            // rseq: optional, glibc copes
         nr => {
