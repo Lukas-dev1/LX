@@ -1059,6 +1059,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         118 => proc::get_res(&proc::UID, [a[0], a[1], a[2]]), // getresuid
         120 => proc::get_res(&proc::GID, [a[0], a[1], a[2]]), // getresgid
         157 => prctl(a[0], a[1]),
+        // seccomp: like a kernel without filter support. libseccomp's probe (an invalid STRICT call) gets
+        // EINVAL, so it knows the syscall exists; a filter isn't silently accepted and ignored.
+        317 => Err(EINVAL),
         115 => Ok(0),                  // getgroups: no supplementary groups
         116 => Ok(0),                  // setgroups: accepted
         109 => Ok(0),                  // setpgid. ponytail: no process groups / job control
@@ -1482,10 +1485,12 @@ const CAP_LAST_CAP: u64 = 40;
 fn prctl(option: u64, arg2: u64) -> R {
     const PR_CAPBSET_READ: u64 = 23;
     const PR_CAP_AMBIENT: u64 = 47;
+    const PR_SET_SECCOMP: u64 = 22;
     match option {
         PR_CAPBSET_READ if arg2 > CAP_LAST_CAP => Err(EINVAL),
         PR_CAPBSET_READ => Ok((arg2 < 32 && DOCKER_CAPS & 1 << arg2 != 0) as i64),
         PR_CAP_AMBIENT => Ok(0), // nothing ambient (IS_SET answers 0; raising one is accepted)
+        PR_SET_SECCOMP => Err(EINVAL), // see seccomp below: no filters, said so rather than faked
         _ => Ok(0),
     }
 }
