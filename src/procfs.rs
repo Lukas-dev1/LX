@@ -31,6 +31,9 @@ Pss: {:>16} kB
             let s = unsafe { crate::win::GetTickCount64() } as f64 / 1000.0;
             format!("{s:.2} {s:.2}\n")
         }
+        "/proc/stat" => stat(),
+        // vmstat won't start without it. ponytail: no paging figures.
+        "/proc/vmstat" => "nr_free_pages 0\npgpgin 0\npgpgout 0\npswpin 0\npswpout 0\npgfault 0\npgmajfault 0\n".into(),
         "/proc/loadavg" => format!("0.00 0.00 0.00 1/1 {}\n", crate::proc::getpid().unwrap_or(0)),
         "/proc/version" => "Linux version 6.6.0-lx (lx) #1 SMP lx\n".into(),
         "/proc/sys/kernel/hostname" => "lx\n".into(),
@@ -69,6 +72,29 @@ fn self_rest(guest: &str) -> Option<&str> {
     let r = guest.strip_prefix("/proc/")?;
     let (pid, rest) = r.split_once('/')?;
     (pid == "self" || crate::proc::host_pid(pid.parse().ok()?) == crate::proc::pid()).then_some(rest)
+}
+
+/// The machine's CPU times (in 1/100 s ticks) and boot time: ps reads btime, top the cpu lines.
+/// ponytail: per-CPU lines split the totals evenly; no interrupt or context-switch counts.
+fn stat() -> String {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    }
+    let (mut idle, mut kernel, mut user) = (0u64, 0u64, 0u64);
+    unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+    // 100 ns units -> ticks; kernel time includes idle time.
+    let (idle, sys, user) = (idle / 100_000, kernel.saturating_sub(idle) / 100_000, user / 100_000);
+    let line = |name: &str, d: u64| format!("{name} {} 0 {} {} 0 0 0 0 0 0\n", user / d, sys / d, idle / d);
+    let mut s = line("cpu ", 1);
+    for i in 0..n {
+        s += &line(&format!("cpu{i}"), n);
+    }
+    let up = unsafe { crate::win::GetTickCount64() } / 1000;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    s + &format!("intr 0\nctxt 0\nbtime {}\nprocesses {}\nprocs_running 1\nprocs_blocked 0\n",
+                 now.saturating_sub(up), crate::ptable::all().len())
 }
 
 fn mounts() -> String {
