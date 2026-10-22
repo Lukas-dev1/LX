@@ -258,6 +258,8 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
        lx logs <pid>                         output of a `lx run -d` container
        lx exec [-e ..] [-w dir] [-u user] <pid> <command> [args...]
                                              runs a command inside a running container
+       lx images                             pulled and built images
+       lx rmi <image>...                     remove images
        lx ps                                 running containers
        lx stop <pid>                         SIGTERM, then SIGKILL after 10s
        lx kill <pid> [SIGNAL]                default TERM
@@ -310,6 +312,24 @@ fn run() -> Result<(), String> {
     if let [cmd, image] = args.as_slice() && cmd == "pull" {
         let dir = image::pull(&image::Ref::parse(image))?;
         eprintln!("[lx] pulled {image} into {}", dir.display());
+        return Ok(());
+    }
+    if let [cmd] = args.as_slice() && cmd == "images" {
+        println!("{:<50} TAG", "REPOSITORY");
+        for (repo, tag) in image::list() {
+            println!("{repo:<50} {tag}");
+        }
+        return Ok(());
+    }
+    if let [cmd, images @ ..] = args.as_slice() && cmd == "rmi" && !images.is_empty() {
+        for i in images {
+            let dir = image::Ref::parse(i).dir();
+            if !dir.join("config.json").exists() {
+                return Err(format!("{i}: no such image"));
+            }
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("{i}: {e}"))?;
+            println!("removed {i}");
+        }
         return Ok(());
     }
     if let [cmd, rest @ ..] = args.as_slice() && cmd == "build" {

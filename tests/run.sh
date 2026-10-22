@@ -117,6 +117,9 @@ expect "lx build: run the image"   0 "hello from lx build: spicy in /srv/app as 
 expect "lx build: base untouched"  0 "motd kept" -- run alpine sh -c 'test -e /etc/motd && echo motd kept'
 expect "lx build: multi-stage"     0 "built lxtest-multi:1" -- build -t lxtest-multi:1 -f guest/buildctx/Dockerfile.multi guest/buildctx
 expect "lx build: COPY --from"     0 "made in stage make, mode 600" -- run lxtest-multi:1
+expect "lx images lists a build"   0 "lxtest-multi" -- images
+expect "lx rmi"                    0 "removed lxtest-multi:1" -- rmi lxtest-multi:1
+expect "lx rmi: gone from images"  127 "no such image" -- rmi lxtest-multi:1
 # A daemon outlives the process that started it (redis --daemonize forks; its parent exits at once).
 expect "redis: daemonized server"  0 "PONG" -- run redis:alpine sh -c 'redis-server --port 6390 --daemonize yes > /dev/null; sleep 2; redis-cli -p 6390 ping; redis-cli -p 6390 shutdown nosave'
 expect "postgres: initdb, pg_ctl start, query, stop" 0 "answer 42" -- run -v "$GUEST" postgres:alpine sh /t/pgtest.sh

@@ -25,7 +25,9 @@ pub fn build(tag: &str, context: &Path, dockerfile: &Path, build_args: Vec<(Stri
     let r = run_steps(&text, context, &work, build_args.into_iter().collect());
     let r = r.and_then(|last| {
         let _ = std::fs::remove_dir_all(&target);
-        std::fs::rename(&last, &target).map_err(|e| format!("{}: {e}", target.display()))
+        std::fs::rename(&last, &target).map_err(|e| format!("{}: {e}", target.display()))?;
+        Ref::parse(tag).record_name(&target);
+        Ok(())
     });
     let _ = std::fs::remove_dir_all(&work); // the other stages
     if r.is_ok() {
