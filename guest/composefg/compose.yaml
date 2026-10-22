@@ -1,0 +1,7 @@
+services:
+  a:
+    image: alpine
+    command: sh -c "echo hello from a; sleep 1; echo bye a"
+  b:
+    image: alpine
+    command: echo hi from b

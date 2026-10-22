@@ -5,7 +5,8 @@
 //! (`--add-host db:127.0.0.1`) and its usual port. Keys: image, build (a path or {context, dockerfile}),
 //! ports, environment (map or list), volumes (a relative host path, or a named volume kept in
 //! rootfs/volumes/<project>_<name>), command, entrypoint, working_dir, user, depends_on.
-//! ponytail: `up` always detaches (`lx compose logs` shows output); no networks, profiles, env_file,
+//! `up` follows the services' output until they end or Ctrl-C (then stops them); `up -d` leaves them running.
+//! ponytail: no networks, profiles, env_file,
 //! healthchecks or restart policies; services' ports must not collide (one network for all).
 
 use serde_json::{json, Map, Value};
@@ -35,6 +36,7 @@ pub fn compose(args: &[String]) -> Result<(), String> {
     let name = |svc: &str| format!("{project}-{svc}");
     match rest {
         [cmd, ..] if cmd == "up" => {
+            let mut pids = Vec::new();
             for svc in &order {
                 let s = &services[svc];
                 let image = match &s["build"] {
@@ -80,7 +82,18 @@ pub fn compose(args: &[String]) -> Result<(), String> {
                 if !out.status.success() {
                     return Err(format!("{svc}: {}", String::from_utf8_lossy(&out.stderr).trim()));
                 }
-                println!("started {} (pid {})", name(svc), String::from_utf8_lossy(&out.stdout).trim());
+                let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                println!("started {} (pid {pid})", name(svc));
+                pids.push((svc.clone(), pid.parse::<u32>().ok()));
+            }
+            if rest.iter().any(|a| a == "-d" || a == "--detach") {
+                return Ok(());
+            }
+            // In the foreground, like `docker compose up`: follow every service's output until they've all
+            // ended or Ctrl-C, then stop them.
+            follow(&pids);
+            for svc in order.iter().rev() {
+                let _ = std::process::Command::new(&lx).args(["stop", &name(svc)]).output();
             }
             Ok(())
         }
@@ -110,7 +123,46 @@ pub fn compose(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("usage: lx compose [-f file] up|down|ps|logs [service...]".into()),
+        _ => Err("usage: lx compose [-f file] up [-d]|down|ps|logs [service...]".into()),
+    }
+}
+
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe extern "system" fn on_ctrl(_kind: u32) -> i32 {
+    INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    1 // handled: we stop the services ourselves
+}
+
+/// Print each service's new log lines as `service | line` until every service has ended or Ctrl-C.
+fn follow(services: &[(String, Option<u32>)]) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    unsafe { crate::win::SetConsoleCtrlHandler(Some(on_ctrl), 1) };
+    let mut offsets = vec![0u64; services.len()];
+    let mut partial = vec![String::new(); services.len()];
+    loop {
+        let mut running = 0;
+        for (i, (svc, pid)) in services.iter().enumerate() {
+            let Some(pid) = *pid else { continue };
+            if crate::proc::send(pid, 0).is_ok() {
+                running += 1;
+            }
+            let Some(mut f) = crate::proc::log_of(pid).and_then(|p| std::fs::File::open(p).ok()) else { continue };
+            let mut buf = Vec::new();
+            if f.seek(SeekFrom::Start(offsets[i])).is_ok() && f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                offsets[i] += buf.len() as u64;
+                partial[i].push_str(&String::from_utf8_lossy(&buf));
+                while let Some(nl) = partial[i].find('\n') {
+                    let line: String = partial[i].drain(..=nl).collect();
+                    let _ = write!(std::io::stdout(), "{svc} | {line}");
+                }
+            }
+        }
+        let _ = std::io::stdout().flush();
+        if running == 0 || INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
