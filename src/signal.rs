@@ -452,7 +452,9 @@ fn gregs(c: &mut Context) -> [&mut u64; 17] {
 }
 
 /// Largest signal frame: return address + ucontext + siginfo, plus alignment slack.
-pub const FRAME_MAX: usize = (8 + UC_SIZE + SI_SIZE + 32) as usize;
+/// Largest signal frame: return address + FP area (an XSAVE image, 64-aligned, + magic) + ucontext +
+/// siginfo, plus alignment slack.
+pub const FRAME_MAX: usize = (8 + 4096 + 64 + 64 + UC_SIZE + SI_SIZE + 32) as usize;
 
 /// Called when a syscall returns (`c` already holds the post-syscall state). If a signal is pending and
 /// unblocked, run its default action, or point `c` at its handler and return the signal frame bytes,
@@ -511,10 +513,16 @@ fn frame(s: &mut State, c: &mut Context, sig: u64, a: Action, code: u64, addr: u
     let t = crate::syscall::ts();
     let alt = t.altstack.filter(|&(b, n)| a.flags & SA_ONSTACK != 0 && !(b..b + n).contains(&c.rsp));
     let top = alt.map(|(b, n)| b + n).unwrap_or(c.rsp - 128); // else below the red zone
-    let info = (top - SI_SIZE) & !15;
+    // Top down, as Linux lays it out: the interrupted FP/vector state (uc_mcontext.fpregs points here;
+    // rt_sigreturn restores it, so a handler using xmm can't clobber the code it interrupted), then
+    // siginfo, the ucontext, and the return address right below it (rt_sigreturn finds uc at rsp).
+    let fp = crate::syscall::fp_area(c);
+    let xstate = fp.len() > 512;
+    let fpa = (top - fp.len() as u64 - 64) & !63; // + room for the FP_XSTATE_MAGIC2 after it
+    let info = (fpa - SI_SIZE) & !15;
     let uc = (info - UC_SIZE) & !15;
     let sp = uc - 8; // handler entry: rsp % 16 == 8, as after a call
-    let mut frame = vec![0u8; (info + SI_SIZE - sp) as usize];
+    let mut frame = vec![0u8; (fpa + fp.len() as u64 + 64 - sp) as usize];
     let mut put = |addr: u64, v: u64| {
         let o = (addr - sp) as usize;
         frame[o..o + 8].copy_from_slice(&v.to_le_bytes());
@@ -529,6 +537,21 @@ fn frame(s: &mut State, c: &mut Context, sig: u64, a: Action, code: u64, addr: u
     }
     put(uc + UC_MCONTEXT + 8 * 17, flags);
     put(uc + UC_SIGMASK, restore_mask);
+    for (i, q) in fp.chunks_exact(8).enumerate() {
+        put(fpa + 8 * i as u64, u64::from_le_bytes(q.try_into().unwrap()));
+    }
+    if xstate {
+        // fx_sw_bytes in the image's software-reserved bytes, then FP_XSTATE_MAGIC2 right after it,
+        // so code that walks the extended state (as glibc's and the kernel's readers do) finds it.
+        let n = fp.len() as u64;
+        let features = u64::from_le_bytes(fp[512..520].try_into().unwrap()) | 3; // XSTATE_BV, x87 + SSE
+        put(fpa + 464, 0x4650_5853 | (n + 4) << 32); // FP_XSTATE_MAGIC1, extended_size
+        put(fpa + 472, features);
+        put(fpa + 480, n); // xstate_size
+        put(fpa + n, 0x4650_5845); // FP_XSTATE_MAGIC2
+        put(uc, 1); // uc_flags: UC_FP_XSTATE
+    }
+    put(uc + UC_MCONTEXT + 8 * 23, fpa); // mcontext.fpregs
     if let Some((b, n)) = t.altstack {
         // uc_stack describes the alternate stack (Go reads it back).
         let on_alt = alt.is_some() || (b..b + n).contains(&c.rsp);
@@ -558,6 +581,17 @@ pub fn sigreturn(c: &mut Context) {
         *r = *v;
     }
     c.eflags = saved[17] as u32;
+    // The FP state the frame carries (the handler may have edited it) goes back too. A full XSAVE
+    // image says so with FP_XSTATE_MAGIC1; otherwise only the legacy 512 bytes are trusted, so a
+    // frame from the trap path never feeds xrstor a header it didn't write.
+    let fpregs = get(23);
+    if fpregs != 0 {
+        let dst = crate::syscall::fp_area(c);
+        let magic = unsafe { *((fpregs + 464) as *const u32) };
+        let size = unsafe { *((fpregs + 480) as *const u32) } as usize;
+        let n = if magic == 0x4650_5853 { size.min(dst.len()) } else { 512 };
+        unsafe { std::ptr::copy_nonoverlapping(fpregs as *const u8, dst.as_mut_ptr(), n.min(dst.len())) };
+    }
     if crate::syscall::siglog() {
         crate::syscall::dlog(format_args!("sigreturn to rip {:#x} rsp {:#x}", c.rip, c.rsp));
     }
