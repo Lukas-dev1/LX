@@ -256,6 +256,7 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
                                              -w /dir sets the working directory
                                              -u user[:group] runs as that user (default: the image's USER)
                                              --name NAME names it (for exec, logs, stop, kill)
+                                             --add-host name:ip adds a line to /etc/hosts
        lx run -d ...                         the same in the background: prints the container's pid
        lx build -t name[:tag] [-f Dockerfile] [--build-arg K=V] [--no-cache] <dir>
                                              builds an image from a Dockerfile
@@ -389,8 +390,14 @@ fn run() -> Result<(), String> {
         let (mut rest, mut ports) = (rest, Vec::new());
         let (mut volumes, mut envs, mut workdir, mut user) = (Vec::new(), Vec::new(), None, None);
         let (mut entrypoint, mut keep_layer, mut name) = (None, None, None);
+        let mut extra_hosts: Vec<(String, String)> = Vec::new();
         while let [flag, value, more @ ..] = rest {
             match flag.as_str() {
+                // --add-host name:ip, like Docker (lx compose names the other services this way).
+                "--add-host" => {
+                    let (n, ip) = value.split_once(':').ok_or(format!("bad --add-host {value:?}: want name:ip"))?;
+                    extra_hosts.push((n.to_string(), ip.to_string()));
+                }
                 "-u" | "--user" => user = Some(value.clone()),
                 "--name" => {
                     if let Some(pid) = proc::container_pid(value) {
@@ -450,7 +457,10 @@ fn run() -> Result<(), String> {
         fs::init(root.clone());
         fs::set_upper(layer.join("upper"));
         // Like Docker: the container resolves names through the host's DNS servers.
-        let (resolv, hosts) = net::dns_files();
+        let (resolv, mut hosts) = net::dns_files();
+        for (name, ip) in &extra_hosts {
+            hosts.push_str(&format!("{ip}\t{name}\n")); // --add-host
+        }
         let _ = fs::write_guest_file("/etc/resolv.conf", resolv.as_bytes());
         let _ = fs::write_guest_file("/etc/hosts", hosts.as_bytes());
         let _ = fs::mkdir_guest("/dev/shm"); // POSIX shared memory and semaphores (glibc's sem_open) live here
