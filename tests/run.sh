@@ -276,6 +276,14 @@ dup=$($LX run --name "$nm" alpine true 2>&1)
 $LX stop "$nm" > /dev/null 2>&1
 if [ "$out" = by-name ] && echo "$dup" | grep -q "already in use"; then ok "lx run --name"; else bad "--name: exec '$out', duplicate '$dup'"; fi
 
+# lx compose: a built service reaches another by its service name; down stops both.
+CF=guest/composetest/compose.yaml
+$LX compose -f $CF up > "$OUT/compose" 2>&1
+for _ in $(seq 40); do got=$($LX exec composetest-cache redis-cli -p 6391 get greeting 2>/dev/null); [ "$got" = "hello from app" ] && break; sleep 0.5; done
+$LX compose -f $CF down > /dev/null 2>&1
+left=$($LX ps | grep -c composetest)
+if [ "$got" = "hello from app" ] && [ "$left" = 0 ]; then ok "lx compose up/down"; else bad "lx compose: got '$got', $left left"; tail -3 "$OUT/compose"; fi
+
 # Only this checkout's lx.exe (every lx of a container runs it): another worktree's containers may run.
 exe=$(cygpath -w "$ROOT/target/release/lx.exe")
 left=$(powershell -NoProfile -Command "@(Get-CimInstance Win32_Process -Filter \"Name='lx.exe'\" | Where-Object ExecutablePath -eq '$exe').Count" | tr -d '\r')
