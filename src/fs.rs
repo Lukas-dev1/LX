@@ -116,6 +116,17 @@ pub fn eventfd(init: u64, flags: u64) -> R {
     Ok(add_fd(Fd::Event(Arc::new(EventFd::new(init, flags))), flags & EFD_CLOEXEC != 0))
 }
 
+/// memfd_create(name, flags): an anonymous file, here a scratch file Windows deletes with its last handle,
+/// so it reads, writes, truncates and maps (MAP_SHARED included) like any file. PHP and Chromium use it.
+/// ponytail: sealing (MFD_ALLOW_SEALING, F_ADD_SEALS) is accepted and not enforced.
+pub fn memfd_create(_name: u64, flags: u64) -> R {
+    const MFD_CLOEXEC: u64 = 1;
+    with(|fs| {
+        let (f, host) = scratch_file(fs, b"").map_err(errno)?;
+        Ok(fs.add(Fd::File { f, host }, 0, flags & MFD_CLOEXEC != 0))
+    })
+}
+
 /// signalfd4(fd, mask, sizemask, flags): fd -1 makes a new one, else changes that one's mask.
 pub fn signalfd(fd: u64, mask: u64, _size: u64, flags: u64) -> R {
     const SFD_CLOEXEC: u64 = 0o2000000;
