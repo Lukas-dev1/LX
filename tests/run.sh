@@ -63,7 +63,7 @@ if [ -x $GO ]; then
 fi
 
 # ---- images: pull what's missing; guest scripts reach containers through a read-only volume ----
-for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine node:alpine golang:alpine mariadb:11 rabbitmq:3-alpine mongo:7; do
+for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine node:alpine golang:alpine mariadb:11 rabbitmq:3-alpine mongo:7 wordpress:fpm-alpine; do
   dir=$STORE/library_${img%%:*}/${img#*:}/rootfs
   # Pulled before lx kept file modes, every file reads 0755 (no real image has /etc/passwd so): re-pull.
   if [ -d "$dir" ] && [ "$($LX run "$img" stat -c %a /etc/passwd 2> /dev/null < /dev/null)" = 755 ]; then
@@ -215,6 +215,7 @@ else
   online "python3 /script.py: sockets + threaded server" "20/20 responses" run -v "$GUEST" python:3.12-alpine python3 /t/nettest.py
   online "debian: sockets + threaded server" "20/20 responses" run -v "$GUEST" python:3.12 python3 /t/nettest.py
   online "debian: apt-get install jq" "jq says 6" run python:3.12 sh -c 'apt-get update -qq && apt-get install -qqy --no-install-recommends jq && echo "jq says $(echo "{\"lx\": [1, 2, 3]}" | jq ".lx | add")"'
+  online "php-fpm: workers serve PHP over FastCGI" "php-fpm says 42" run wordpress:fpm-alpine sh -c 'php-fpm -D 2>/dev/null; printf "<?php echo \"php-fpm says \" . (6*7);" > /var/www/html/t.php; apk add -q fcgi > /dev/null 2>&1; sleep 1; SCRIPT_FILENAME=/var/www/html/t.php REQUEST_METHOD=GET cgi-fcgi -bind -connect 127.0.0.1:9000'
   # The package managers a Dockerfile's RUN lines use most.
   online "alpine: apk add" "jq says 1" run alpine sh -c 'apk add -q --no-cache jq && echo "jq says $(echo "{\"a\": 1}" | jq .a)"'
   online "pip install" "requests 2" run python:3.12-alpine sh -c 'pip install -q --root-user-action=ignore requests 2> /dev/null; python3 -c "import requests; print(\"requests\", requests.__version__)"'
