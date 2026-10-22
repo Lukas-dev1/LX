@@ -1172,12 +1172,18 @@ pub unsafe fn guest_mut<'a>(addr: u64, len: usize) -> &'a mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len) }
 }
 
+/// A path (PATH_MAX, 4096 bytes with its NUL).
 pub fn cstr(addr: u64) -> Result<String, i64> {
+    cstr_max(addr, 4096).map_err(|e| if e == E2BIG { ENAMETOOLONG } else { e })
+}
+
+/// A NUL-terminated guest string of at most `max` bytes, else E2BIG.
+pub fn cstr_max(addr: u64, max: usize) -> Result<String, i64> {
     if addr == 0 {
         return Err(EFAULT);
     }
     let p = addr as *const u8;
-    let len = (0..4096).find(|&i| unsafe { *p.add(i) } == 0).ok_or(ENAMETOOLONG)?;
+    let len = (0..max).find(|&i| unsafe { *p.add(i) } == 0).ok_or(E2BIG)?;
     Ok(String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned())
 }
 

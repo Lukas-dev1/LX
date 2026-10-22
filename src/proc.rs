@@ -537,7 +537,9 @@ fn strv(p: u64) -> Result<Vec<String>, i64> {
         if s == 0 {
             return Ok(v);
         }
-        v.push(cstr(s)?);
+        // An argument or environment string may be up to MAX_ARG_STRLEN (32 pages), not just a path's
+        // 4096: aclocal hands sh -c a 4.7 KB command line.
+        v.push(crate::syscall::cstr_max(s, 32 * 4096)?);
     }
     Err(crate::syscall::E2BIG)
 }
