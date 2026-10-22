@@ -857,12 +857,13 @@ pub fn sys_sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, alen: u64)
     if addr == 0 {
         return s.send(buf, len, flags);
     }
-    let mut a = if s.udgram && is_unix_addr(addr, alen) {
-        udgram_dest(addr, alen)?.1.to_vec()
+    let a = if s.udgram && is_unix_addr(addr, alen) {
+        udgram_dest(addr, alen)?.1.to_vec() // our own plumbing on the host's loopback: not rewritten
     } else {
-        addr_in(addr, alen)?
+        let mut a = addr_in(addr, alen)?;
+        dest_addr(s.s, &mut a);
+        a
     };
-    dest_addr(s.s, &mut a);
     let len = len.min(i32::MAX as u64) as i32;
     s.op(POLLOUT, flags & MSG_DONTWAIT != 0, || {
         let n = unsafe { sendto(s.s, buf as *const u8, len, msg_flags(flags), a.as_ptr(), a.len() as i32) };
