@@ -74,14 +74,24 @@ pub fn add_watch(fd: u64, path: u64, mask: u64) -> R {
     }
     let w: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(dir.as_os_str()).chain([0]).collect();
     // FILE_LIST_DIRECTORY, share all, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a directory)
-    let h = unsafe { crate::win::CreateFileW(w.as_ptr(), 1, 7, std::ptr::null_mut(), 3, 0x0200_0000, 0) };
+    // ... | FILE_FLAG_OVERLAPPED: the first wait is issued here, so the watch is armed when we return
+    // (NT collects a directory's changes only from its handle's first ReadDirectoryChangesW on).
+    let h = unsafe { crate::win::CreateFileW(w.as_ptr(), 1, 7, std::ptr::null_mut(), 3, 0x0200_0000 | 0x4000_0000, 0) };
     if h == -1 {
+        return Err(crate::syscall::ENOENT);
+    }
+    let mut buf = vec![0u32; 16384]; // DWORD-aligned, as ReadDirectoryChangesW wants
+    let event = unsafe { crate::win::CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+    let mut ov = Box::new(Ov { internal: [0; 2], offset: 0, offset_high: 0, event });
+    if !arm(h, &mut buf, &mut ov) {
+        unsafe { crate::win::CloseHandle(event) };
+        unsafe { crate::win::CloseHandle(h) };
         return Err(crate::syscall::ENOENT);
     }
     let wd = NEXT_WD.fetch_add(1, Relaxed) as i32;
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
-    std::thread::spawn(move || watch(h, wd, mask, only, &dir, &sink, &stopped));
+    std::thread::spawn(move || watch(h, buf, ov, wd, mask, only, &dir, &sink, &stopped));
     let mut all = INSTANCES.lock().unwrap();
     if let Some(i) = all.iter_mut().find(|i| i.pipe == pipe) {
         i.watches.push(Watch { wd, dir: h, stop });
@@ -102,15 +112,32 @@ pub fn rm_watch(fd: u64, wd: u64) -> R {
     Ok(0)
 }
 
-fn watch(h: isize, wd: i32, mask: u32, only: Option<String>, dir: &std::path::Path, sink: &Mutex<OwnedHandle>, stop: &AtomicBool) {
+#[repr(C)]
+struct Ov {
+    internal: [usize; 2],
+    offset: u32,
+    offset_high: u32,
+    event: isize,
+}
+
+/// Issue the next (overlapped) wait for changes; its result lands in `buf`.
+fn arm(h: isize, buf: &mut [u32], ov: &mut Ov) -> bool {
     // FILE_NOTIFY_CHANGE_FILE_NAME | DIR_NAME | ATTRIBUTES | SIZE | LAST_WRITE
     const FILTER: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10;
-    let mut buf = vec![0u32; 16384]; // DWORD-aligned, as ReadDirectoryChangesW wants
+    unsafe {
+        crate::win::ReadDirectoryChangesW(h, buf.as_mut_ptr().cast(), (buf.len() * 4) as u32, 0, FILTER, std::ptr::null_mut(),
+            (ov as *mut Ov).cast(), std::ptr::null_mut()) != 0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn watch(h: isize, mut buf: Vec<u32>, mut ov: Box<Ov>, wd: i32, mask: u32, only: Option<String>, dir: &std::path::Path,
+         sink: &Mutex<OwnedHandle>, stop: &AtomicBool) {
     let mut moving = 0u32;
-    while !stop.load(Relaxed) {
+    loop {
         let mut n = 0u32;
-        let ok = unsafe { crate::win::ReadDirectoryChangesW(h, buf.as_mut_ptr().cast(), (buf.len() * 4) as u32, 0, FILTER, &mut n,
-            std::ptr::null_mut(), std::ptr::null_mut()) };
+        // Wait for the armed request (rm_watch cancels it: ERROR_OPERATION_ABORTED).
+        let ok = unsafe { crate::win::GetOverlappedResult(h, (&mut *ov as *mut Ov).cast(), &mut n, 1) };
         if ok == 0 || stop.load(Relaxed) {
             break;
         }
@@ -155,6 +182,10 @@ fn watch(h: isize, wd: i32, mask: u32, only: Option<String>, dir: &std::path::Pa
         if !out.is_empty() && !send(sink, &out) {
             break; // the inotify fd is closed
         }
+        if stop.load(Relaxed) || !arm(h, &mut buf, &mut ov) {
+            break; // (changes in between are kept by NT for the next request)
+        }
     }
     unsafe { crate::win::CloseHandle(h) };
+    unsafe { crate::win::CloseHandle(ov.event) };
 }
