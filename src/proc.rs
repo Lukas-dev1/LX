@@ -107,12 +107,19 @@ fn uncancelled<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result
 
 fn spawn_lx(mode: &str, extra: &[String], state: Vec<String>) -> std::io::Result<Child> {
     let (r, w) = inheritable_pipe()?;
-    let child = std::process::Command::new(std::env::current_exe()?).arg(mode).arg(raw(&r)).args(extra).spawn()?;
+    let mut child = std::process::Command::new(std::env::current_exe()?).arg(mode).arg(raw(&r)).args(extra).spawn()?;
     drop(r);
     let (mut w, state) = (std::fs::File::from(w), state.join("\0"));
     let mut rest = state.as_bytes();
     while !rest.is_empty() {
-        let n = uncancelled(|| w.write(rest))?;
+        let n = match uncancelled(|| w.write(rest)) {
+            Ok(n) => n,
+            // The new lx died before reading its state: say how (an NTSTATUS like 0xc0000005 is a crash).
+            Err(e) => {
+                let code = child.wait().ok().and_then(|s| s.code()).map(|c| c as u32);
+                return Err(std::io::Error::other(format!("{e}; the new lx exited with {code:#x?}")));
+            }
+        };
         if n == 0 {
             return Err(std::io::ErrorKind::WriteZero.into());
         }
