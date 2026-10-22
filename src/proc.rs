@@ -536,7 +536,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
     let env = if envp == 0 { vec![] } else { strv(envp)? };
     // execve takes the path literally (relative to cwd), never a PATH search.
     let lookup = if path.contains('/') { path.clone() } else { format!("./{path}") };
-    let (exe, bytes) = fs::find_exe(&lookup, "")?;
+    let (_, bytes) = fs::find_exe(&lookup, "")?;
     if !bytes.starts_with(b"\x7fELF") && !bytes.starts_with(b"#!") {
         return Err(ENOEXEC); // the shell then runs it as a script itself
     }
@@ -545,7 +545,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
     let (mut state, handles) = fs::proc_state(false);
     state.push(PARENT.load(Relaxed).to_string()); // exec keeps the pid relationship
     state.push(pid().to_string()); // and the pid itself
-    state.push(exe);
+    state.push(lookup); // as called, not resolved: a #! script sees the name it was run by (start)
     state.push(argv.len().to_string());
     state.extend(argv);
     state.extend(env);
