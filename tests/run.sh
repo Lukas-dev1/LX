@@ -287,6 +287,9 @@ $LX compose -f $CF down > /dev/null 2>&1
 left=$($LX ps | grep -c composetest)
 if [ "$got" = "hello from app" ] && [ "$left" = 0 ]; then ok "lx compose up/down"; else bad "lx compose: got '$got', $left left"; tail -3 "$OUT/compose"; fi
 
+# lx compose up in the foreground: prefixed output of every service, back when all have ended.
+expect "lx compose up (foreground)" 0 "b | hi from b" -- compose -f guest/composefg/compose.yaml up
+
 # Only this checkout's lx.exe (every lx of a container runs it): another worktree's containers may run.
 exe=$(cygpath -w "$ROOT/target/release/lx.exe")
 left=$(powershell -NoProfile -Command "@(Get-CimInstance Win32_Process -Filter \"Name='lx.exe'\" | Where-Object ExecutablePath -eq '$exe').Count" | tr -d '\r')
