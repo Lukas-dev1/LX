@@ -2199,8 +2199,10 @@ fn mark_views(addr: u64, len: u64, written: bool, exec: bool) {
     for v in COW_VIEWS.lock().unwrap().iter_mut() {
         if v.base < addr + len && addr < v.base + v.len {
             v.written |= written;
-            if exec && v.code.is_empty() {
-                v.code = vec![(v.off, v.len)]; // made executable later: mprotect patched all of it
+            if exec {
+                // mprotect patched this part: a re-map must patch it again (overlaps rescan clean).
+                let (lo, hi) = (addr.max(v.base), (addr + len).min(v.base + v.len));
+                v.code.push((v.off + (lo - v.base), hi - lo));
             }
         }
     }
