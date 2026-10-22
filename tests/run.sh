@@ -51,6 +51,7 @@ cc_static 2 rootfs/threads guest/threads.c
 cc_static 2 rootfs/stacktest guest/stacktest.c
 cc_static 2 rootfs/sigfdtest guest/sigfdtest.c
 cc_static 2 rootfs/sigfutex guest/sigfutex.c
+cc_static 2 rootfs/restarttest guest/restarttest.c
 cc_static 2 rootfs/sysbench guest/sysbench.c
 cc_static 2 rootfs/xmmtest guest/xmmtest.c
 cc_static 2 rootfs/sigxmm guest/sigxmm.c
@@ -93,6 +94,7 @@ expect "a signal handler's xmm use doesn't leak into the interrupted code" 0 "si
 expect "crash -> SIGSEGV" 139 "guest fault"              -- rootfs /stress crash
 expect "signalfd in epoll, woken by a child's signal" 0 "OK" -- rootfs /sigfdtest
 expect "SIGTERM reaches threads parked in futexes (Go idle)" 0 "sigfutex OK" -- rootfs /sigfutex
+expect "SA_RESTART: an interrupted read continues" 0 "read=1" -- rootfs /restarttest
 expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regress.sh
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
 expect "the first process is pid 1"  0 "pid1 OK" -- run -v "$GUEST" alpine sh /t/pid1.sh
