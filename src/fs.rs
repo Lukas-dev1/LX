@@ -939,6 +939,10 @@ pub fn proc_state(fork: bool) -> (Vec<String>, Vec<OwnedHandle>) {
         let mut n = 0;
         for (i, s) in fs.fds.iter().enumerate() {
             let Some(s) = s.as_ref().filter(|s| fork || !s.cloexec) else { continue };
+            // Only epolls that would survive exec travel: php-fpm's workers share the master's (no CLOEXEC);
+            // copying Go's CLOEXEC netpoller epoll into its fork children made `go run` hang.
+            // ponytail: why the copy hangs Go is not understood yet.
+            if s.cloexec && matches!(s.fd, Fd::Epoll(_)) { continue }
             let Some((kind, h, path)) = entry(&s.fd) else { continue };
             let h = if h == 0 { 0 } else { dup(h) };
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
