@@ -337,6 +337,12 @@ done
 $LX stop "lxipA-$$" > /dev/null 2>&1; $LX stop "lxipB-$$" > /dev/null 2>&1
 if [ "$got" = "AB" ]; then ok "two containers on the same port"; else bad "two containers on the same port: got '$got'"; fi
 
+# Another container's published port is reached at its container port (web:80 of a -p 8098:80 service).
+$LX run -d --name "lxpp-$$" --ip 127.77.0.1 -p 8098:8088 busybox sh -c "mkdir /w; echo pp > /w/i; httpd -f -p 8088 -h /w" < /dev/null > /dev/null 2>&1
+for _ in $(seq 40); do got=$($LX run busybox wget -qO- http://127.77.0.1:8088/i 2>/dev/null); [ "$got" = pp ] && break; sleep 0.5; done
+$LX stop "lxpp-$$" > /dev/null 2>&1
+if [ "$got" = pp ]; then ok "another container's published port at its container port"; else bad "another container's published port: got '$got'"; fi
+
 # lx compose up in the foreground: prefixed output of every service, back when all have ended.
 expect "lx compose up (foreground)" 0 "b | hi from b" -- compose -f guest/composefg/compose.yaml up
 
