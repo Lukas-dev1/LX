@@ -242,7 +242,7 @@ std::arch::global_asm!(
     "lea r8, [r8 + {xsave}]",
     "mov eax, -1",
     "mov edx, -1",
-    ".byte 0x49, 0x0f, 0xae, 0x20",       // xsave64 [r8]: every enabled component
+    ".byte 0x49, 0x0f, 0xae, 0x30",       // xsaveopt64 [r8]: every enabled component, unchanged ones skipped
     "mov rcx, rsp",
     "sub rsp, 32",
     "call lx_direct",
@@ -576,6 +576,7 @@ pub fn install() {
     // CPUID.(EAX=0Dh,ECX=0).EBX: the XSAVE area size for what the OS enabled (XCR0).
     let need = std::arch::x86_64::__cpuid_count(0xd, 0).ebx as usize;
     assert!(need <= XSAVE_MAX, "XSAVE area of {need} bytes doesn't fit the {XSAVE_MAX} reserved");
+    assert!(std::arch::x86_64::__cpuid_count(0xd, 1).eax & 1 != 0, "this CPU lacks XSAVEOPT"); // every Windows 11 CPU has it
     let idx = unsafe { TlsAlloc() };
     assert!(idx < 64, "TLS index {idx} is past the TEB's inline slots"); // inline slots: gs:[0x1480 + 8*i]
     TLS_INDEX.store(idx as u64, Relaxed);
