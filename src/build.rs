@@ -135,6 +135,7 @@ fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, 
                 cur = work.join(format!("stage{}", stages.len()));
                 root = cur.join("rootfs");
                 std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+                crate::fs::case_sensitive(&root); // fresh, ours: what FROM links in and RUN merges inherit it
                 config = json!({});
                 shell = vec!["/bin/sh".to_string(), "-c".to_string()];
                 // Every marker this build makes carries the attribute; the base's did if it's stamped.
