@@ -289,6 +289,16 @@ pub struct Mount {
     ro: bool,
 }
 
+impl Mount {
+    /// A named volume (lx's own folder under rootfs/volumes, made by `lx compose`) keeps Linux modes and
+    /// owners like the container layer (postgres wants its data dir 0700, owned by postgres); any other
+    /// volume holds the host's own files, whose modes aren't ours to set.
+    fn keeps_meta(&self) -> bool {
+        static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| fs::canonicalize("rootfs/volumes").ok()).as_ref().is_some_and(|d| self.host.starts_with(d))
+    }
+}
+
 // Whiteouts in the upper layer use the OCI layer format, so a container layer is a valid image layer.
 pub const WHITEOUT: &str = ".wh.";
 pub const OPAQUE: &str = ".wh..wh..opq";
@@ -541,6 +551,11 @@ impl Fs {
     /// The volume `comps` is in (the innermost one), and the path inside it.
     fn mount_of<'a>(&self, comps: &'a [String]) -> Option<(&Mount, &'a [String])> {
         self.mounts.iter().find(|m| comps.starts_with(&m.guest)).map(|m| (m, &comps[m.guest.len()..]))
+    }
+
+    /// Whether `comps` may get Linux modes and owners: anywhere but in a volume of the host's files.
+    fn keeps_meta(&self, comps: &[String]) -> bool {
+        self.mount_of(comps).is_none_or(|(m, _)| m.keeps_meta())
     }
 
     /// Is the image's copy of `comps` deleted in the upper layer?
@@ -1385,7 +1400,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
                 .create_new(excl && acc != 0)
                 .open(&host)
                 .map_err(errno)?;
-            if flags & O_CREAT != 0 && meta.is_err() && fs.mount_of(&comps_of(&guest)).is_none() {
+            if flags & O_CREAT != 0 && meta.is_err() && fs.keeps_meta(&comps_of(&guest)) {
                 let _ = set_meta(&host, new_meta(mode));
             }
             Fd::File { f, host }
@@ -1851,7 +1866,7 @@ fn with_meta(s: &mut [u64; 18], host: &Path) {
 /// chmod/chown of the entry at `c` (guest path components; `host` is where it is now): through the
 /// writable layer, so the image keeps its own. `mode`/`owner` None: keep; an id of -1 keeps that id.
 fn chmeta(fs: &Fs, c: &[String], host: &Path, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
-    if fs.mount_of(c).is_some() {
+    if !fs.keeps_meta(c) {
         return Ok(0); // ponytail: a volume's files are the host's: their modes and owners aren't ours to set
     }
     let dir = host.is_dir();
@@ -2137,7 +2152,7 @@ pub fn mkdirat(dirfd: u64, path: u64, mode: u64) -> R {
         let was_hidden = fs.upper.is_some() && fs.hidden(&c);
         let up = fs.writable(&c, false)?;
         fs::create_dir(&up).map_err(errno)?;
-        if fs.mount_of(&c).is_none() {
+        if fs.keeps_meta(&c) {
             let _ = set_meta(&up, new_meta(mode));
         }
         if was_hidden {
