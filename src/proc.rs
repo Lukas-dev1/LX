@@ -70,12 +70,29 @@ pub fn pid() -> u32 {
     }
 }
 
-pub fn getpid() -> R {
-    Ok(pid() as i64)
+/// The container's first process (whose lx is LX_IN_JOB). The guest sees it as pid 1, as in Docker:
+/// s6-overlay, tini and dumb-init insist on being pid 1. lx keeps the real pids inside (signal mailboxes
+/// are named by them); `guest_pid` and `host_pid` translate at the syscall boundary.
+fn root() -> u32 {
+    static ROOT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ROOT.get_or_init(|| std::env::var("LX_IN_JOB").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+pub fn guest_pid(p: u32) -> u32 {
+    if p != 0 && p == root() { 1 } else { p }
+}
+
+pub fn host_pid(p: u32) -> u32 {
+    if p == 1 && root() != 0 { root() } else { p }
+}
+
+pub fn getpid() -> R {
+    Ok(guest_pid(pid()) as i64)
+}
+
+/// pid 1's parent is 0, as in a container.
 pub fn getppid() -> R {
-    Ok(PARENT.load(Relaxed) as i64)
+    Ok(if pid() == root() { 0 } else { guest_pid(PARENT.load(Relaxed)) as i64 })
 }
 
 fn inheritable_pipe() -> std::io::Result<(OwnedHandle, OwnedHandle)> {
@@ -309,6 +326,7 @@ pub fn wait_for_child_exit() {
 }
 
 pub fn kill(pid: i64, sig: u64) -> R {
+    let pid = if pid > 0 { host_pid(pid as u32) as i64 } else { pid };
     let me = self::pid() as i64;
     if pid == me {
         return if sig == 0 { Ok(0) } else { signal::raise(sig) }; // delivered when this syscall returns

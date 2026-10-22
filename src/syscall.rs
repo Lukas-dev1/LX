@@ -1070,7 +1070,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         273 => Ok(0),                  // set_robust_list
         // tkill, tgkill. ponytail: signals are process-wide; whichever thread returns from a syscall next runs it.
         200 => signal::send_thread(a[0], a[1]),        // tkill
-        234 => if a[0] as u32 == crate::proc::pid() { signal::send_thread(a[1], a[2]) } else { proc::kill(a[0] as i32 as i64, a[2]) }, // tgkill
+        234 => if crate::proc::host_pid(a[0] as u32) == crate::proc::pid() { signal::send_thread(a[1], a[2]) } else { proc::kill(a[0] as i32 as i64, a[2]) }, // tgkill
         292 => fs::dup3(a[0], a[1], a[2]),
         293 => fs::pipe2(a[0], a[1]),
         318 => getrandom(a[0], a[1]),
