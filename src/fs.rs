@@ -403,6 +403,9 @@ fn errno(e: io::Error) -> i64 {
         Some(267) => ENOTDIR,
         Some(17) => 18, // ERROR_NOT_SAME_DEVICE -> EXDEV: rename across a volume boundary
         Some(123 | 87) => EINVAL,
+        // ERROR_OPERATION_ABORTED: a signal's CancelSynchronousIo cut a blocking read/write short.
+        // Callers retry EINTR (and the signal is delivered as the syscall returns).
+        Some(995) => crate::syscall::EINTR,
         _ => {
             if crate::syscall::debug() {
                 crate::syscall::dlog(format_args!("Windows error {e} -> EIO"));
