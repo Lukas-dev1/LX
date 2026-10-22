@@ -450,6 +450,18 @@ pub fn attrs(p: &Path) -> Option<Attrs> {
     })
 }
 
+/// getdents' d_type for a directory entry, from what the listing already returned (no extra call):
+/// DT_DIR, DT_REG for a file that can't be one of our markers (empty, or larger than any: symlinks
+/// are at most 4096 bytes), else DT_UNKNOWN so the reader stats it (find over a big tree otherwise
+/// stats every file).
+fn d_type(e: &fs::DirEntry) -> u8 {
+    match e.metadata() {
+        Ok(m) if m.is_dir() => 4,
+        Ok(m) if m.len() == 0 || m.len() > 4096 => 8,
+        _ => 0,
+    }
+}
+
 /// An fd owns its Windows handle (dup duplicates it), so closing the last fd of a pipe end really
 /// closes it and the reader sees EOF.
 pub struct Slot {
@@ -766,12 +778,12 @@ impl Fs {
     }
 
     /// Directory entries of `comps` across both layers (names, is-dir), whiteouts applied.
-    fn list(&self, comps: &[String]) -> Result<Vec<(String, bool)>, i64> {
+    fn list(&self, comps: &[String]) -> Result<Vec<(String, u8)>, i64> {
         if self.mount_of(comps).is_some() {
             let rd = fs::read_dir(self.host(comps)).map_err(errno)?;
-            return Ok(rd.flatten().map(|e| (dec(&e.file_name().to_string_lossy()), e.file_type().is_ok_and(|t| t.is_dir()))).collect());
+            return Ok(rd.flatten().map(|e| (dec(&e.file_name().to_string_lossy()), d_type(&e))).collect());
         }
-        let mut out: Vec<(String, bool)> = Vec::new();
+        let mut out: Vec<(String, u8)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut hide = std::collections::HashSet::new();
         let mut found = false;
@@ -788,7 +800,7 @@ impl Fs {
                     } else if let Some(h) = name.strip_prefix(WHITEOUT) {
                         hide.insert(h.to_string());
                     } else if seen.insert(name.clone()) {
-                        out.push((name, e.file_type().is_ok_and(|t| t.is_dir())));
+                        out.push((name, d_type(&e)));
                     }
                 }
             }
@@ -801,7 +813,7 @@ impl Fs {
                 for e in rd.flatten() {
                     let name = dec(&e.file_name().to_string_lossy());
                     if !hide.contains(&name) && seen.insert(name.clone()) {
-                        out.push((name, e.file_type().is_ok_and(|t| t.is_dir())));
+                        out.push((name, d_type(&e)));
                     }
                 }
             }
@@ -2955,9 +2967,7 @@ pub fn getdents64(fd: u64, buf: u64, count: u64) -> R {
         if let Some(fd_dir) = proc_dir(&guest) {
             names.extend(proc_entries(fd_dir, &fs.fds));
         } else {
-            for (name, dir) in fs.list(&comps_of(&guest))? {
-                names.push((name, if dir { 4 } else { 0 })); // DT_DIR / DT_UNKNOWN
-            }
+            names.extend(fs.list(&comps_of(&guest))?);
         }
         let out = unsafe { guest_mut(buf, count as usize) };
         let (mut n, mut i) = (0, start);
