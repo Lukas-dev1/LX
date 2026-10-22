@@ -125,6 +125,9 @@ pub mod win {
         pub fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
         pub fn SetEvent(ev: isize) -> i32;
         pub fn CancelSynchronousIo(thread: isize) -> i32;
+        pub fn GetConsoleMode(h: isize, mode: *mut u32) -> i32;
+        pub fn SetConsoleMode(h: isize, mode: u32) -> i32;
+        pub fn GetConsoleScreenBufferInfo(h: isize, info: *mut [i16; 11]) -> i32;
         pub fn SetConsoleCtrlHandler(h: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
         pub fn GetCurrentThread() -> isize;
         pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
