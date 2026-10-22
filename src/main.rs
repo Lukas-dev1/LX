@@ -252,17 +252,18 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
                                              -e NAME=value (or -e NAME: the host's) sets an env var
                                              -w /dir sets the working directory
                                              -u user[:group] runs as that user (default: the image's USER)
+                                             --name NAME names it (for exec, logs, stop, kill)
        lx run -d ...                         the same in the background: prints the container's pid
        lx build -t name[:tag] [-f Dockerfile] [--build-arg K=V] [--no-cache] <dir>
                                              builds an image from a Dockerfile
-       lx logs <pid>                         output of a `lx run -d` container
-       lx exec [-e ..] [-w dir] [-u user] <pid> <command> [args...]
+       lx logs <name|pid>                     output of a `lx run -d` container
+       lx exec [-e ..] [-w dir] [-u user] <name|pid> <command> [args...]
                                              runs a command inside a running container
        lx images                             pulled and built images
        lx rmi <image>...                     remove images
        lx ps                                 running containers
-       lx stop <pid>                         SIGTERM, then SIGKILL after 10s
-       lx kill <pid> [SIGNAL]                default TERM
+       lx stop <name|pid>                    SIGTERM, then SIGKILL after 10s
+       lx kill <name|pid> [SIGNAL]           default TERM
        lx <rootfs-dir> <command> [args...]   run a command in an unpacked rootfs
        lx unpack <layer.tar[.gz]> <rootfs-dir>";
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -353,14 +354,15 @@ fn run() -> Result<(), String> {
         return build::build(&tag, context, &file, build_args, no_cache);
     }
     if let [cmd] = args.as_slice() && cmd == "ps" {
-        println!("{:<8} COMMAND", "PID");
+        println!("{:<8} {:<16} COMMAND", "PID", "NAME");
         for (pid, desc) in proc::ps() {
-            println!("{pid:<8} {}", desc.split_whitespace().collect::<Vec<_>>().join(" ")); // one line per container
+            let name = proc::name_of(pid).unwrap_or_else(|| "-".into());
+            println!("{pid:<8} {name:<16} {}", desc.split_whitespace().collect::<Vec<_>>().join(" ")); // one line per container
         }
         return Ok(());
     }
-    if let [cmd, pid, rest @ ..] = args.as_slice() && (cmd == "kill" || cmd == "stop") {
-        let pid: u32 = pid.parse().map_err(|_| format!("bad pid {pid}"))?;
+    if let [cmd, id, rest @ ..] = args.as_slice() && (cmd == "kill" || cmd == "stop") {
+        let pid = container(id)?;
         if cmd == "stop" {
             return proc::stop(pid, std::time::Duration::from_secs(10));
         }
@@ -372,8 +374,8 @@ fn run() -> Result<(), String> {
         run_args.remove(i);
         return detach(&run_args);
     }
-    if let [cmd, pid] = args.as_slice() && cmd == "logs" {
-        let pid: u32 = pid.parse().map_err(|_| format!("bad pid {pid}"))?;
+    if let [cmd, id] = args.as_slice() && cmd == "logs" {
+        let pid = container(id)?;
         let log = proc::log_of(pid).ok_or(format!("{pid}: no log (only `lx run -d` containers have one)"))?;
         let text = std::fs::read(&log).map_err(|e| format!("{log}: {e}"))?;
         std::io::Write::write_all(&mut std::io::stdout(), &text).map_err(|e| e.to_string())?;
@@ -383,10 +385,16 @@ fn run() -> Result<(), String> {
         // Flags before the image: -p/--publish [hostip:]hostport:containerport[/udp], repeatable.
         let (mut rest, mut ports) = (rest, Vec::new());
         let (mut volumes, mut envs, mut workdir, mut user) = (Vec::new(), Vec::new(), None, None);
-        let (mut entrypoint, mut keep_layer) = (None, None);
+        let (mut entrypoint, mut keep_layer, mut name) = (None, None, None);
         while let [flag, value, more @ ..] = rest {
             match flag.as_str() {
                 "-u" | "--user" => user = Some(value.clone()),
+                "--name" => {
+                    if let Some(pid) = proc::container_pid(value) {
+                        return Err(format!("the name {value} is already in use by container {pid}"));
+                    }
+                    name = Some(value.clone());
+                }
                 "--entrypoint" => entrypoint = Some(value.clone()),
                 // lx build: the step's writable layer goes here and stays after the container exits.
                 "--layer" => keep_layer = Some(std::path::PathBuf::from(value)),
@@ -451,6 +459,7 @@ fn run() -> Result<(), String> {
         let config = serde_json::json!({
             "root": root, "layer": layer, "env": c.env, "workdir": c.workdir, "uid": uid, "gid": gid,
             "ports": ports.join(","), "mounts": volumes.iter().map(|(h, g, ro)| serde_json::json!([h, g, ro])).collect::<Vec<_>>(),
+            "name": name,
         });
         proc::register_container(&format!("{image}  {}", c.argv.join(" ")), &config.to_string());
         return start(&c.argv[0], c.argv.clone(), c.env);
@@ -463,6 +472,11 @@ fn run() -> Result<(), String> {
     fs::init(root);
     let env = vec![format!("PATH={PATH}"), "HOME=/root".into(), "HOSTNAME=lx".into()];
     start(cmd, std::iter::once(cmd).chain(rest).cloned().collect(), env)
+}
+
+/// A running container by `--name` or pid.
+fn container(id: &str) -> Result<u32, String> {
+    proc::container_pid(id).ok_or(format!("{id}: no such container (see lx ps)"))
 }
 
 /// Where `-d`/`--detach` is among `lx run`'s flags (each of the others takes a value).
@@ -523,9 +537,9 @@ fn exec(args: &[String]) -> Result<(), String> {
         }
         rest = more;
     }
-    let [pid, cmd, ..] = rest else { return Err(USAGE.into()) };
-    let pid: u32 = pid.parse().map_err(|_| format!("bad pid {pid}"))?;
-    let raw = proc::container_config(pid).ok_or(format!("{pid}: no such container (see lx ps)"))?;
+    let [id, cmd, ..] = rest else { return Err(USAGE.into()) };
+    let pid = container(id)?;
+    let raw = proc::container_config(pid).ok_or(format!("{id}: no such container (see lx ps)"))?;
     let cfg: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("container {pid}: {e}"))?;
     let path = |k: &str| cfg[k].as_str().map(std::path::PathBuf::from).ok_or(format!("container {pid}: no {k}"));
     let (root, layer) = (path("root")?, path("layer")?);

@@ -390,6 +390,20 @@ pub fn container_config(pid: u32) -> Option<String> {
     send(pid, 0).ok()?;
     std::fs::read_to_string(format!("{RUNNING}/{pid}.json")).ok()
 }
+
+/// A running container's `--name`.
+pub fn name_of(pid: u32) -> Option<String> {
+    let cfg: serde_json::Value = serde_json::from_str(&container_config(pid)?).ok()?;
+    cfg["name"].as_str().map(String::from)
+}
+
+/// A running container by `--name`, or by the pid of its first lx process.
+pub fn container_pid(id: &str) -> Option<u32> {
+    if let Ok(pid) = id.parse::<u32>() {
+        return Some(pid);
+    }
+    ps().into_iter().map(|(pid, _)| pid).find(|&pid| name_of(pid).as_deref() == Some(id))
+}
 static CONTAINER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ---- per-container writable layers ----

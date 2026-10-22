@@ -261,6 +261,15 @@ listed=$($LX ps | awk -v p="$dpid" '$1 == p' | wc -l)
 $LX stop "$dpid" > /dev/null 2>&1
 if [ $took -lt 5 ] && [ "$listed" = 1 ] && [ "$logs" = started ]; then ok "lx run -d + lx logs"; else bad "lx run -d: ${took}s, listed $listed, logs '$logs'"; fi
 
+# --name: exec and stop by name; a second container can't take a name in use.
+nm=lxname-$$
+$LX run -d --name "$nm" alpine sleep 60 > /dev/null
+sleep 2
+out=$($LX exec "$nm" echo by-name 2>&1)
+dup=$($LX run --name "$nm" alpine true 2>&1)
+$LX stop "$nm" > /dev/null 2>&1
+if [ "$out" = by-name ] && echo "$dup" | grep -q "already in use"; then ok "lx run --name"; else bad "--name: exec '$out', duplicate '$dup'"; fi
+
 # Only this checkout's lx.exe (every lx of a container runs it): another worktree's containers may run.
 exe=$(cygpath -w "$ROOT/target/release/lx.exe")
 left=$(powershell -NoProfile -Command "@(Get-CimInstance Win32_Process -Filter \"Name='lx.exe'\" | Where-Object ExecutablePath -eq '$exe').Count" | tr -d '\r')
