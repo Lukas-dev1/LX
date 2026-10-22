@@ -21,10 +21,7 @@ pub fn set_main() {
 
 pub fn gettid() -> R {
     let me = unsafe { GetCurrentThreadId() };
-    // ponytail: the main thread keeps its real tid even when getpid says 1 (Linux: tid == pid). With tid 1,
-    // musl Python's exit found a host heap pointer in its pthread struct's `next` (pthread_key_delete
-    // crashed): something in lx writes guest memory keyed by that value; not found yet.
-    if me == MAIN_TID.load(Relaxed) { Ok(crate::proc::pid() as i64) } else { Ok(me as i64) }
+    if me == MAIN_TID.load(Relaxed) { crate::proc::getpid() } else { Ok(me as i64) }
 }
 
 struct Init {
