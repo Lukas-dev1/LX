@@ -1226,7 +1226,11 @@ fn protect(addr: u64, len: u64, prot: u32) -> bool {
     each_region(addr, len, |p, n, state| {
         let mut old = 0;
         match state {
-            MEM_COMMIT => unsafe { VirtualProtect(p as *mut _, n as usize, prot, &mut old) != 0 },
+            MEM_COMMIT => unsafe {
+                // A copy-on-write file view (map_image) takes writable as WRITECOPY, not READWRITE.
+                VirtualProtect(p as *mut _, n as usize, prot, &mut old) != 0
+                    || matches!(prot, 0x04 | 0x40) && VirtualProtect(p as *mut _, n as usize, prot * 2, &mut old) != 0
+            },
             _ if prot == 0x01 => true, // reserved and staying inaccessible
             _ => unsafe { !VirtualAlloc(p as *mut _, n as usize, MEM_COMMIT, prot).is_null() },
         }
@@ -1834,5 +1838,161 @@ pub fn fp_area(c: &mut Context) -> &'static mut [u8] {
     } else {
         // CONTEXT.FltSave (XSAVE_FORMAT) right after rip; only the trap path has a whole CONTEXT.
         unsafe { std::slice::from_raw_parts_mut((c as *mut Context as *mut u8).add(0x100), 512) }
+    }
+}
+
+// ---- program images as shared copy-on-write file views ----
+//
+// Linux shares a program's pages between every process running it (page cache); copying the file in
+// gave each process its own full copy (Grafana's ~20 Go plugin processes: tens of MB each). Here a
+// placeholder reserves the image's span, and each PT_LOAD becomes a copy-on-write view of the file at
+// its exact 4K address and offset (placeholders allow 4K granularity where plain views need 64K);
+// bss becomes anonymous memory and gaps plain reservations, so the rest of lx sees ordinary regions.
+// Patching syscall sites then privatizes only the pages it writes.
+
+#[link(name = "kernelbase", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn VirtualAlloc2(process: isize, addr: *mut std::ffi::c_void, size: usize, ty: u32, prot: u32,
+                     params: *mut std::ffi::c_void, count: u32) -> *mut std::ffi::c_void;
+    fn MapViewOfFile3(section: isize, process: isize, addr: *mut std::ffi::c_void, offset: u64, size: usize,
+                      ty: u32, prot: u32, params: *mut std::ffi::c_void, count: u32) -> *mut std::ffi::c_void;
+}
+const MEM_RESERVE_PLACEHOLDER: u32 = 0x40000;
+const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+
+/// One PT_LOAD of an image: file offset, absolute address (bias applied), sizes.
+pub struct ImageSeg {
+    pub off: u64,
+    pub addr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+}
+
+/// Map `segs` of the file at `host` over [lo, hi) (64K-aligned lo; `fixed`: exactly there, else in the
+/// guest window) as copy-on-write views. Returns the base, or None to fall back to copying (a layout
+/// where segments share a page, or the file can't be mapped): checked before anything is mapped.
+pub fn map_image(host: &std::path::Path, segs: &[ImageSeg], fixed: bool, lo: u64, hi: u64) -> Option<u64> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    if std::env::var_os("LX_NOCOW").is_some() {
+        return None;
+    }
+    // Each segment's pages must be its own: no two segments in one page (older layouts do that).
+    let page = |a: u64| a & !(PAGE - 1);
+    let mut order: Vec<&ImageSeg> = segs.iter().collect();
+    order.sort_by_key(|s| s.addr);
+    for w in order.windows(2) {
+        if (w[0].addr + w[0].memsz).next_multiple_of(PAGE) > page(w[1].addr) {
+            return None;
+        }
+    }
+    let f = std::fs::OpenOptions::new().read(true).access_mode(0x8000_0000 | 0x2000_0000).open(host).ok()?; // GENERIC_READ | GENERIC_EXECUTE
+    let section = unsafe { CreateFileMappingW(f.as_raw_handle() as isize, std::ptr::null_mut(), PAGE_EXECUTE_WRITECOPY, 0, 0, std::ptr::null()) };
+    if section == 0 {
+        return None;
+    }
+    let len = hi - lo;
+    let reserve = |a: u64| unsafe {
+        VirtualAlloc2(0, a as *mut _, len as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0)
+    } as u64;
+    let base = if fixed {
+        Some(lo).filter(|&a| reserve(a) == a)
+    } else {
+        loop {
+            let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
+            if a + len > WINDOW.1 {
+                break None;
+            }
+            if reserve(a) == a {
+                break Some(a);
+            }
+        }
+    };
+    let Some(base) = base else {
+        unsafe { CloseHandle(section) };
+        return None;
+    };
+    let bias = base - lo;
+    let me = unsafe { GetCurrentProcess() };
+    // Carve [a, a+n) out of the placeholder that starts at `cursor` (it runs to the span's end).
+    let carve = |cursor: u64, a: u64, n: u64| unsafe {
+        if a > cursor {
+            VirtualFree(cursor as *mut _, (a - cursor) as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        }
+        if a + n < base + len {
+            VirtualFree(a as *mut _, n as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        }
+    };
+    let plain = |a: u64, n: u64, commit: bool| unsafe {
+        let ty = MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | if commit { MEM_COMMIT } else { 0 };
+        !VirtualAlloc2(0, a as *mut _, n as usize, ty, if commit { PAGE_READWRITE } else { 0x01 }, std::ptr::null_mut(), 0).is_null()
+    };
+    let mut cursor = base;
+    let mut ok = true;
+    for s in order {
+        let (v0, v1) = (page(s.addr + bias), (s.addr + bias + s.filesz).next_multiple_of(PAGE));
+        let mem_end = (s.addr + bias + s.memsz).next_multiple_of(PAGE);
+        if v0 > cursor {
+            carve(cursor, v0, 0); // the gap before: back to an ordinary reservation below
+            ok &= plain(cursor, v0 - cursor, false);
+            cursor = v0;
+        }
+        if v1 > v0 {
+            carve(cursor, v0, v1 - v0);
+            let v = unsafe {
+                MapViewOfFile3(section, me, v0 as *mut _, page(s.off), (v1 - v0) as usize, MEM_REPLACE_PLACEHOLDER,
+                               PAGE_EXECUTE_WRITECOPY, std::ptr::null_mut(), 0)
+            } as u64;
+            ok &= v == v0;
+            // Bytes after filesz in its last page belong to bss: zero them (copy-on-write of that page).
+            let tail = s.addr + bias + s.filesz;
+            if ok && tail < v1 {
+                unsafe { std::ptr::write_bytes(tail as *mut u8, 0, (v1.min(s.addr + bias + s.memsz.max(s.filesz)) - tail) as usize) };
+                if s.memsz <= s.filesz {
+                    unsafe { std::ptr::write_bytes(tail as *mut u8, 0, (v1 - tail) as usize) };
+                }
+            }
+            cursor = v1;
+        }
+        if mem_end > cursor {
+            carve(cursor, cursor, mem_end - cursor);
+            ok &= plain(cursor, mem_end - cursor, true); // bss: fresh zero pages
+            cursor = mem_end;
+        }
+    }
+    if cursor < base + len {
+        ok &= plain(cursor, base + len - cursor, false);
+    }
+    unsafe { CloseHandle(section) }; // the views keep it alive
+    if !ok {
+        release_span(base, len);
+        return None;
+    }
+    ALLOCS.lock().unwrap().push((base, len));
+    Some(base)
+}
+
+/// Free [base, base+len) region by region: views are unmapped, anonymous pieces released. A span from
+/// map_image is several allocations, not one.
+fn release_span(base: u64, len: u64) {
+    let mut p = base;
+    while p < base + len {
+        let mut m = MemoryBasicInformation::default();
+        if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 {
+            break;
+        }
+        let end = m.base as u64 + m.region_size as u64;
+        unsafe {
+            const MEM_MAPPED: u32 = 0x40000;
+            if m.state != MEM_FREE {
+                if m.ty == MEM_MAPPED {
+                    UnmapViewOfFile(m.allocation_base as *mut _);
+                } else {
+                    VirtualFree(m.allocation_base as *mut _, 0, MEM_RELEASE);
+                }
+            }
+        }
+        p = end.max(p + PAGE);
     }
 }
