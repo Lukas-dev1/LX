@@ -478,7 +478,16 @@ pub fn restore<'a>(f: &'a [String], parent: isize) -> Result<((u64, u64), &'a [S
         // Guard pages are untouched by definition (touching one commits it), so they're zero too.
         let copy = prot != 0x01 && prot & PAGE_GUARD == 0;
         if copy && unsafe { ReadProcessMemory(parent, a as *const _, a as *mut _, len as usize, &mut done) } == 0 {
-            return Err(format!("copying guest memory {a:#x}+{len:#x} failed ({})", unsafe { GetLastError() }));
+            const ERROR_PARTIAL_COPY: u32 = 299;
+            if unsafe { GetLastError() } != ERROR_PARTIAL_COPY {
+                return Err(format!("copying guest memory {a:#x}+{len:#x} failed ({})", unsafe { GetLastError() }));
+            }
+            // Another of the parent's threads unmapped or protected part of the range after the snapshot
+            // (Go forks from a running program). Copy what's still readable, page by page; the rest stays
+            // zero, which nothing the child runs before exec can tell from gone.
+            for p in (a..a + len).step_by(PAGE as usize) {
+                unsafe { ReadProcessMemory(parent, p as *const _, p as *mut _, PAGE as usize, &mut done) };
+            }
         }
         let mut old = 0;
         unsafe { VirtualProtect(a as *mut _, len as usize, prot, &mut old) };

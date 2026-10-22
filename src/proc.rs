@@ -107,12 +107,19 @@ fn uncancelled<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result
 
 fn spawn_lx(mode: &str, extra: &[String], state: Vec<String>) -> std::io::Result<Child> {
     let (r, w) = inheritable_pipe()?;
-    let child = std::process::Command::new(std::env::current_exe()?).arg(mode).arg(raw(&r)).args(extra).spawn()?;
+    let mut child = std::process::Command::new(std::env::current_exe()?).arg(mode).arg(raw(&r)).args(extra).spawn()?;
     drop(r);
     let (mut w, state) = (std::fs::File::from(w), state.join("\0"));
     let mut rest = state.as_bytes();
     while !rest.is_empty() {
-        let n = uncancelled(|| w.write(rest))?;
+        let n = match uncancelled(|| w.write(rest)) {
+            Ok(n) => n,
+            // The new lx died before reading its state: say how (an NTSTATUS like 0xc0000005 is a crash).
+            Err(e) => {
+                let code = child.wait().ok().and_then(|s| s.code()).map(|c| c as u32);
+                return Err(std::io::Error::other(format!("{e}; the new lx exited with {code:#x?}")));
+            }
+        };
         if n == 0 {
             return Err(std::io::ErrorKind::WriteZero.into());
         }
@@ -144,7 +151,7 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     // the sections back, so another thread's fork in between (Go forks from many) would hand its child
     // handles that weren't inherited ("shared mapping can't be placed in the child").
     let spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-    let mut state = fs::proc_state(true);
+    let (mut state, handles) = fs::proc_state(true); // `handles`: what the child inherits, ours until spawned
     state.extend(syscall::snapshot());
     state.extend(signal::snapshot());
     state.extend(crate::jump::snapshot());
@@ -163,7 +170,7 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     let (ready_r, ready_w) = inheritable_pipe().map_err(|e| fail(e.to_string()))?;
     let child = spawn_lx("--fork", &[raw(&me), raw(&ready_w)], state);
     syscall::views_inheritable(false); // the child has its copies of the shared-memory sections now
-    drop(spawning);
+    drop((spawning, handles));
     let mut child = child.map_err(|e| fail(e.to_string()))?;
     drop((me, ready_w)); // if the child dies before reporting, `ready` hits EOF
     let mut byte = [0u8];
@@ -510,7 +517,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
         return Err(ENOEXEC); // the shell then runs it as a script itself
     }
     let spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner()); // see fork
-    let mut state = fs::proc_state(false);
+    let (mut state, handles) = fs::proc_state(false);
     state.push(PARENT.load(Relaxed).to_string()); // exec keeps the pid relationship
     state.push(pid().to_string()); // and the pid itself
     state.push(exe);
@@ -518,7 +525,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
     state.extend(argv);
     state.extend(env);
     let child = spawn_lx("--exec", &[], state);
-    drop(spawning);
+    drop((spawning, handles)); // before waiting: holding pipe ends would keep readers from EOF
     let mut child = child.map_err(|e| {
         eprintln!("[lx] execve: {e}");
         EAGAIN

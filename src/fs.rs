@@ -414,6 +414,9 @@ fn errno(e: io::Error) -> i64 {
         Some(267) => ENOTDIR,
         Some(17) => 18, // ERROR_NOT_SAME_DEVICE -> EXDEV: rename across a volume boundary
         Some(123 | 87) => EINVAL,
+        // ERROR_OPERATION_ABORTED: a signal's CancelSynchronousIo cut a blocking read/write short.
+        // Callers retry EINTR (and the signal is delivered as the syscall returns).
+        Some(995) => crate::syscall::EINTR,
         _ => {
             if crate::syscall::debug() {
                 crate::syscall::dlog(format_args!("Windows error {e} -> EIO"));
@@ -803,18 +806,33 @@ fn handle_any(fd: &Fd) -> Result<isize, i64> {
 
 /// Everything a new lx needs to rebuild this process's view: root, cwd, and the fds. A fork keeps
 /// every fd; an exec drops CLOEXEC ones. Handles are passed by value (inherited at the same value).
-pub fn proc_state(fork: bool) -> Vec<String> {
+/// The state carries handle values the new process inherits. They're private inheritable duplicates (in
+/// the returned list; drop them once the process is spawned), not the fds' own handles: another thread
+/// can close an fd between this and CreateProcess (Go closes fds on other threads all the time), and the
+/// child would get a value that was never inherited, which something else then reuses. One duplicate
+/// per distinct handle, so fds sharing one (dup'd pipes and sockets) still share it over there. The
+/// fds' own handles are never inheritable: only what the new process keeps may reach it (a leaked pipe
+/// end would block EOF forever).
+pub fn proc_state(fork: bool) -> (Vec<String>, Vec<OwnedHandle>) {
     with(|fs| {
-        // Only handles the new process keeps may reach it; a leaked pipe end would block EOF forever.
-        // Pipes and sockets share one handle between dup'd fds, so a handle is inherited if ANY fd that
-        // survives keeps it (dup2(p, 1) plus the original p left CLOEXEC: fd 1 must still get it).
-        let keep: std::collections::HashSet<isize> = fs.fds.iter().flatten()
-            .filter(|s| fork || !s.cloexec)
-            .filter_map(|s| handle_any(&s.fd).ok())
-            .collect();
+        let mut dups: std::collections::HashMap<usize, OwnedHandle> = std::collections::HashMap::new();
+        let mut dup = |h: usize| -> usize {
+            if let Some(d) = dups.get(&h) {
+                return d.as_raw_handle() as usize;
+            }
+            let me = unsafe { crate::win::GetCurrentProcess() };
+            let mut d = 0isize;
+            // DUPLICATE_SAME_ACCESS, inheritable. A handle that's gone (closed meanwhile) stays 0: the new
+            // process sees an fd it can't use, not someone else's handle.
+            if unsafe { crate::win::DuplicateHandle(me, h as isize, me, &mut d, 0, 1, 2) } == 0 {
+                return 0;
+            }
+            dups.insert(h, unsafe { OwnedHandle::from_raw_handle(d as _) });
+            d as usize
+        };
         for s in fs.fds.iter().flatten() {
             if let Ok(h) = handle_any(&s.fd) {
-                unsafe { crate::win::SetHandleInformation(h, 1, keep.contains(&h) as u32) };
+                unsafe { crate::win::SetHandleInformation(h, 1, 0) };
             }
         }
         let upper = fs.upper.as_ref().map(|u| u.to_string_lossy().into_owned()).unwrap_or_default();
@@ -825,11 +843,12 @@ pub fn proc_state(fork: bool) -> Vec<String> {
         for (i, s) in fs.fds.iter().enumerate() {
             let Some(s) = s.as_ref().filter(|s| fork || !s.cloexec) else { continue };
             let Some((kind, h, path)) = entry(&s.fd) else { continue };
+            let h = if h == 0 { 0 } else { dup(h) };
             v.extend([i.to_string(), kind.into(), h.to_string(), path, (s.cloexec as u8).to_string()]);
             n += 1;
         }
         v[4] = n.to_string();
-        v
+        (v, dups.into_values().collect())
     })
 }
 
