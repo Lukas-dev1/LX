@@ -8,7 +8,8 @@
 //! the base image still links to is never written in place. COPY/ADD copy from the context; ENV, WORKDIR,
 //! USER, CMD, ENTRYPOINT, SHELL and ARG update the config. The result sits where `lx run name:tag` looks.
 //! RUN layers are cached (see "build cache" below) and .dockerignore is honoured.
-//! ponytail: ADD doesn't fetch URLs or unpack archives, and ARG scope isn't per stage.
+//! ADD unpacks local .tar/.tar.gz/.tgz archives. ponytail: ADD doesn't fetch URLs, and ARG scope isn't
+//! per stage.
 
 use crate::fs::{enc, get_meta, set_meta, OPAQUE, WHITEOUT};
 use crate::image::Ref;
@@ -184,7 +185,7 @@ fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, 
                     config["config"]["Labels"][k] = json!(v);
                 }
             }
-            "COPY" | "ADD" => copy(&rest, context, &root, &config, &stages, &ignore)?,
+            "COPY" | "ADD" => copy(&rest, op == "ADD", context, &root, &config, &stages, &ignore)?,
             "RUN" => run(&rest, &shell, &cur, &config, &args, key, no_cache)?,
             "VOLUME" | "STOPSIGNAL" | "HEALTHCHECK" | "MAINTAINER" | "ONBUILD" => {} // nothing lx acts on yet
             _ => return Err(format!("unknown instruction {op}")),
@@ -412,7 +413,7 @@ fn make_dirs(root: &Path, guest: &str) -> Result<(), String> {
 
 /// COPY/ADD [--chown=u[:g]] [--from=stage|image] <src>... <dest>: from the build context (or, with
 /// --from, absolute paths in an earlier stage or an image), relative to WORKDIR.
-fn copy(rest: &str, context: &Path, root: &Path, config: &Value, stages: &[(Option<String>, PathBuf)], ignore: &Ignore) -> Result<(), String> {
+fn copy(rest: &str, add: bool, context: &Path, root: &Path, config: &Value, stages: &[(Option<String>, PathBuf)], ignore: &Ignore) -> Result<(), String> {
     let mut words: Vec<String> = if rest.starts_with('[') {
         serde_json::from_str(rest).map_err(|_| "bad COPY array")?
     } else {
@@ -446,6 +447,13 @@ fn copy(rest: &str, context: &Path, root: &Path, config: &Value, stages: &[(Opti
         };
         if !from.exists() {
             return Err(format!("COPY {src}: not found"));
+        }
+        // ADD of a local tar archive (plain or gzip) unpacks it into the destination directory.
+        let archive = [".tar", ".tar.gz", ".tgz"].iter().any(|x| src.ends_with(x));
+        if add && from_root.is_none() && from.is_file() && archive {
+            make_dirs(root, &dest)?;
+            crate::fs::unpack(&from, &host_path(root, &dest)).map_err(|e| format!("ADD {src}: {e}"))?;
+            continue;
         }
         let to_guest = if from.is_dir() || !(into_dir || host_path(root, &dest).is_dir()) {
             dest.clone()
