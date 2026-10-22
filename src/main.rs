@@ -649,7 +649,10 @@ fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), Strin
     let not_found = |e: i64| format!("{cmd}: {}", if e == syscall::EACCES { "permission denied" } else { "not found in image" });
     let path = env.iter().find_map(|e| e.strip_prefix("PATH=")).unwrap_or(PATH).to_string();
     let (mut exe, mut image) = fs::find_exe(cmd, &path).map_err(not_found)?;
-    // #! scripts (nested up to 4 deep, like Linux): argv becomes [interp, optional-arg, script, args...].
+    // #! scripts (nested up to 4 deep, like Linux): argv becomes [interp, optional-arg, script, args...],
+    // the script as it was called, not where its links lead (addgroup, a link to adduser, picks its mode
+    // from its name). ponytail: a bare name found on PATH passes the resolved path.
+    let mut script = if cmd.contains('/') { cmd.to_string() } else { exe.clone() };
     for _ in 0..4 {
         let Some(line) = image.strip_prefix(b"#!") else { break };
         let line = String::from_utf8_lossy(line.split(|&b| b == b'\n').next().unwrap_or_default()).trim().to_string();
@@ -659,9 +662,10 @@ fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), Strin
         };
         let mut new = vec![interp.clone()];
         new.extend(arg);
-        new.push(exe.clone());
+        new.push(script);
         new.extend(argv.drain(..).skip(1));
         argv = new;
+        script = interp.clone();
         (exe, image) = fs::find_exe(&interp, &path).map_err(|_| format!("{exe}: bad interpreter {interp}"))?;
     }
     fs::set_exe(&exe);
