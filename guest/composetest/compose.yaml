@@ -1,0 +1,11 @@
+# lx compose in the suite: a built service reaches another by its service name.
+services:
+  cache:
+    image: redis:alpine
+    command: redis-server --port 6391 --save ""
+  app:
+    build: .
+    depends_on: [cache]
+    environment:
+      CACHE: cache
+    command: ["sh", "/app/start.sh"]

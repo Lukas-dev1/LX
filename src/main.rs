@@ -1,5 +1,6 @@
 //! lx: run a static x86-64 Linux ELF natively on NT. See DESIGN.md.
 mod build;
+mod compose;
 mod elf;
 mod fs;
 mod jump;
@@ -263,6 +264,7 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
        lx logs <name|pid>                     output of a `lx run -d` container
        lx exec [-e ..] [-w dir] [-u user] <name|pid> <command> [args...]
                                              runs a command inside a running container
+       lx compose [-f file] up|down|ps|logs  the services of a compose file (up starts them detached)
        lx images                             pulled and built images
        lx rmi <image>...                     remove images
        lx ps                                 running containers
@@ -336,6 +338,9 @@ fn run() -> Result<(), String> {
             println!("removed {i}");
         }
         return Ok(());
+    }
+    if let [cmd, rest @ ..] = args.as_slice() && cmd == "compose" {
+        return compose::compose(rest);
     }
     if let [cmd, rest @ ..] = args.as_slice() && cmd == "build" {
         // lx build -t name[:tag] [-f Dockerfile] [--build-arg K=V] [--no-cache] <context>
