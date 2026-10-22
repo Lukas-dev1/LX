@@ -122,9 +122,21 @@ fn uncancelled<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result
     }
 }
 
+/// Creation flags for an lx we start: without a console of our own (lx run -d, an engine in the
+/// background), Windows would give every new console process a console window of its own, one popping
+/// up per fork. DETACHED_PROCESS gives it none, like us (its stdio are inherited handles anyway).
+pub fn no_console_flags() -> u32 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetConsoleWindow() -> isize;
+    }
+    if unsafe { GetConsoleWindow() } == 0 { 0x8 } else { 0 }
+}
+
 fn spawn_lx(mode: &str, extra: &[String], state: Vec<String>) -> std::io::Result<Child> {
+    use std::os::windows::process::CommandExt;
     let (r, w) = inheritable_pipe()?;
-    let mut child = std::process::Command::new(std::env::current_exe()?).arg(mode).arg(raw(&r)).args(extra).spawn()?;
+    let mut child = std::process::Command::new(std::env::current_exe()?).arg(mode).arg(raw(&r)).args(extra).creation_flags(no_console_flags()).spawn()?;
     drop(r);
     let (mut w, state) = (std::fs::File::from(w), state.join("\0"));
     let mut rest = state.as_bytes();

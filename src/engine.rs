@@ -348,7 +348,7 @@ fn spawn(run: &Arc<Run>, args: &[String], stdin: bool, exited: impl FnOnce() + S
         .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .creation_flags(0x200) // CREATE_NEW_PROCESS_GROUP: the engine's Ctrl-C isn't theirs
+        .creation_flags(0x200 | crate::proc::no_console_flags()) // CREATE_NEW_PROCESS_GROUP: the engine's Ctrl-C isn't theirs
         .spawn()
         .map_err(|e| e.to_string())?;
     {
