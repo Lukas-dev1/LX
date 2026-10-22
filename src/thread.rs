@@ -150,7 +150,8 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
                     let (s, ns) = syscall::now(if op & FUTEX_CLOCK_REALTIME != 0 { 0 } else { 1 });
                     want = want.saturating_sub(std::time::Duration::new(s, ns as u32));
                 }
-                want.as_millis().min(u32::MAX as u128 - 1) as u32
+                // Round up: a wait with 0.9 ms left must still sleep, not spin (WaitOnAddress(0) returns at once).
+                want.as_nanos().div_ceil(1_000_000).min(u32::MAX as u128 - 1) as u32
             };
             if syscall::in_shared_view(uaddr) {
                 // In MAP_SHARED memory the waker may be another process, and WaitOnAddress only hears wakes

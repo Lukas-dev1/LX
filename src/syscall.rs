@@ -898,7 +898,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
         34 => signal::sigsuspend(0),   // pause
         130 => signal::sigsuspend(a[0]),
-        128 => signal::sigtimedwait(a[0], a[1], if a[2] == 0 { -1 } else { let [s, ns] = unsafe { *(a[2] as *const [u64; 2]) }; (s * 1000 + ns / 1_000_000) as i64 }),
+        128 => signal::sigtimedwait(a[0], a[1], if a[2] == 0 { -1 } else { let [s, ns] = unsafe { *(a[2] as *const [u64; 2]) }; (s * 1000 + ns.div_ceil(1_000_000)) as i64 }),
         16 => fs::ioctl(a[0], a[1], a[2]),
         17 => fs::pread(a[0], a[1], a[2], a[3], false),
         18 => fs::pread(a[0], a[1], a[2], a[3], true),
@@ -1644,7 +1644,7 @@ fn timeval_ms(tv: u64) -> i64 {
         return -1;
     }
     let [s, us] = unsafe { *(tv as *const [i64; 2]) };
-    s.saturating_mul(1000).saturating_add(us / 1000)
+    s.saturating_mul(1000).saturating_add((us + 999) / 1000) // rounded up: 0.5 ms must not become a busy poll
 }
 
 /// A `struct timespec *` timeout in ms; NULL means wait forever (-1).
@@ -1653,7 +1653,7 @@ fn timespec_ms(ts: u64) -> i64 {
         return -1;
     }
     let [s, ns] = unsafe { *(ts as *const [i64; 2]) };
-    s.saturating_mul(1000).saturating_add(ns / 1_000_000)
+    s.saturating_mul(1000).saturating_add((ns + 999_999) / 1_000_000) // rounded up, like timeval_ms
 }
 
 pub fn getrandom(buf: u64, len: u64) -> R {
