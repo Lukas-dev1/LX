@@ -477,7 +477,11 @@ fn run() -> Result<(), String> {
         proc::gc_layers();
         let layer = match keep_layer {
             Some(d) => {
+                let fresh = !d.join("upper").exists();
                 std::fs::create_dir_all(d.join("upper")).map_err(|e| e.to_string())?;
+                if fresh {
+                    fs::case_sensitive(&d.join("upper")); // only one we just made: never someone's existing folder
+                }
                 std::fs::canonicalize(d).map_err(|e| e.to_string())?
             }
             None => proc::new_layer().map_err(|e| format!("creating the container layer: {e}"))?,
