@@ -130,7 +130,7 @@ pub fn send_thread(tid: u64, sig: u64) -> R {
         return Err(EINVAL);
     }
     let main = crate::thread::MAIN_TID.load(Relaxed);
-    let wtid = if tid as u32 == proc::pid() { main } else { tid as u32 };
+    let wtid = if proc::host_pid(tid as u32) == proc::pid() { main } else { tid as u32 };
     let t = crate::syscall::ts_of(wtid).ok_or(crate::syscall::ESRCH)?;
     if sig == 0 {
         return Ok(0);
