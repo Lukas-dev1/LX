@@ -975,6 +975,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         21 => fs::faccessat(CWD, a[0]),
         28 => madvise(a[0], a[1], a[2]),
         149..=152 | 325 => Ok(0), // mlock, munlock, mlockall, munlockall, mlock2. ponytail: pages may still be paged out
+        140 => Ok(20), // getpriority: the raw call answers 20 - nice; everyone runs at nice 0 (rpm asks)
+        141 => Ok(0),  // setpriority. ponytail: accepted, not applied
         32 => fs::dup(a[0], 0, false),
         33 => fs::dup3(a[0], a[1], 0),
         35 => nanosleep(a[0]),
