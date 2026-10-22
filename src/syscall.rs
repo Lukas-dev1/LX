@@ -81,6 +81,8 @@ pub struct ThreadState {
     /// The guest's extended register state (x87/SSE/AVX...) while a direct syscall runs: Linux preserves
     /// every vector register across syscall, and our handler code doesn't. 64-byte aligned for xsave.
     xsave: Xsave,
+    /// Inside lx_direct: the guest's FP state is in `xsave`, not in an exception CONTEXT.
+    in_direct: bool,
 }
 
 const TS_RESUME: usize = std::mem::offset_of!(ThreadState, resume);
@@ -134,7 +136,7 @@ pub fn ts() -> &'static mut ThreadState {
         fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host + HOST_STACK as u64,
         frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None,
         tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
-        on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]),
+        on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]), in_direct: false,
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
     THREAD_TS.lock().unwrap().push((unsafe { GetCurrentThreadId() }, st as *const ThreadState as usize));
@@ -316,6 +318,7 @@ unsafe extern "system" fn lx_direct(f: *mut DirectFrame) {
     let c = &mut f.ctx;
     let t = ts();
     t.on_host = true;
+    t.in_direct = true;
     let (base, limit): (u64, u64);
     let top = t.host_stack;
     unsafe {
@@ -338,6 +341,7 @@ unsafe extern "system" fn lx_direct(f: *mut DirectFrame) {
     f.flags = c.eflags as u64;
     unsafe { std::arch::asm!("mov qword ptr gs:[0x08], {b}", "mov qword ptr gs:[0x10], {l}", b = in(reg) base, l = in(reg) limit) };
     ts().on_host = false;
+    ts().in_direct = false;
 }
 
 /// Jump into guest code on this thread. Never returns: the guest ends it with exit or exit_group.
@@ -1801,4 +1805,17 @@ pub fn fine_timer() {
     ON.call_once(|| unsafe {
         timeBeginPeriod(1);
     });
+}
+
+/// The interrupted guest's FP/vector state for a signal frame: on the direct path the XSAVE image
+/// lx_sys_entry took (restored on the way out), on the trap path the CONTEXT's legacy 512-byte area.
+pub fn fp_area(c: &mut Context) -> &'static mut [u8] {
+    let t = ts();
+    if t.in_direct {
+        let n = (std::arch::x86_64::__cpuid_count(0xd, 0).ebx as usize).next_multiple_of(64);
+        &mut t.xsave.0[..n]
+    } else {
+        // CONTEXT.FltSave (XSAVE_FORMAT) right after rip; only the trap path has a whole CONTEXT.
+        unsafe { std::slice::from_raw_parts_mut((c as *mut Context as *mut u8).add(0x100), 512) }
+    }
 }
