@@ -69,6 +69,10 @@ pub struct ThreadState {
     /// This thread's blocked signals, and the one to restore after rt_sigsuspend's handler.
     pub sigmask: u64,
     pub suspended_mask: Option<u64>,
+    /// Signals sent to this thread alone (tkill/tgkill), and the futex address it sleeps on (0 = none),
+    /// so a sender can wake it. Read and written by other threads.
+    pub tpending: std::sync::atomic::AtomicU64,
+    pub futex_addr: std::sync::atomic::AtomicU64,
     /// Whether we're running on host_stack right now.
     on_host: bool,
     /// The TEB's own stack fields (StackBase, StackLimit, DeallocationStack) before the guest took over.
@@ -95,6 +99,19 @@ pub fn tls_slot_offsets() -> (u32, u32) {
     (LX_TLS_OFF.load(Relaxed) as u32, SCRATCH_OFF.load(Relaxed) as u32)
 }
 
+/// Every guest thread's ThreadState by Windows tid, for signals sent to one thread (they're leaked, so
+/// the pointers stay valid; an exiting thread takes itself out).
+static THREAD_TS: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+
+pub fn ts_of(tid: u32) -> Option<&'static ThreadState> {
+    THREAD_TS.lock().unwrap().iter().find(|e| e.0 == tid).map(|e| unsafe { &*(e.1 as *const ThreadState) })
+}
+
+pub fn forget_ts() {
+    let me = unsafe { GetCurrentThreadId() };
+    THREAD_TS.lock().unwrap().retain(|e| e.0 != me);
+}
+
 /// This thread's state, created on first use.
 pub fn ts() -> &'static mut ThreadState {
     let idx = TLS_INDEX.load(Relaxed) as u32;
@@ -107,9 +124,11 @@ pub fn ts() -> &'static mut ThreadState {
     let st = Box::leak(Box::new(ThreadState {
         fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host + HOST_STACK as u64,
         frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None,
+        tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
         on_host: false, host_teb: None,
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
+    THREAD_TS.lock().unwrap().push((unsafe { GetCurrentThreadId() }, st as *const ThreadState as usize));
     st
 }
 static START: Mutex<Option<Instant>> = Mutex::new(None);
@@ -868,6 +887,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         31 => shmctl(a[0], a[1], a[2]),
         25 => mremap(a[0], a[1], a[2], a[3]),
         26 => msync(a[0], a[1]),
+        27 => mincore(a[0], a[1], a[2]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
@@ -878,6 +898,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
         34 => signal::sigsuspend(0),   // pause
         130 => signal::sigsuspend(a[0]),
+        128 => signal::sigtimedwait(a[0], a[1], if a[2] == 0 { -1 } else { let [s, ns] = unsafe { *(a[2] as *const [u64; 2]) }; (s * 1000 + ns / 1_000_000) as i64 }),
         16 => fs::ioctl(a[0], a[1], a[2]),
         17 => fs::pread(a[0], a[1], a[2], a[3], false),
         18 => fs::pread(a[0], a[1], a[2], a[3], true),
@@ -903,6 +924,13 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         100 => times(a[0]),
         309 => getcpu(a[0], a[1]),
         204 => sched_getaffinity(a[1], a[2]),
+        // Scheduling policy: everything is SCHED_OTHER at priority 0; changes are accepted, not applied.
+        // (pthread_getschedparam failing aborted Abseil's mutex setup in node's npm.)
+        143 => { if a[1] != 0 { unsafe { *(a[1] as *mut i32) = 0 } }; Ok(0) } // sched_getparam
+        145 => Ok(0),                         // sched_getscheduler: SCHED_OTHER
+        142 | 144 | 203 => Ok(0),             // sched_setparam, sched_setscheduler, sched_setaffinity
+        146 => Ok(if a[0] == 1 || a[0] == 2 { 99 } else { 0 }), // sched_get_priority_max (FIFO, RR: 99)
+        147 => Ok(if a[0] == 1 || a[0] == 2 { 1 } else { 0 }),  // sched_get_priority_min
         41 => net::sys_socket(a[0], a[1], a[2]),
         42 => net::sys_connect(a[0], a[1], a[2]),
         43 => net::sys_accept(a[0], a[1], a[2], 0),
@@ -1017,8 +1045,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         269 | 439 => fs::faccessat(a[0], a[1]),
         273 => Ok(0),                  // set_robust_list
         // tkill, tgkill. ponytail: signals are process-wide; whichever thread returns from a syscall next runs it.
-        200 => proc::kill(proc::getpid().unwrap_or(0), a[1]),
-        234 => proc::kill(proc::getpid().unwrap_or(0), a[2]),
+        200 => signal::send_thread(a[0], a[1]),        // tkill
+        234 => if a[0] as u32 == crate::proc::pid() { signal::send_thread(a[1], a[2]) } else { proc::kill(a[0] as i32 as i64, a[2]) }, // tgkill
         292 => fs::dup3(a[0], a[1], a[2]),
         293 => fs::pipe2(a[0], a[1]),
         318 => getrandom(a[0], a[1]),
@@ -1668,6 +1696,25 @@ fn getcpu(cpu: u64, node: u64) -> R {
     }
     if node != 0 {
         unsafe { *(node as *mut u32) = 0 };
+    }
+    Ok(0)
+}
+/// mincore: one byte per page, 1 where committed. ENOMEM if part of the range isn't mapped at all,
+/// which callers use to probe for holes (grep's stack-limit scan loops until it sees one).
+fn mincore(addr: u64, len: u64, vec: u64) -> R {
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_FREE: u32 = 0x10000;
+    let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
+    let mut p = start;
+    while p < end {
+        let mut m = MemoryBasicInformation::default();
+        if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 || m.state == MEM_FREE {
+            return Err(ENOMEM);
+        }
+        let top = (m.base as u64 + m.region_size as u64).min(end);
+        let n = ((top - p) / 4096) as usize;
+        unsafe { std::ptr::write_bytes((vec + (p - start) / 4096) as *mut u8, (m.state == MEM_COMMIT) as u8, n) };
+        p = top;
     }
     Ok(0)
 }

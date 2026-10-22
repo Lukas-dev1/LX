@@ -63,7 +63,7 @@ if [ -x $GO ]; then
 fi
 
 # ---- images: pull what's missing; guest scripts reach containers through a read-only volume ----
-for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine node:alpine golang:alpine; do
+for img in alpine:latest python:3.12-alpine python:3.12 nginx:alpine httpd:alpine eclipse-temurin:21-jre-alpine redis:alpine postgres:alpine node:alpine golang:alpine mariadb:11; do
   dir=$STORE/library_${img%%:*}/${img#*:}/rootfs
   # Pulled before lx kept file modes, every file reads 0755 (no real image has /etc/passwd so): re-pull.
   if [ -d "$dir" ] && [ "$($LX run "$img" stat -c %a /etc/passwd 2> /dev/null < /dev/null)" = 755 ]; then
@@ -101,10 +101,13 @@ expect "socketpair (stream, dgram, fork, mp.Pipe)" 0 "OK" -- run -v "$GUEST" pyt
 expect "file modes + owners"       0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/modetest.py
 expect "debian: file modes + owners" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/modetest.py
 expect "per-thread signal masks (threads, fork)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/masktest.py
+expect "sigwait / sigwaitinfo / sigtimedwait" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/sigwait.py
 expect "/proc/self/fd lists open fds" 0 "0 1 2 3" -- run alpine sh -c 'ls /proc/self/fd | tr "\n" " "'
 expect "SIGSEGV reaches the guest's handler" 139 "Fatal Python error: Segmentation fault" -- run python:3.12 python3 -X faulthandler -c "import ctypes; ctypes.string_at(0)"
 expect "httpd: config check (ErrorLog /proc/self/fd/2)" 0 "Syntax OK" -- run httpd:alpine httpd -t
 expect "java -version (HotSpot's SIGSEGV use)" 0 "OpenJDK 64-Bit Server VM" -- run eclipse-temurin:21-jre-alpine java -version
+# mariadb through its official entrypoint (gosu, install-db, InnoDB). -p: the host may run its own 3306.
+expect "mariadb: entrypoint + InnoDB query" 0 "hello,lx" -- run -p 13306:3306 -e MARIADB_ROOT_PASSWORD=x mariadb:11 sh -c 'docker-entrypoint.sh mariadbd > /tmp/log 2>&1 & for i in $(seq 1 100); do mariadb -uroot -px -e "select 1" > /dev/null 2>&1 && break; sleep 1; done; mariadb -uroot -px -e "create database t; create table t.a (id int primary key, s text) engine=innodb; insert into t.a values (1, \"hello\"), (2, \"lx\"); select group_concat(s) from t.a"; mariadb-admin -uroot -px shutdown; wait'
 # -e adds and overrides the image's env (PYTHON_VERSION is set by the image), -w sets the directory.
 expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERSION=9 -w /usr python:3.12-alpine sh -c 'echo A=$A V=$PYTHON_VERSION $(pwd)'
 expect "run -u / USER + HOME"      0 "65534:65533 HOME=/." -- run -u nobody:nogroup alpine sh -c 'echo $(id -u):$(id -g) HOME=$HOME.'
@@ -200,6 +203,10 @@ else
   online "python3 /script.py: sockets + threaded server" "20/20 responses" run -v "$GUEST" python:3.12-alpine python3 /t/nettest.py
   online "debian: sockets + threaded server" "20/20 responses" run -v "$GUEST" python:3.12 python3 /t/nettest.py
   online "debian: apt-get install jq" "jq says 6" run python:3.12 sh -c 'apt-get update -qq && apt-get install -qqy --no-install-recommends jq && echo "jq says $(echo "{\"lx\": [1, 2, 3]}" | jq ".lx | add")"'
+  # The package managers a Dockerfile's RUN lines use most.
+  online "alpine: apk add" "jq says 1" run alpine sh -c 'apk add -q --no-cache jq && echo "jq says $(echo "{\"a\": 1}" | jq .a)"'
+  online "pip install" "requests 2" run python:3.12-alpine sh -c 'pip install -q --root-user-action=ignore requests 2> /dev/null; python3 -c "import requests; print(\"requests\", requests.__version__)"'
+  online "npm install" "left-pad --x" run node:alpine sh -c 'cd /tmp && npm init -y > /dev/null && npm install -s left-pad && node -e "console.log(\"left-pad\", require(\"left-pad\")(\"x\", 3, \"-\"))"'
   # glibc should stay off the trap path too: no fallback traps, no FS faults in a full threaded run.
   LX_PATCHLOG=1 timeout 120 $LX run -v "$GUEST" python:3.12 python3 /t/nettest.py < /dev/null > "$OUT/deb" 2>&1
   if grep -q " 0 fallback traps;.* 0 FS-base faults" "$OUT/deb"; then ok "debian: no trap fallbacks"; else bad "debian: trap fallbacks taken"; grep "exit:" "$OUT/deb"; fi

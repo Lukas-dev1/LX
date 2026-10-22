@@ -6,6 +6,7 @@ mod jump;
 mod image;
 mod net;
 mod proc;
+mod procfs;
 mod signal;
 mod syscall;
 mod thread;
