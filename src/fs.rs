@@ -3121,30 +3121,60 @@ pub fn read_at(fd: u64, dst: &mut [u8], off: u64) -> R {
     })
 }
 
-// ---- image layers ----
-
-/// Unpack an OCI/Docker layer (tar, gzipped or not) into `dest`, on top of earlier layers.
-/// Entry paths are untrusted: absolute paths and `..` are rejected, never joined. Our symlinks are plain
-/// marker files on the host, so an entry can't be written "through" a symlink either.
-/// Whiteouts: `.wh.NAME` deletes NAME from lower layers, `.wh..wh..opq` empties its directory.
 /// Make `dir` case-sensitive, like a Linux file system: `Makefile` and `makefile` are two files.
 /// NTFS keeps a per-directory flag that subdirectories made later inherit, so setting it on an empty
-/// rootfs or layer before anything is created covers the whole tree. Best effort: where the volume
-/// doesn't support it, names stay case-insensitive (as before).
+/// rootfs or layer before anything is created covers the whole tree. Setting it needs "delete
+/// subfolders and files" on the directory, which a plain Modify grant (the usual one outside the user
+/// profile) lacks; we created the directory, so as its owner we grant ourselves that first.
+/// Best effort: where the volume doesn't support it, names stay case-insensitive (as before).
 pub fn case_sensitive(dir: &Path) {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::ffi::c_void;
+    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+    #[repr(C)]
+    struct ExplicitAccess { perms: u32, mode: u32, inherit: u32, multiple: *const c_void, multiple_op: u32, form: u32, kind: u32, name: *const u16 }
     #[link(name = "ntdll")]
     unsafe extern "system" {
-        fn NtSetInformationFile(h: isize, iosb: *mut [usize; 2], info: *const std::ffi::c_void, len: u32, class: u32) -> i32;
+        fn NtSetInformationFile(h: isize, iosb: *mut [usize; 2], info: *const c_void, len: u32, class: u32) -> i32;
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn GetNamedSecurityInfoW(name: *const u16, kind: u32, info: u32, o: *mut c_void, g: *mut c_void, dacl: *mut *mut c_void, sacl: *mut c_void, sd: *mut *mut c_void) -> u32;
+        fn SetEntriesInAclW(n: u32, ea: *const ExplicitAccess, old: *mut c_void, new: *mut *mut c_void) -> u32;
+        fn SetNamedSecurityInfoW(name: *const u16, kind: u32, info: u32, o: *mut c_void, g: *mut c_void, dacl: *mut c_void, sacl: *mut c_void) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(p: *mut c_void) -> *mut c_void;
     }
     const FILE_CASE_SENSITIVE_INFORMATION: u32 = 71;
     const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 1;
+    let w: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    let me: Vec<u16> = "CURRENT_USER".encode_utf16().chain([0]).collect();
+    // FILE_DELETE_CHILD, GRANT_ACCESS, inherited by subfolders and files, trustee by name
+    let ea = ExplicitAccess { perms: 0x40, mode: 1, inherit: 3, multiple: std::ptr::null(), multiple_op: 0, form: 1, kind: 0, name: me.as_ptr() };
+    let null = std::ptr::null_mut();
+    unsafe {
+        let (mut dacl, mut sd, mut new) = (null, null, null);
+        if GetNamedSecurityInfoW(w.as_ptr(), 1, 4, null, null, &mut dacl, null, &mut sd) == 0 { // SE_FILE_OBJECT, DACL
+            if SetEntriesInAclW(1, &ea, dacl, &mut new) == 0 {
+                SetNamedSecurityInfoW(w.as_ptr(), 1, 4, null, null, new, null);
+                LocalFree(new);
+            }
+            LocalFree(sd);
+        }
+    }
     let Ok(f) = OpenOptions::new().read(true).write(true).custom_flags(0x0200_0000).open(dir) else { return }; // BACKUP_SEMANTICS: a directory
     let mut iosb = [0usize; 2];
     let flag = FILE_CS_FLAG_CASE_SENSITIVE_DIR;
     unsafe { NtSetInformationFile(f.as_raw_handle() as isize, &mut iosb, (&flag as *const u32).cast(), 4, FILE_CASE_SENSITIVE_INFORMATION) };
 }
 
+// ---- image layers ----
+
+/// Unpack an OCI/Docker layer (tar, gzipped or not) into `dest`, on top of earlier layers.
+/// Entry paths are untrusted: absolute paths and `..` are rejected, never joined. Our symlinks are plain
+/// marker files on the host, so an entry can't be written "through" a symlink either.
+/// Whiteouts: `.wh.NAME` deletes NAME from lower layers, `.wh..wh..opq` empties its directory.
 pub fn unpack(layer: &Path, dest: &Path) -> Result<(u32, u32), String> {
     let mut f = io::BufReader::new(File::open(layer).map_err(|e| format!("{}: {e}", layer.display()))?);
     let gz = io::BufRead::fill_buf(&mut f).map_err(|e| e.to_string())?.starts_with(&[0x1f, 0x8b]);
