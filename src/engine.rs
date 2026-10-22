@@ -820,6 +820,14 @@ fn route(r: &Req, c: &mut Conn) -> bool {
         }
         ("POST", ["networks", _, "connect" | "disconnect"]) => respond(&p, 200, "text/plain", b""),
         ("GET", ["volumes"]) => reply(&p, 200, json!({ "Volumes": [], "Warnings": [] })),
+        // ponytail: an events stream that stays open and quiet (clients that watch it still work).
+        ("GET", ["events"]) => {
+            open_stream(&p, 200, "application/json", false);
+            while c.fill() {
+                c.buf.clear();
+            }
+            return false;
+        }
         _ => fail(&p, 404, &format!("page not found: {} {} (not in lx's Engine API yet)", r.method, r.path)),
     }
     true
