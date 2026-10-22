@@ -924,6 +924,13 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         100 => times(a[0]),
         309 => getcpu(a[0], a[1]),
         204 => sched_getaffinity(a[1], a[2]),
+        // Scheduling policy: everything is SCHED_OTHER at priority 0; changes are accepted, not applied.
+        // (pthread_getschedparam failing aborted Abseil's mutex setup in node's npm.)
+        143 => { if a[1] != 0 { unsafe { *(a[1] as *mut i32) = 0 } }; Ok(0) } // sched_getparam
+        145 => Ok(0),                         // sched_getscheduler: SCHED_OTHER
+        142 | 144 | 203 => Ok(0),             // sched_setparam, sched_setscheduler, sched_setaffinity
+        146 => Ok(if a[0] == 1 || a[0] == 2 { 99 } else { 0 }), // sched_get_priority_max (FIFO, RR: 99)
+        147 => Ok(if a[0] == 1 || a[0] == 2 { 1 } else { 0 }),  // sched_get_priority_min
         41 => net::sys_socket(a[0], a[1], a[2]),
         42 => net::sys_connect(a[0], a[1], a[2]),
         43 => net::sys_accept(a[0], a[1], a[2], 0),
