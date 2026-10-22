@@ -1535,9 +1535,13 @@ fn fifo_reader(name: Vec<u16>, flags: u64) -> R {
         let mut n = 0u32;
         (unsafe { GetOverlappedResult(h, (op as *mut Overlapped).cast(), &mut n, 1) } != 0).then_some(n)
     };
+    // Inbound, overlapped, byte mode, unlimited instances: the broker waits for one writer at a time. The
+    // first one listens before open returns (s6-supervise opens its control FIFO for writing right after).
+    let listen = move || unsafe { CreateNamedPipeW(name.as_ptr(), 0x1 | 0x4000_0000, 0, 255, 65536, 65536, 0, std::ptr::null_mut()) };
+    let mut next = listen();
     std::thread::spawn(move || loop {
-        // Inbound, overlapped, byte mode, unlimited instances: this thread waits for one writer at a time.
-        let inst = unsafe { CreateNamedPipeW(name.as_ptr(), 0x1 | 0x4000_0000, 0, 255, 65536, 65536, 0, std::ptr::null_mut()) };
+        let inst = std::mem::replace(&mut next, -1);
+        let inst = if inst == -1 { listen() } else { inst };
         if inst == -1 {
             return;
         }
