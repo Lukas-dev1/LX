@@ -111,6 +111,7 @@ expect "erlang: VM, 1000 processes, os:cmd port" 0 "sum=6 procs=1000 port-ok" --
 expect "/proc/self/fd lists open fds" 0 "0 1 2 3" -- run alpine sh -c 'ls /proc/self/fd | tr "\n" " "'
 expect "SIGSEGV reaches the guest's handler" 139 "Fatal Python error: Segmentation fault" -- run python:3.12 python3 -X faulthandler -c "import ctypes; ctypes.string_at(0)"
 expect "httpd: config check (ErrorLog /proc/self/fd/2)" 0 "Syntax OK" -- run httpd:alpine httpd -t
+expect "fchmodat2 by path and by fd" 0 "fchmodat2 640 604" -- run -v "$GUEST" python:3.12 python3 /t/fchmodat2.py
 expect "java -version (HotSpot's SIGSEGV use)" 0 "OpenJDK 64-Bit Server VM" -- run eclipse-temurin:21-jre-alpine java -version
 # mariadb through its official entrypoint (gosu, install-db, InnoDB). -p: the host may run its own 3306.
 expect "mariadb: entrypoint + InnoDB query" 0 "hello,lx" -- run -p 13306:3306 -e MARIADB_ROOT_PASSWORD=x mariadb:11 sh -c 'docker-entrypoint.sh mariadbd > /tmp/log 2>&1 & for i in $(seq 1 100); do mariadb -uroot -px -e "select 1" > /dev/null 2>&1 && break; sleep 1; done; mariadb -uroot -px -e "create database t; create table t.a (id int primary key, s text) engine=innodb; insert into t.a values (1, \"hello\"), (2, \"lx\"); select group_concat(s) from t.a"; mariadb-admin -uroot -px shutdown; wait'
