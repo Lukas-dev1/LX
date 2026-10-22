@@ -974,6 +974,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         22 => fs::pipe2(a[0], 0),
         21 => fs::faccessat(CWD, a[0]),
         28 => madvise(a[0], a[1], a[2]),
+        149..=152 | 325 => Ok(0), // mlock, munlock, mlockall, munlockall, mlock2. ponytail: pages may still be paged out
         32 => fs::dup(a[0], 0, false),
         33 => fs::dup3(a[0], a[1], 0),
         35 => nanosleep(a[0]),
