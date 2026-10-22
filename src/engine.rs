@@ -260,6 +260,9 @@ fn open_stream(p: &Pipe, code: u16, ctype: &str, upgrade: bool) {
 fn connection(p: Arc<Pipe>) {
     let mut c = Conn { p: p.clone(), buf: Vec::new() };
     while let Some(req) = c.request() {
+        if std::env::var_os("LX_ENGINE_LOG").is_some() {
+            eprintln!("[lx engine] {} {} {:?}", req.method, req.path, req.query);
+        }
         if !route(&req, &mut c) {
             break; // hijacked or streamed: the connection is done
         }
@@ -443,6 +446,28 @@ struct Container {
 static CONTAINERS: Mutex<Vec<Arc<Container>>> = Mutex::new(Vec::new());
 static EXECS: Mutex<Vec<(String, Arc<Container>, Value, Arc<Run>)>> = Mutex::new(Vec::new());
 static NETWORKS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+/// Clients following /events, with their filters.
+static WATCHERS: Mutex<Vec<(Arc<Pipe>, Value)>> = Mutex::new(Vec::new());
+
+/// A container event (create, start, die, destroy) to everyone watching /events whose filters match.
+fn emit(action: &str, c: &Container, exit_code: Option<i32>) {
+    let mut attrs = c.body["Labels"].as_object().cloned().unwrap_or_default();
+    attrs.insert("name".into(), json!(c.name));
+    attrs.insert("image".into(), c.body["Image"].clone());
+    if let Some(code) = exit_code {
+        attrs.insert("exitCode".into(), json!(code.to_string()));
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let ev = json!({ "Type": "container", "Action": action, "status": action, "id": c.id, "from": c.body["Image"],
+                     "Actor": { "ID": c.id, "Attributes": attrs }, "scope": "local", "time": now.as_secs(), "timeNano": now.as_nanos() as u64 });
+    let line = format!("{ev}
+");
+    WATCHERS.lock().unwrap().retain(|(p, f)| {
+        let allows = |key: &str, v: &str| filter_vals(&f[key]).is_empty() || filter_vals(&f[key]).iter().any(|x| x == v);
+        let wanted = allows("type", "container") && allows("event", action) && matches_filters(c, &json!({ "label": f["label"] }));
+        !wanted || p.send(line.as_bytes()).is_ok()
+    });
+}
 
 fn new_id() -> String {
     let mut b = [0u8; 32];
@@ -486,6 +511,11 @@ fn nets(c: &Container) -> Vec<(String, Vec<String>)> {
 
 fn image_exists(name: &str) -> bool {
     crate::image::Ref::parse(name).dir().join("config.json").exists()
+}
+
+/// A filter's values: clients send `{"key": ["a"]}` or `{"key": {"a": true}}`.
+fn filter_vals(v: &Value) -> Vec<String> {
+    v.as_object().map_or_else(|| strs(v), |m| m.keys().cloned().collect())
 }
 
 fn strs(v: &Value) -> Vec<String> {
@@ -563,10 +593,14 @@ fn start(c: &Arc<Container>) -> Result<(), String> {
     let auto_remove = c.body["HostConfig"]["AutoRemove"].as_bool().unwrap_or(false);
     let me = c.clone();
     spawn(&c.run, &run_args(c), stdin, move || {
+        emit("die", &me, me.run.s.lock().unwrap().code);
         if auto_remove {
             CONTAINERS.lock().unwrap().retain(|x| !Arc::ptr_eq(x, &me));
+            emit("destroy", &me, None);
         }
-    })
+    })?;
+    emit("start", c, None);
+    Ok(())
 }
 
 fn rfc3339(t: Option<SystemTime>) -> String {
@@ -664,8 +698,7 @@ fn image_id(name: &str) -> String {
 
 fn matches_filters(c: &Container, filters: &Value) -> bool {
     let labels = &c.body["Labels"];
-    let ok = |key: &str, test: &dyn Fn(&str) -> bool| strs(&filters[key]).iter().all(|v| test(v))
-        && filters[key].as_object().is_none_or(|m| m.keys().all(|v| test(v))); // both filter encodings
+    let ok = |key: &str, test: &dyn Fn(&str) -> bool| filter_vals(&filters[key]).iter().all(|v| test(v));
     ok("label", &|l| match l.split_once('=') {
         Some((k, v)) => labels[k].as_str() == Some(v),
         None => !labels[l].is_null(),
@@ -756,7 +789,9 @@ fn route(r: &Req, c: &mut Conn) -> bool {
                 let id = new_id();
                 let name = if name.is_empty() { format!("lx_{}", &id[..8]) } else { name };
                 let ip = ip_for(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
-                CONTAINERS.lock().unwrap().push(Arc::new(Container { id: id.clone(), name, created: SystemTime::now(), body, ip, run: Arc::default() }));
+                let ct = Arc::new(Container { id: id.clone(), name, created: SystemTime::now(), body, ip, run: Arc::default() });
+                CONTAINERS.lock().unwrap().push(ct.clone());
+                emit("create", &ct, None);
                 reply(&p, 201, json!({ "Id": id, "Warnings": [] }));
             }
         }
@@ -849,12 +884,15 @@ fn route(r: &Req, c: &mut Conn) -> bool {
         }
         ("POST", ["networks", _, "connect" | "disconnect"]) => respond(&p, 200, "text/plain", b""),
         ("GET", ["volumes"]) => reply(&p, 200, json!({ "Volumes": [], "Warnings": [] })),
-        // ponytail: an events stream that stays open and quiet (clients that watch it still work).
+        // Container events as they happen (compose waits for "die"). ponytail: no since/until replay.
         ("GET", ["events"]) => {
             open_stream(&p, 200, "application/json", false);
+            let filters: Value = serde_json::from_str(r.q("filters")).unwrap_or(Value::Null);
+            WATCHERS.lock().unwrap().push((p.clone(), filters));
             while c.fill() {
                 c.buf.clear();
             }
+            WATCHERS.lock().unwrap().retain(|(x, _)| !Arc::ptr_eq(x, &p));
             return false;
         }
         _ => fail(&p, 404, &format!("page not found: {} {} (not in lx's Engine API yet)", r.method, r.path)),
@@ -965,6 +1003,7 @@ fn container_route(m: &str, action: &[&str], r: &Req, c: &mut Conn, ct: &Arc<Con
                 ct.run.wait();
             }
             CONTAINERS.lock().unwrap().retain(|x| !Arc::ptr_eq(x, ct));
+            emit("destroy", ct, None);
             respond(&p, 204, "text/plain", b"");
         }
         ("POST", ["resize"]) => respond(&p, 200, "text/plain", b""),
