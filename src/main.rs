@@ -274,7 +274,7 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
        lx images                             pulled and built images
        lx rmi <image>...                     remove images
        lx ps                                 running containers
-       lx stop <name|pid>                    SIGTERM, then SIGKILL after 10s
+       lx stop [-t secs] <name|pid>          SIGTERM, then SIGKILL after 10s (or -t)
        lx kill <name|pid> [SIGNAL]           default TERM
        lx <rootfs-dir> <command> [args...]   run a command in an unpacked rootfs
        lx unpack <layer.tar[.gz]> <rootfs-dir>";
@@ -376,11 +376,17 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if let [cmd, id, rest @ ..] = args.as_slice() && (cmd == "kill" || cmd == "stop") {
+    if let [cmd, rest @ ..] = args.as_slice() && cmd == "stop" {
+        // Like docker stop: -t for init systems that take longer to shut down (s6-overlay's grace times).
+        let (secs, id) = match rest {
+            [t, n, id] if t == "-t" || t == "--time" => (n.parse().map_err(|_| format!("bad timeout {n:?}"))?, id),
+            [id] => (10, id),
+            _ => return Err(USAGE.into()),
+        };
+        return proc::stop(container(id)?, std::time::Duration::from_secs(secs));
+    }
+    if let [cmd, id, rest @ ..] = args.as_slice() && cmd == "kill" {
         let pid = container(id)?;
-        if cmd == "stop" {
-            return proc::stop(pid, std::time::Duration::from_secs(10));
-        }
         let sig = rest.first().map_or(Some(15), |s| signal::parse(s)).ok_or("unknown signal")?;
         return proc::send(pid, sig).map(|_| ()).map_err(|_| format!("{pid}: no such lx process"));
     }
