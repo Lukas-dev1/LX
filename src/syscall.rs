@@ -1015,6 +1015,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         186 => thread::gettid(),
         24 => thread::sched_yield(),
         40 => fs::sendfile(a[0], a[1], a[2], a[3]),
+        // splice(in, off_in, out, off_out, len, flags) is sendfile through a buffer here. ponytail: no off_out.
+        275 => if a[3] != 0 { Err(EINVAL) } else { fs::sendfile(a[2], a[0], a[1], a[4]) },
         56 => proc::clone(c, a[0], a[1], a[2], a[3], a[4]),
         435 => proc::clone3(c, a[0], a[1]),
         57 | 58 => proc::fork(c, 0),   // fork, vfork
