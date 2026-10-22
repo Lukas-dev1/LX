@@ -152,12 +152,32 @@ fn scalar(v: &Value) -> String {
     v.as_str().map(String::from).unwrap_or_else(|| v.to_string())
 }
 
-/// `command:`/`entrypoint:` as a list (exec form) or a string (split on spaces, as compose does).
+/// `command:`/`entrypoint:` as a list (exec form) or a string, split like a shell would (quotes group,
+/// `""` is an empty argument), as compose does.
 fn words(v: &Value) -> Vec<String> {
     match v {
         Value::Array(a) => a.iter().map(scalar).collect(),
         Value::Null => vec![],
-        x => scalar(x).split_whitespace().map(String::from).collect(),
+        x => {
+            let (mut out, mut cur, mut quote, mut any) = (Vec::new(), String::new(), None, false);
+            for c in scalar(x).chars() {
+                match (c, quote) {
+                    ('"' | '\'', None) => (quote, any) = (Some(c), true),
+                    (q, Some(o)) if q == o => quote = None,
+                    (c, None) if c.is_whitespace() => {
+                        if any {
+                            out.push(std::mem::take(&mut cur));
+                        }
+                        any = false;
+                    }
+                    (c, _) => (cur.push(c), any = true).0,
+                }
+            }
+            if any {
+                out.push(cur);
+            }
+            out
+        }
     }
 }
 
@@ -310,5 +330,6 @@ fn compose_yaml() {
     assert_eq!(env_list(&web["environment"]), ["A=1", "B=two words"]);
     assert_eq!(start_order(doc["services"].as_object().unwrap()).unwrap(), ["db", "web"]);
     assert_eq!(words(&doc["services"]["db"]["command"]), ["postgres", "-c", "fsync=off"]);
+    assert_eq!(words(&json!("redis-server --save \"\" --x 'a b'")), ["redis-server", "--save", "", "--x", "a b"]);
     assert_eq!(list(&doc["services"]["db"]["volumes"]), ["data:/var/lib/postgresql/data"]);
 }
