@@ -1180,6 +1180,17 @@ static TERMIOS: Mutex<[u32; 9]> = Mutex::new([
     0x7f1c_0300, 0x0100_0415, 0x1a13_1100, 0x170f_1200, 0x0000_0016,
 ]);
 
+/// Let the console interpret the escape sequences a Linux terminal does (colors, cursor moves), on
+/// stdout and stderr; the console keeps this mode for every process of the container.
+pub fn console_vt() {
+    for std in [-11i32, -12] {
+        let (h, mut mode) = (unsafe { crate::win::GetStdHandle(std as u32) }, 0);
+        if unsafe { crate::win::GetConsoleMode(h, &mut mode) } != 0 {
+            unsafe { crate::win::SetConsoleMode(h, mode | 4) }; // ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        }
+    }
+}
+
 fn is_console(h: isize) -> bool {
     let mut mode = 0;
     unsafe { crate::win::GetConsoleMode(h, &mut mode) != 0 }

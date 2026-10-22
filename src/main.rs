@@ -613,6 +613,7 @@ fn exec(args: &[String]) -> Result<(), String> {
 
 /// Load `cmd` (and its ELF interpreter, or its #! interpreter) and jump into it. Never returns on success.
 fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), String> {
+    fs::console_vt();
     let not_found = |e: i64| format!("{cmd}: {}", if e == syscall::EACCES { "permission denied" } else { "not found in image" });
     let path = env.iter().find_map(|e| e.strip_prefix("PATH=")).unwrap_or(PATH).to_string();
     let (mut exe, mut image) = fs::find_exe(cmd, &path).map_err(not_found)?;
