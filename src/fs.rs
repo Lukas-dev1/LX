@@ -3127,12 +3127,31 @@ pub fn read_at(fd: u64, dst: &mut [u8], off: u64) -> R {
 /// Entry paths are untrusted: absolute paths and `..` are rejected, never joined. Our symlinks are plain
 /// marker files on the host, so an entry can't be written "through" a symlink either.
 /// Whiteouts: `.wh.NAME` deletes NAME from lower layers, `.wh..wh..opq` empties its directory.
+/// Make `dir` case-sensitive, like a Linux file system: `Makefile` and `makefile` are two files.
+/// NTFS keeps a per-directory flag that subdirectories made later inherit, so setting it on an empty
+/// rootfs or layer before anything is created covers the whole tree. Best effort: where the volume
+/// doesn't support it, names stay case-insensitive (as before).
+pub fn case_sensitive(dir: &Path) {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetInformationFile(h: isize, iosb: *mut [usize; 2], info: *const std::ffi::c_void, len: u32, class: u32) -> i32;
+    }
+    const FILE_CASE_SENSITIVE_INFORMATION: u32 = 71;
+    const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 1;
+    let Ok(f) = OpenOptions::new().read(true).write(true).custom_flags(0x0200_0000).open(dir) else { return }; // BACKUP_SEMANTICS: a directory
+    let mut iosb = [0usize; 2];
+    let flag = FILE_CS_FLAG_CASE_SENSITIVE_DIR;
+    unsafe { NtSetInformationFile(f.as_raw_handle() as isize, &mut iosb, (&flag as *const u32).cast(), 4, FILE_CASE_SENSITIVE_INFORMATION) };
+}
+
 pub fn unpack(layer: &Path, dest: &Path) -> Result<(u32, u32), String> {
     let mut f = io::BufReader::new(File::open(layer).map_err(|e| format!("{}: {e}", layer.display()))?);
     let gz = io::BufRead::fill_buf(&mut f).map_err(|e| e.to_string())?.starts_with(&[0x1f, 0x8b]);
     let input: Box<dyn Read> = if gz { Box::new(flate2::read::GzDecoder::new(f)) } else { Box::new(f) };
     let mut ar = tar::Archive::new(input);
     fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    case_sensitive(dest); // before the first entry: everything below inherits it
     let (mut done, mut skipped) = (0, 0);
     let clean = |p: &Path| -> Option<PathBuf> {
         let mut out = PathBuf::new();
