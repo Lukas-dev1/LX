@@ -848,7 +848,7 @@ impl Fs {
     /// (gosu stats /proc/self/exe). Only paths of exactly those three components are looked at.
     fn proc_self_link(&self, comps: &[String]) -> Option<String> {
         let [p, who, what] = comps else { return None };
-        if p != "proc" || (who != "self" && who.parse::<u32>().ok()? != crate::proc::pid()) {
+        if p != "proc" || (who != "self" && crate::proc::host_pid(who.parse().ok()?) != crate::proc::pid()) {
             return None;
         }
         match what.as_str() {
@@ -1364,7 +1364,7 @@ fn tty_ioctl(h: isize, req: u64, arg: u64) -> R {
             Ok(0)
         }
         TIOCGPGRP => {
-            unsafe { *(arg as *mut i32) = crate::proc::pid() as i32 };
+            unsafe { *(arg as *mut i32) = crate::proc::getpid().unwrap_or(0) as i32 };
             Ok(0)
         }
         TIOCSCTTY | TIOCSPGRP | TIOCSWINSZ => Ok(0),
@@ -2681,7 +2681,7 @@ pub fn set_exe(guest: &str) {
 fn proc_dir(guest: &str) -> Option<bool> {
     let r = guest.strip_prefix("/proc/")?;
     let (pid, rest) = r.split_once('/').unwrap_or((r, ""));
-    if pid != "self" && pid.parse::<u32>().ok()? != crate::proc::pid() {
+    if pid != "self" && crate::proc::host_pid(pid.parse().ok()?) != crate::proc::pid() {
         return None;
     }
     match rest {
@@ -2706,7 +2706,7 @@ fn proc_link(guest: &str) -> Option<String> {
     let rest = guest.strip_prefix("/proc/self/").or_else(|| {
         let r = guest.strip_prefix("/proc/")?;
         let (pid, rest) = r.split_once('/')?;
-        (pid.parse::<u32>().ok()? == crate::proc::pid()).then_some(rest)
+        (crate::proc::host_pid(pid.parse().ok()?) == crate::proc::pid()).then_some(rest)
     })?;
     match rest {
         "exe" => Some(EXE.lock().unwrap().clone()),

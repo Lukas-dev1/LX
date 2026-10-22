@@ -89,6 +89,7 @@ expect "crash -> SIGSEGV" 139 "guest fault"              -- rootfs /stress crash
 expect "signalfd in epoll, woken by a child's signal" 0 "OK" -- rootfs /sigfdtest
 expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regress.sh
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
+expect "the first process is pid 1"  0 "pid1 OK" -- run -v "$GUEST" alpine sh /t/pid1.sh
 expect "deep stack + fork" 0  "child exit 3"             -- rootfs/alpine /deepstack
 expect "dlopen while threads run" 0 " OK"                -- rootfs/alpine /dltest
 # Debian (glibc) image: the three usual ways a Python image starts.

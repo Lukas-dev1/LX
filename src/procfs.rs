@@ -26,7 +26,7 @@ Pss: {:>16} kB
             let s = unsafe { crate::win::GetTickCount64() } as f64 / 1000.0;
             format!("{s:.2} {s:.2}\n")
         }
-        "/proc/loadavg" => format!("0.00 0.00 0.00 1/1 {}\n", crate::proc::pid()),
+        "/proc/loadavg" => format!("0.00 0.00 0.00 1/1 {}\n", crate::proc::getpid().unwrap_or(0)),
         "/proc/version" => "Linux version 6.6.0-lx (lx) #1 SMP lx\n".into(),
         "/proc/sys/kernel/hostname" => "lx\n".into(),
         "/proc/sys/kernel/osrelease" => "6.6.0-lx\n".into(),
@@ -46,7 +46,7 @@ Pss: {:>16} kB
 fn self_rest(guest: &str) -> Option<&str> {
     let r = guest.strip_prefix("/proc/")?;
     let (pid, rest) = r.split_once('/')?;
-    (pid == "self" || pid.parse::<u32>().ok()? == crate::proc::pid()).then_some(rest)
+    (pid == "self" || crate::proc::host_pid(pid.parse().ok()?) == crate::proc::pid()).then_some(rest)
 }
 
 fn mounts() -> String {
@@ -125,7 +125,7 @@ fn statm() -> String {
 /// /proc/self/status: the fields programs parse (ids, threads, memory).
 fn status() -> String {
     let (vsz, rss) = mem();
-    let pid = crate::proc::pid();
+    let pid = crate::proc::getpid().unwrap_or(0);
     let ppid = crate::proc::getppid().unwrap_or(0);
     let name = crate::fs::exe_name();
     let (uid, gid) = (crate::proc::UID.load(std::sync::atomic::Ordering::Relaxed), crate::proc::GID.load(std::sync::atomic::Ordering::Relaxed));
