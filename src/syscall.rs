@@ -1323,8 +1323,11 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
             })
             .flatten()
             .unwrap_or(vec![(off, len)]);
-        for (o, n) in ranges {
+        for &(o, n) in &ranges {
             patch_code(p + (o - off), n as usize);
+        }
+        if cow.is_some() && let Some(v) = COW_VIEWS.lock().unwrap().iter_mut().find(|v| v.base == p) {
+            v.exec = ranges;
         }
     }
     protect(p, len, page_prot(prot));
@@ -2055,7 +2058,9 @@ struct CowView {
     section: isize, // kept open for re-mapping parts; ponytail: never closed
     off: u64,
     fsize: u64,     // the file's size: a view may not reach past its end
-    exec: bool,     // syscall sites were patched in (re-done after a re-map)
+    // The file ranges syscall sites were patched in (re-done after a re-map): only its executable
+    // sections, never data such as .dynstr that shares the mapping.
+    exec: Vec<(u64, u64)>,
     written: bool,  // the guest may have changed it: never re-mapped from the file
 }
 static COW_VIEWS: Mutex<Vec<CowView>> = Mutex::new(Vec::new());
@@ -2164,10 +2169,15 @@ fn punch_views(addr: u64, len: u64) -> Vec<(u64, u64)> {
         }
         for &(a, n, off) in &keep {
             if place_view(v.section, a, off, n, v.fsize) {
-                if v.exec {
-                    patch_code(a, n as usize);
+                let exec: Vec<(u64, u64)> = v.exec.iter()
+                    .map(|&(o, m)| (o.max(off), (o + m).min(off + n)))
+                    .filter(|&(s, e)| s < e)
+                    .map(|(s, e)| (s, e - s))
+                    .collect();
+                for &(o, m) in &exec {
+                    patch_code(a + (o - off), m as usize);
                 }
-                views.insert(i, CowView { base: a, len: n, section: v.section, off, fsize: v.fsize, exec: v.exec, written: false });
+                views.insert(i, CowView { base: a, len: n, section: v.section, off, fsize: v.fsize, exec, written: false });
                 i += 1;
             }
         }
@@ -2183,7 +2193,9 @@ fn mark_views(addr: u64, len: u64, written: bool, exec: bool) {
     for v in COW_VIEWS.lock().unwrap().iter_mut() {
         if v.base < addr + len && addr < v.base + v.len {
             v.written |= written;
-            v.exec |= exec;
+            if exec {
+                v.exec = vec![(v.off, v.len)]; // mprotect patched all of it
+            }
         }
     }
 }
@@ -2230,6 +2242,7 @@ fn mmap_cow(addr: u64, len: u64, prot: u64, fixed: bool, fd: u64, off: u64, hole
     if !(view_ok && tail_ok) {
         return None; // ponytail: a half-placed mapping is left as is; never seen
     }
-    COW_VIEWS.lock().unwrap().push(CowView { base, len: flen, section, off, fsize: size, exec: prot & 4 != 0, written: prot & 2 != 0 });
+    // exec: filled in by mmap once it has patched the view.
+    COW_VIEWS.lock().unwrap().push(CowView { base, len: flen, section, off, fsize: size, exec: Vec::new(), written: prot & 2 != 0 });
     Some(base)
 }
