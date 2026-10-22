@@ -8,6 +8,7 @@ mod image;
 mod net;
 mod proc;
 mod procfs;
+mod seccomp;
 mod signal;
 mod syscall;
 mod thread;
@@ -305,6 +306,7 @@ fn parse_volume(spec: &str) -> Result<(std::path::PathBuf, String, bool), String
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     proc::load_ids(); // a forked or exec'd lx: the guest's uid, gid and umask so far
+    seccomp::load(); // and its seccomp filters
     if let [cmd, tgz, dest] = args.as_slice() && cmd == "unpack" {
         let (n, skipped) = fs::unpack(Path::new(tgz), Path::new(dest))?;
         eprintln!("[lx] unpacked {n} entries ({skipped} skipped) into {dest}");

@@ -909,7 +909,10 @@ fn dispatch(c: &mut Context) -> i64 {
     for (slot, v) in IN_SYSCALL.iter().zip([c.rax + 1, a[0], a[1], a[2]]) {
         slot.store(v, Relaxed);
     }
-    let r = dispatch_nr(c, a);
+    let r = match crate::seccomp::check(c.rax, &a, c.rip) {
+        Some(r) => r.unwrap_or_else(|e| -e),
+        None => dispatch_nr(c, a),
+    };
     IN_SYSCALL[0].store(0, Relaxed);
     r
 }
@@ -1058,7 +1061,10 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         114 | 119 => proc::set_id(&proc::GID, a[1]),      // setregid, setresgid
         118 => proc::get_res(&proc::UID, [a[0], a[1], a[2]]), // getresuid
         120 => proc::get_res(&proc::GID, [a[0], a[1], a[2]]), // getresgid
+        157 if a[0] == 21 => crate::seccomp::mode(),       // PR_GET_SECCOMP
+        157 if a[0] == 22 => crate::seccomp::set(a[1], a[2]), // PR_SET_SECCOMP
         157 => prctl(a[0], a[1]),
+        317 => crate::seccomp::seccomp(a[0], a[1], a[2]),
         115 => Ok(0),                  // getgroups: no supplementary groups
         116 => Ok(0),                  // setgroups: accepted
         109 => Ok(0),                  // setpgid. ponytail: no process groups / job control
