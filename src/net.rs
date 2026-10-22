@@ -416,6 +416,9 @@ fn bind_addr(s: usize, a: &mut [u8]) {
     }
 }
 
+/// host.docker.internal in the container's /etc/hosts: the host's own 127.0.0.1 (dest_addr).
+const HOST_GATEWAY: [u8; 4] = [127, 0, 0, 254];
+
 const LOOPBACK6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 fn v6only(s: usize) -> bool {
@@ -425,13 +428,18 @@ fn v6only(s: usize) -> bool {
 }
 
 /// connect()/sendto(): the container reaching its own published port on loopback goes to the host port,
-/// and its other connections to 127.0.0.1 or ::1 to its own loopback address.
+/// its other connections to 127.0.0.1 or ::1 to its own loopback address, and host.docker.internal to
+/// the host's 127.0.0.1.
 fn dest_addr(s: usize, a: &mut [u8]) {
     let Some(ports) = published() else { return };
     if a.len() < 8 || !is_loopback(a) {
         return;
     }
     let fam = u16::from_le_bytes([a[0], a[1]]);
+    if fam == AF_INET && a[4..8] == HOST_GATEWAY {
+        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        return;
+    }
     if fam == AF_INET && a[4..8] != [127, 0, 0, 1] && own_ip() != Some([a[4], a[5], a[6], a[7]]) {
         return; // another container's address: its ports are its own
     }
@@ -1345,7 +1353,7 @@ pub fn dns_files() -> (String, String) {
     let resolv = servers.iter().map(|s| format!("nameserver {s}\n")).collect();
     // uname's nodename resolves too (httpd's ServerName guess, Java's getLocalHost, Erlang nodes), to
     // 127.0.0.1: that's where unpublished any-address listeners are (127.0.1.1 would miss epmd).
-    (resolv, "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.0.1\tlx\n".into())
+    (resolv, "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.0.1\tlx\n127.0.0.254\thost.docker.internal\n".into())
 }
 
 #[link(name = "iphlpapi")]
