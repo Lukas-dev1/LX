@@ -2,7 +2,9 @@
 //! healthchecks): a named shared memory section per container, one slot per guest process, claimed when
 //! its program starts (an exec keeps its pid's slot, a fork child copies its parent's) and freed at exit.
 //! Slots of processes that died without freeing theirs are skipped (and freed) by readers.
-//! ponytail: 1024 slots; no locking (a reader may see a slot mid-write); no CPU or memory figures.
+//! ponytail: 1024 slots; no locking (a reader may see a slot's names mid-write); no CPU or memory
+//! figures; a dead process whose Windows pid is reused at once looks alive (creation times would tell);
+//! a process killed between claiming a slot and storing its Windows pid leaks that slot.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
@@ -16,7 +18,9 @@ const CMDLINE: usize = SLOT - 32 - COMM - EXE;
 #[repr(C)]
 struct Slot {
     pid: AtomicU32, // as getpid says it (1: the container's first process); 0: free
-    win: u32,       // the Windows pid running it now
+    // The Windows pid running it now. 0 with a pid set: being claimed or freed (readers skip it). Claiming
+    // sets pid then win; freeing clears win (one freer wins the swap) then pid.
+    win: AtomicU32,
     ppid: u32,
     uid: u32,
     gid: u32,
@@ -80,26 +84,34 @@ fn claim(pid: u32) -> Option<&'static mut Slot> {
     if let Some(p) = table()?.find(|&p| unsafe { (*p).pid.load(SeqCst) } == pid) {
         return Some(unsafe { &mut *p });
     }
-    // A free slot, else (rarely) one whose process died without freeing it.
-    for dead_ok in [false, true] {
+    // A free slot; if none is, free the slots of processes that died without freeing theirs, and retry.
+    for _ in 0..2 {
         for p in table()? {
             let s = unsafe { &*p };
-            let cur = s.pid.load(SeqCst);
-            if (cur == 0 || (dead_ok && !alive(s.win))) && s.pid.compare_exchange(cur, pid, SeqCst, SeqCst).is_ok() {
+            if s.pid.compare_exchange(0, pid, SeqCst, SeqCst).is_ok() {
+                s.win.store(std::process::id(), SeqCst);
                 let m = unsafe { &mut *p };
                 m.start_ms = unsafe { crate::win::GetTickCount64() };
                 return Some(m);
             }
         }
+        all(); // frees dead slots
     }
     None
+}
+
+/// Free slot `s` whose process ran as `win` (unless someone else freed or reclaimed it meanwhile).
+fn free(s: &Slot, win: u32) {
+    if win != 0 && s.win.compare_exchange(win, 0, SeqCst, SeqCst).is_ok() {
+        s.pid.store(0, SeqCst);
+    }
 }
 
 /// This process starts a program (run, exec): record it.
 pub fn register(exe: &str, argv: &[String]) {
     let pid = crate::proc::getpid().unwrap_or(0) as u32;
     let Some(s) = claim(pid) else { return };
-    s.win = std::process::id();
+    s.win.store(std::process::id(), SeqCst);
     s.ppid = crate::proc::getppid().unwrap_or(0) as u32;
     s.uid = crate::proc::UID.load(SeqCst);
     s.gid = crate::proc::GID.load(SeqCst);
@@ -116,7 +128,7 @@ pub fn fork_child() {
     let Some(parent) = get(crate::proc::getppid().unwrap_or(0) as u32) else { return };
     let pid = crate::proc::getpid().unwrap_or(0) as u32;
     let Some(s) = claim(pid) else { return };
-    s.win = std::process::id();
+    s.win.store(std::process::id(), SeqCst);
     s.ppid = parent.pid;
     (s.uid, s.gid) = (crate::proc::UID.load(SeqCst), crate::proc::GID.load(SeqCst));
     put(&mut s.comm, parent.comm.as_bytes());
@@ -127,9 +139,9 @@ pub fn fork_child() {
 /// At exit: free our slot (an exec proxy's was taken over by its successor).
 pub fn unregister() {
     let me = std::process::id();
-    let mine = table().and_then(|mut t| t.find(|&p| unsafe { (*p).win == me && (*p).pid.load(SeqCst) != 0 }));
+    let mine = table().and_then(|mut t| t.find(|&p| unsafe { (*p).win.load(SeqCst) == me && (*p).pid.load(SeqCst) != 0 }));
     if let Some(p) = mine {
-        unsafe { (*p).pid.store(0, SeqCst) };
+        free(unsafe { &*p }, me);
     }
 }
 
@@ -148,12 +160,12 @@ pub fn all() -> Vec<Info> {
     let Some(t) = table() else { return Vec::new() };
     t.filter_map(|p| {
         let s = unsafe { &*p };
-        let pid = s.pid.load(SeqCst);
-        if pid == 0 {
-            return None;
+        let (pid, win) = (s.pid.load(SeqCst), s.win.load(SeqCst));
+        if pid == 0 || win == 0 {
+            return None; // free, or being claimed or freed
         }
-        if !alive(s.win) {
-            let _ = s.pid.compare_exchange(pid, 0, SeqCst, SeqCst); // died without freeing it
+        if !alive(win) {
+            free(s, win); // died without freeing it
             return None;
         }
         Some(info(s))
