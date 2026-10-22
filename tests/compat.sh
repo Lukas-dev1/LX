@@ -32,8 +32,8 @@ elixir|elixir:alpine|elixir-ok 6|elixir -e 'IO.puts("elixir-ok #{Enum.sum([1,2,3
 nginx|nginx:alpine|Welcome to nginx|SVC:nginx -g 'daemon off;'|wget -qO- http://127.0.0.1/
 httpd|httpd:alpine|It works|SVC:httpd-foreground|wget -qO- http://127.0.0.1/
 caddy|caddy:alpine|Caddy|SVC:caddy run --config /etc/caddy/Caddyfile --adapter caddyfile|wget -qO- http://127.0.0.1/
-haproxy|haproxy:alpine|HAProxy version|haproxy -v
-traefik|traefik:latest|Version:|traefik version
+haproxy|haproxy:alpine|haproxy-ok|SVC:printf 'defaults\n mode http\n timeout connect 5s\n timeout client 5s\n timeout server 5s\nfrontend f\n bind 127.0.0.1:8099\n http-request return status 200 content-type text/plain string haproxy-ok\n' > /tmp/h.cfg && haproxy -f /tmp/h.cfg|wget -qO- http://127.0.0.1:8099/
+traefik|traefik:latest|Version|SVC:traefik --api.insecure=true --entrypoints.web.address=:8088|wget -qO- http://127.0.0.1:8080/api/version
 redis|redis:alpine|PONG|SVC:redis-server --port 6395|redis-cli -p 6395 ping
 memcached|memcached:alpine|STAT pid|SVC:memcached -p 11299|printf "stats\r\nquit\r\n" | nc 127.0.0.1 11299
 postgres|postgres:alpine|answer 42|sh -c 'su postgres -c "initdb -D /tmp/pg > /dev/null && pg_ctl -D /tmp/pg -o \"-p 5499\" -l /tmp/pg.log start > /dev/null && sleep 2 && psql -p 5499 -tAc \"select 40+2\" | sed s/^/answer\ / ; pg_ctl -D /tmp/pg stop > /dev/null"'
@@ -41,13 +41,13 @@ mariadb|mariadb:11|hello|-e MARIADB_ROOT_PASSWORD=x -p 13307:3306 mariadb:11 sh 
 mongo|mongo:7|sum=42|-p 27019:27017 mongo:7 sh -c 'mongod --bind_ip_all > /tmp/log 2>&1 & for i in $(seq 1 60); do grep -q "Waiting for connections" /tmp/log && break; sleep 1; done; mongosh --quiet --eval "db.t.insertOne({a:42}); print(\"sum=\" + db.t.findOne().a)"; mongosh --quiet admin --eval "db.shutdownServer()" > /dev/null 2>&1; wait'
 rabbitmq|rabbitmq:3-alpine|sum=6|erl -noshell -eval 'io:format("sum=~p~n",[lists:sum([1,2,3])]), halt().'
 mosquitto|eclipse-mosquitto:latest|compat-msg|sh -c 'mosquitto -p 1899 > /dev/null 2>&1 & sleep 1; mosquitto_sub -p 1899 -t t -C 1 & sleep 1; mosquitto_pub -p 1899 -t t -m compat-msg; wait %2'
-prometheus|prom/prometheus:latest|prometheus, version|--entrypoint prometheus prom/prometheus:latest --version
+prometheus|prom/prometheus:latest|Ready|SVC:prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/tmp/prom|wget -qO- http://127.0.0.1:9090/-/ready
 grafana|grafana/grafana:latest|"database": "ok"|SVC:/run.sh|wget -qO- http://127.0.0.1:3000/api/health
-influxdb|influxdb:2-alpine|Influx|influxd version
-consul|hashicorp/consul:latest|Consul v|consul version
-vault|hashicorp/vault:latest|Vault v|vault version
-registry|registry:2|registry|registry --version
-minio|minio/minio:latest|minio version|minio --version
+influxdb|influxdb:2-alpine|"status": "pass"|SVC:influxd --bolt-path /tmp/b.db --engine-path /tmp/e|wget -qO- http://127.0.0.1:8086/health
+consul|hashicorp/consul:latest|alive|SVC:consul agent -dev -client 127.0.0.1|consul members
+vault|hashicorp/vault:latest|"initialized":true|SVC:vault server -dev -dev-listen-address=127.0.0.1:8200|wget -qO- http://127.0.0.1:8200/v1/sys/health
+registry|registry:2|{}|SVC:registry serve /etc/docker/registry/config.yml|wget -qO- http://127.0.0.1:5000/v2/
+minio|quay.io/minio/minio:latest|200|SVC:minio server /tmp/data --address 127.0.0.1:9000|curl -s -o /dev/null -w %{http_code} http://127.0.0.1:9000/minio/health/live
 gitea|gitea/gitea:latest|"status": "pass"|SVC:/usr/bin/entrypoint|wget -qO- http://127.0.0.1:3000/api/healthz
 vaultwarden|vaultwarden/server:latest|20|SVC:/start.sh|curl -s http://127.0.0.1:80/alive
 adminer|adminer:latest|Login - Adminer|SVC:php -S 127.0.0.1:8080 -t /var/www/html|wget -qO- http://127.0.0.1:8080/
@@ -64,7 +64,7 @@ while IFS='|' read -r name image expect rest; do
   "$LX" images 2>/dev/null | grep -q "^${image%%:*}[[:space:]]*${image#*:}\b" || pulled=1
   start=$(date +%s)
   case "$rest" in
-    SVC:*) svc=${rest#SVC:}; cmd=$(bg "${svc%%|*}" "${svc#*|}"); log=$(timeout "$T" "$LX" run "$image" sh -c "$cmd" < /dev/null 2>&1) ;;
+    SVC:*) svc=${rest#SVC:}; cmd=$(bg "${svc%%|*}" "${svc#*|}"); log=$(timeout "$T" "$LX" run --entrypoint "" "$image" sh -c "$cmd" < /dev/null 2>&1) ;; # our sh -c, not the image's entrypoint
     -*) log=$(eval "timeout $T $LX run $rest" < /dev/null 2>&1) ;;
     *) log=$(eval "timeout $T $LX run $image $rest" < /dev/null 2>&1) ;;
   esac
