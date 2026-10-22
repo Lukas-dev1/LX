@@ -1,13 +1,13 @@
 //! `lx compose [-f file] up|down|ps|logs [service]`: the multi-container apps of a compose file.
 //!
 //! Each service becomes `lx run -d --name <project>-<service>`, started in depends_on order. lx containers
-//! share the host's network, so a service reaches another by name through an /etc/hosts line
-//! (`--add-host db:127.0.0.1`) and its usual port. Keys: image, build (a path or {context, dockerfile}),
+//! share the host's network, each on its own loopback address (`--ip`), so a service reaches another by
+//! name through an /etc/hosts line (`--add-host db:127.130.7.2`) and its usual port. Keys: image, build (a path or {context, dockerfile}),
 //! ports, environment (map or list), volumes (a relative host path, or a named volume kept in
 //! rootfs/volumes/<project>_<name>), command, entrypoint, working_dir, user, depends_on.
 //! `up` follows the services' output until they end or Ctrl-C (then stops them); `up -d` leaves them running.
 //! ponytail: no networks, profiles, env_file,
-//! healthchecks or restart policies; services' ports must not collide (one network for all).
+//! healthchecks or restart policies.
 
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,11 @@ pub fn compose(args: &[String]) -> Result<(), String> {
     match rest {
         [cmd, ..] if cmd == "up" => {
             let mut pids = Vec::new();
+            // Each service's loopback address, 127.128-255.y.(1+its index), from our Windows pid: no
+            // other compose run (nor lx run, 127.1-64) has the same. ponytail: unique while pids stay under 2^17.
+            let v = std::process::id() >> 2;
+            let ips: Map<String, Value> = services.keys().enumerate()
+                .map(|(i, k)| (k.clone(), json!(format!("127.{}.{}.{}", 128 | (v >> 8 & 0x7f), v & 0xff, i + 1)))).collect();
             for svc in &order {
                 let s = &services[svc];
                 let image = match &s["build"] {
@@ -56,9 +61,9 @@ pub fn compose(args: &[String]) -> Result<(), String> {
                     }
                 };
                 let mut c = std::process::Command::new(&lx);
-                c.args(["run", "-d", "--name", &name(svc)]);
-                for other in services.keys() {
-                    c.args(["--add-host", &format!("{other}:127.0.0.1")]);
+                c.args(["run", "-d", "--name", &name(svc), "--ip", ips[svc].as_str().unwrap_or_default()]);
+                for (other, ip) in &ips {
+                    c.args(["--add-host", &format!("{other}:{}", ip.as_str().unwrap_or_default())]);
                 }
                 for p in list(&s["ports"]) {
                     c.args(["-p", &p]);

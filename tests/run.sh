@@ -209,7 +209,7 @@ else
   else
     stuck=0 served=0 runs=5
     for i in $(seq $runs); do
-      $LX run --name "lxnginx-$$" nginx:alpine > "$OUT/nginx" 2>&1 < /dev/null & # named: only ours is stopped
+      $LX run --name "lxnginx-$$" -p 80:80 nginx:alpine > "$OUT/nginx" 2>&1 < /dev/null & # named: only ours is stopped
       for t in $(seq 50); do
         [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1/)" = 200 ] && break
         sleep 0.2
@@ -323,6 +323,15 @@ for _ in $(seq 40); do got=$($LX exec composetest-cache redis-cli -p 6391 get gr
 $LX compose -f $CF down > /dev/null 2>&1
 left=$($LX ps | grep -c composetest)
 if [ "$got" = "hello from app" ] && [ "$left" = 0 ]; then ok "lx compose up/down"; else bad "lx compose: got '$got', $left left"; tail -3 "$OUT/compose"; fi
+
+# Each container has its own loopback address: two can listen on the same unpublished port.
+for n in A B; do $LX run -d --name "lxip$n-$$" busybox sh -c "mkdir /w; echo $n > /w/i; httpd -f -p 8088 -h /w" < /dev/null > /dev/null 2>&1; done
+for _ in $(seq 40); do
+  got=$($LX exec "lxipA-$$" wget -qO- http://127.0.0.1:8088/i 2>/dev/null)$($LX exec "lxipB-$$" wget -qO- http://localhost:8088/i 2>/dev/null)
+  [ "$got" = "AB" ] && break; sleep 0.5
+done
+$LX stop "lxipA-$$" > /dev/null 2>&1; $LX stop "lxipB-$$" > /dev/null 2>&1
+if [ "$got" = "AB" ]; then ok "two containers on the same port"; else bad "two containers on the same port: got '$got'"; fi
 
 # lx compose up in the foreground: prefixed output of every service, back when all have ended.
 expect "lx compose up (foreground)" 0 "b | hi from b" -- compose -f guest/composefg/compose.yaml up
