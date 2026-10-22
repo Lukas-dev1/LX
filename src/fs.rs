@@ -128,6 +128,19 @@ impl EventFd {
         }
     }
 
+    /// For a fork/exec child: "count:semaphore:nonblock".
+    fn export(&self) -> String {
+        let nb = self.nonblock.load(std::sync::atomic::Ordering::Relaxed);
+        format!("{}:{}:{}", *self.count.lock().unwrap(), self.semaphore as u8, nb as u8)
+    }
+
+    fn import(s: &str) -> Option<Self> {
+        let mut f = s.split(':');
+        let count: u64 = f.next()?.parse().ok()?;
+        let (sem, nb) = (f.next()? == "1", f.next()? == "1");
+        Some(EventFd::new(count, if sem { 1 } else { 0 } | if nb { O_NONBLOCK } else { 0 }))
+    }
+
     fn read(&self, buf: u64, len: u64) -> R {
         if len < 8 {
             return Err(EINVAL);
@@ -1097,8 +1110,22 @@ fn entry(fd: &Fd) -> Option<(&'static str, usize, String)> {
         Fd::Socket(k) => ("s", k.s, k.inherit_tag()),
         // An equal epoll over the same fd numbers (Linux shares the instance; see net::epoll_export).
         Fd::Epoll(e) => ("e", 0, crate::net::epoll_export(e)),
-        // ponytail: an eventfd shared across fork isn't carried either; each process starts without it.
-        Fd::Event(_) | Fd::Signal(_) => return None,
+        // An eventfd or signalfd goes over as a copy of its state, not shared (Linux shares it): the fd
+        // number stays taken, or the child's next file would get it and receive the eventfd's writes
+        // (curl's wakeups landed in pacman's download). ponytail: no wakeups across the processes.
+        Fd::Event(e) => ("v", 0, e.export()),
+        Fd::Signal(s) => ("g", 0, format!("{}:{}", s.mask.load(Relaxed), s.nonblock.load(Relaxed) as u8)),
+    })
+}
+
+fn import_counter(kind: &str, extra: &str) -> Option<Fd> {
+    Some(match kind {
+        "v" => Fd::Event(Arc::new(EventFd::import(extra)?)),
+        _ => {
+            let (mask, nb) = extra.split_once(':')?;
+            let s = crate::signal::SignalFd { mask: mask.parse::<u64>().ok()?.into(), nonblock: (nb == "1").into() };
+            Fd::Signal(Arc::new(s))
+        }
     })
 }
 
@@ -1119,6 +1146,7 @@ pub fn import_fd(kind: &str, h: usize, extra: &str, cloexec: bool) -> R {
         "random" => Fd::Dev(Dev::Random),
         "e" => Fd::Epoll(Arc::new(Mutex::new(crate::net::epoll_import(extra)))),
         "s" => Fd::Socket(Arc::new(Sock::inherited(h, extra))),
+        "v" | "g" => import_counter(kind, extra).ok_or(EINVAL)?,
         _ => return Err(EINVAL),
     };
     Ok(add_fd(fd, cloexec))
@@ -1165,6 +1193,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
             "zero" => Fd::Dev(Dev::Zero),
             "random" => Fd::Dev(Dev::Random),
             "e" => Fd::Epoll(Arc::new(Mutex::new(crate::net::epoll_import(path)))),
+            "v" | "g" => import_counter(kind, path).ok_or_else(bad)?,
             "s" => Fd::Socket(socks.entry(h).or_insert_with(|| Arc::new(Sock::inherited(h, path))).clone()),
             _ => return Err(bad()),
         };
