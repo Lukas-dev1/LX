@@ -226,6 +226,8 @@ pub fn pull(r: &Ref) -> Result<PathBuf, String> {
     let config = fetch_blob(&mut reg, &config_digest)?;
     let rootfs = dir.join("rootfs");
     let _ = std::fs::remove_dir_all(&rootfs); // a re-pull starts clean
+    std::fs::create_dir_all(&rootfs).map_err(|e| e.to_string())?;
+    fs::case_sensitive(&rootfs); // a fresh directory of ours, before the first layer: all below inherit it
     for (i, (digest, media)) in layers.iter().enumerate() {
         eprintln!("[lx] layer {}/{}: {}", i + 1, layers.len(), &digest[..19.min(digest.len())]);
         let blob = fetch_blob(&mut reg, digest)?;

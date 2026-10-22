@@ -3126,7 +3126,9 @@ pub fn read_at(fd: u64, dst: &mut [u8], off: u64) -> R {
 /// rootfs or layer before anything is created covers the whole tree. Setting it needs "delete
 /// subfolders and files" on the directory, which a plain Modify grant (the usual one outside the user
 /// profile) lacks; we created the directory, so as its owner we grant ourselves that first.
-/// Best effort: where the volume doesn't support it, names stay case-insensitive (as before).
+/// Only for directories lx itself just created (image rootfs, container layer): never volumes or
+/// other existing folders, since it changes their ACL. Best effort: where the volume doesn't
+/// support it, names stay case-insensitive (as before).
 pub fn case_sensitive(dir: &Path) {
     use std::ffi::c_void;
     use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
@@ -3181,7 +3183,6 @@ pub fn unpack(layer: &Path, dest: &Path) -> Result<(u32, u32), String> {
     let input: Box<dyn Read> = if gz { Box::new(flate2::read::GzDecoder::new(f)) } else { Box::new(f) };
     let mut ar = tar::Archive::new(input);
     fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-    case_sensitive(dest); // before the first entry: everything below inherits it
     let (mut done, mut skipped) = (0, 0);
     let clean = |p: &Path| -> Option<PathBuf> {
         let mut out = PathBuf::new();
