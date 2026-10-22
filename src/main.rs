@@ -125,6 +125,9 @@ pub mod win {
         pub fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
         pub fn SetEvent(ev: isize) -> i32;
         pub fn CancelSynchronousIo(thread: isize) -> i32;
+        pub fn GetConsoleMode(h: isize, mode: *mut u32) -> i32;
+        pub fn SetConsoleMode(h: isize, mode: u32) -> i32;
+        pub fn GetConsoleScreenBufferInfo(h: isize, info: *mut [i16; 11]) -> i32;
         pub fn SetConsoleCtrlHandler(h: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
         pub fn GetCurrentThread() -> isize;
         pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
@@ -396,7 +399,12 @@ fn run() -> Result<(), String> {
         let (mut volumes, mut envs, mut workdir, mut user) = (Vec::new(), Vec::new(), None, None);
         let (mut entrypoint, mut keep_layer, mut name) = (None, None, None);
         let mut extra_hosts: Vec<(String, String)> = Vec::new();
-        while let [flag, value, more @ ..] = rest {
+        while let [flag, more @ ..] = rest {
+            if NO_OP_FLAGS.contains(&flag.as_str()) {
+                rest = more;
+                continue;
+            }
+            let [value, more @ ..] = more else { break };
             match flag.as_str() {
                 // --add-host name:ip, like Docker (lx compose names the other services this way).
                 "--add-host" => {
@@ -497,12 +505,17 @@ fn container(id: &str) -> Result<u32, String> {
     proc::container_pid(id).ok_or(format!("{id}: no such container (see lx ps)"))
 }
 
-/// Where `-d`/`--detach` is among `lx run`'s flags (each of the others takes a value).
+/// `lx run` flags without a value, accepted for Docker's sake: stdin is always attached and containers
+/// are always removed when they exit.
+const NO_OP_FLAGS: [&str; 7] = ["-i", "-t", "-it", "-ti", "--interactive", "--tty", "--rm"];
+
+/// Where `-d`/`--detach` is among `lx run`'s flags (the others take a value, or are NO_OP_FLAGS).
 fn detach_flag(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while let Some(a) = args.get(i) {
         match a.as_str() {
             "-d" | "--detach" => return Some(i),
+            a if NO_OP_FLAGS.contains(&a) => i += 1,
             a if a.starts_with('-') => i += 2,
             _ => return None, // the image
         }
@@ -600,6 +613,7 @@ fn exec(args: &[String]) -> Result<(), String> {
 
 /// Load `cmd` (and its ELF interpreter, or its #! interpreter) and jump into it. Never returns on success.
 fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), String> {
+    fs::console_vt();
     let not_found = |e: i64| format!("{cmd}: {}", if e == syscall::EACCES { "permission denied" } else { "not found in image" });
     let path = env.iter().find_map(|e| e.strip_prefix("PATH=")).unwrap_or(PATH).to_string();
     let (mut exe, mut image) = fs::find_exe(cmd, &path).map_err(not_found)?;

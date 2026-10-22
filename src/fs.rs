@@ -1117,6 +1117,7 @@ fn io_target(fd: u64) -> Result<Io, i64> {
 
 pub fn read(fd: u64, buf: u64, len: u64) -> R {
     match io_target(fd)? {
+        Io::Handle(h) if is_console(h) => read_console(h, buf, len),
         Io::Handle(h) => read_handle(h, buf, len),
         Io::Pipe(p) => p.io(buf, len, false),
         Io::Sock(s) => s.recv(buf, len, 0),
@@ -1237,8 +1238,129 @@ pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
             unsafe { *(arg as *mut i32) = avail as i32 };
             Ok(0)
         }
-        _ => Err(crate::syscall::ENOTTY), // no terminals yet
+        (_, Io::Handle(h)) if is_console(h) => tty_ioctl(h, req, arg),
+        _ => Err(crate::syscall::ENOTTY),
     }
+}
+
+// ---- the console as the container's terminal ----
+// The guest's termios is kept here and mapped onto the console's modes: ICANON is line input, ECHO is
+// echo, ISIG is Ctrl-C as a signal, and raw mode reads VT sequences (arrows, ...) like a Linux tty.
+// ponytail: one termios per lx process (an exec starts from the defaults again), and the console's mode
+// isn't restored if the guest dies in raw mode; no /dev/tty, /dev/pts or ttyname.
+
+const ICRNL: u32 = 0o400;
+const ISIG: u32 = 1;
+const ICANON: u32 = 2;
+const ECHO: u32 = 0o10;
+
+/// struct termios as TCGETS has it: iflag, oflag, cflag, lflag, c_line, c_cc[19]. Starts as a fresh
+/// Linux tty: ICRNL|IXON, OPOST|ONLCR, B38400|CS8|CREAD, ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN.
+static TERMIOS: Mutex<[u32; 9]> = Mutex::new([
+    ICRNL | 0o2000, 0o5, 0o277, 0o105073,
+    // c_line 0; ^C ^\ DEL ^U ^D, VTIME 0, VMIN 1; VSWTC 0, ^Q ^S ^Z, VEOL 0; ^R ^O ^W ^V, VEOL2 0.
+    0x7f1c_0300, 0x0100_0415, 0x1a13_1100, 0x170f_1200, 0x0000_0016,
+]);
+
+/// Let the console interpret the escape sequences a Linux terminal does (colors, cursor moves), on
+/// stdout and stderr; the console keeps this mode for every process of the container.
+pub fn console_vt() {
+    for std in [-11i32, -12] {
+        let (h, mut mode) = (unsafe { crate::win::GetStdHandle(std as u32) }, 0);
+        if unsafe { crate::win::GetConsoleMode(h, &mut mode) } != 0 {
+            unsafe { crate::win::SetConsoleMode(h, mode | 4) }; // ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        }
+    }
+}
+
+fn is_console(h: isize) -> bool {
+    let mut mode = 0;
+    unsafe { crate::win::GetConsoleMode(h, &mut mode) != 0 }
+}
+
+/// This process's termios, with ISIG/ICANON/ECHO as the console has them now: the console's mode is
+/// what the container's processes share (`stty raw` runs in a process of its own).
+fn termios() -> [u32; 9] {
+    let mut t = *TERMIOS.lock().unwrap();
+    let mut mode = 0;
+    if unsafe { crate::win::GetConsoleMode(crate::win::GetStdHandle(-10i32 as u32), &mut mode) } != 0 {
+        t[3] &= !(ISIG | ICANON | ECHO);
+        t[3] |= [(1, ISIG), (2, ICANON), (4, ECHO)].iter().filter(|(m, _)| mode & m != 0).fold(0, |f, (_, b)| f | b);
+    }
+    t
+}
+
+fn tty_ioctl(h: isize, req: u64, arg: u64) -> R {
+    const TCGETS: u64 = 0x5401;
+    const TCSETS: u64 = 0x5402; // TCSETSW and TCSETSF follow: the console has nothing to drain or flush
+    const TIOCSCTTY: u64 = 0x540E;
+    const TIOCGPGRP: u64 = 0x540F;
+    const TIOCSPGRP: u64 = 0x5410;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
+    match req {
+        TCGETS => {
+            unsafe { *(arg as *mut [u32; 9]) = termios() };
+            Ok(0)
+        }
+        TCSETS..=0x5404 => {
+            let t = unsafe { *(arg as *const [u32; 9]) };
+            *TERMIOS.lock().unwrap() = t;
+            let input = unsafe { crate::win::GetStdHandle(-10i32 as u32) };
+            let (lflag, mut mode) = (t[3], 0u32);
+            if lflag & ISIG != 0 {
+                mode |= 1; // ENABLE_PROCESSED_INPUT
+            }
+            if lflag & ICANON != 0 {
+                mode |= 2 | if lflag & ECHO != 0 { 4 } else { 0 }; // ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT
+            } else {
+                mode |= 0x200; // ENABLE_VIRTUAL_TERMINAL_INPUT
+            }
+            if is_console(input) {
+                unsafe { crate::win::SetConsoleMode(input, mode) };
+            }
+            Ok(0)
+        }
+        TIOCGWINSZ => {
+            let mut info = [0i16; 11];
+            let out = [h, unsafe { crate::win::GetStdHandle(-11i32 as u32) }];
+            if !out.iter().any(|&o| unsafe { crate::win::GetConsoleScreenBufferInfo(o, &mut info) } != 0) {
+                info[5..9].copy_from_slice(&[0, 0, 79, 23]); // only an input console: say 80x24
+            }
+            let (rows, cols) = (info[8] - info[6] + 1, info[7] - info[5] + 1); // srWindow
+            unsafe { *(arg as *mut [u16; 4]) = [rows as u16, cols as u16, 0, 0] };
+            Ok(0)
+        }
+        TIOCGPGRP => {
+            unsafe { *(arg as *mut i32) = crate::proc::pid() as i32 };
+            Ok(0)
+        }
+        TIOCSCTTY | TIOCSPGRP | TIOCSWINSZ => Ok(0),
+        _ => Err(EINVAL),
+    }
+}
+
+/// A console read, the way a tty delivers it: with ICRNL, Enter's CR (and the console's CRLF in line
+/// mode) becomes LF; a line holding just ^D is end of file, as on Linux.
+fn read_console(h: isize, buf: u64, len: u64) -> R {
+    let n = read_handle(h, buf, len)? as usize;
+    let data = unsafe { guest_mut(buf, n) };
+    let t = termios();
+    if t[3] & ICANON != 0 && data.first() == Some(&4) {
+        return Ok(0);
+    }
+    if t[0] & ICRNL == 0 {
+        return Ok(n as i64);
+    }
+    let mut out = 0;
+    for i in 0..n {
+        if data[i] == b'\r' && data.get(i + 1) == Some(&b'\n') {
+            continue;
+        }
+        data[out] = if data[i] == b'\r' { b'\n' } else { data[i] };
+        out += 1;
+    }
+    Ok(out as i64)
 }
 
 /// poll/ppoll: pipes are checked with PeekNamedPipe, console input by waiting on it, sockets with
