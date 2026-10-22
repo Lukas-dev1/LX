@@ -648,6 +648,7 @@ fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), Strin
     enter_job()?;
     syscall::install();
     let img = elf::load(&image)?;
+    drop(image); // its segments are copied in; the guest never returns here to free the file's bytes
     // Dynamically linked: the kernel's job is to map ld.so too and start there; ld.so maps the rest via mmap.
     let (entry, interp_base) = match &img.interp {
         Some(ld) => {
