@@ -376,10 +376,22 @@ fn is_loopback(a: &[u8]) -> bool {
 fn bind_addr(s: usize, a: &mut [u8]) {
     let Some(ports) = published() else { return };
     let port = port_of(a);
-    if port == 0 || a.len() < 8 {
-        return; // ephemeral ports are nobody's business
+    if a.len() < 8 {
+        return;
     }
     let fam = u16::from_le_bytes([a[0], a[1]]);
+    if port == 0 {
+        // An ephemeral port on loopback (a test server on 127.0.0.1:0) is where the container's clients of
+        // 127.0.0.1 go: its own address. One on any address is usually a client's, which must keep
+        // reaching other hosts: left alone.
+        let Some(ip) = own_ip() else { return };
+        if fam == AF_INET && a[4..8] == [127, 0, 0, 1] {
+            a[4..8].copy_from_slice(&ip);
+        } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == LOOPBACK6 && !v6only(s) {
+            a[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
+        }
+        return;
+    }
     let udp = is_udp(s);
     if let Some(m) = ports.iter().find(|m| m.udp == udp && m.container == port) {
         set_port(a, m.host);
