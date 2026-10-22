@@ -114,7 +114,15 @@ pub fn raise(sig: u64) -> R {
     if sig == 0 || sig > 64 {
         return Err(EINVAL);
     }
-    S.lock().unwrap().pending |= bit(sig);
+    let mut s = S.lock().unwrap();
+    // An ignored signal (SIG_IGN, or a default action of "ignore" like SIGCHLD's) that isn't blocked is
+    // discarded when it's sent, as on Linux: left pending it would make the next wait4 return EINTR.
+    let handler = s.actions[sig as usize].handler;
+    let blocked = MAIN_MASK.load(std::sync::atomic::Ordering::Relaxed) & bit(sig) != 0;
+    if !blocked && (handler == 1 || (handler == 0 && default_ignores(sig))) {
+        return Ok(0);
+    }
+    s.pending |= bit(sig);
     Ok(0)
 }
 
@@ -314,7 +322,7 @@ fn arrive(sig: u64) {
         return;
     }
     if sig == 9 {
-        proc::exit(128 + 9); // SIGKILL can't be caught
+        proc::die(9); // SIGKILL can't be caught
     }
     let _ = raise(sig);
     // Default action "terminate" needs no guest cooperation: do it now, even if the guest is spinning.
@@ -324,7 +332,7 @@ fn arrive(sig: u64) {
         s.pending & !blocked & bit(sig) != 0 && s.actions[sig as usize].handler == 0 && !default_ignores(sig)
     };
     if fatal {
-        proc::exit(128 + sig);
+        proc::die(sig);
     }
     unsafe {
         crate::win::SetEvent(INTR.load(SeqCst));
@@ -506,7 +514,7 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
             0 if default_ignores(sig) => continue,
             0 => {
                 drop(s);
-                proc::exit(128 + sig); // default action: terminate, reported like a shell would
+                proc::die(sig); // default action: terminate (wait4 sees WIFSIGNALED)
             }
             1 => continue, // SIG_IGN
             _ => {
