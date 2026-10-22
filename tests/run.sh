@@ -96,6 +96,8 @@ expect "debian: python3 -c"         0 "hi"               -- run python:3.12 pyth
 expect "debian: python3 /script.py" 0 "script ran: 3.12" -- run -v "$GUEST" python:3.12 python3 /t/hello.py
 expect "debian: AF_UNIX echo (path + abstract)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/unixtest.py
 expect "debian: pty (openpty, pty.fork)" 0 "pty OK" -- run -v "$GUEST" python:3.12 python3 /t/ptytest.py
+expect "FIFOs: mkfifo, open waits, ENXIO, poll" 0 "fifo OK 0o600 through the fifo" -- run -v "$GUEST" python:3.12 python3 /t/fifotest.py
+expect "FIFOs in a shell loop" 0 "got round 2" -- run alpine sh -c 'mkfifo /tmp/p; for i in 1 2; do (echo round $i > /tmp/p &); read line < /tmp/p; echo "got $line"; done'
 expect "run -it --rm (Docker's no-op flags)" 0 "1 /tmp"     -- run -it -e A=1 --rm -w /tmp alpine sh -c 'echo $A $(pwd)'
 expect "AF_UNIX datagrams"         0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/dgramtest.py
 expect "debian: AF_UNIX datagrams" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/dgramtest.py
