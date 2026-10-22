@@ -1132,6 +1132,7 @@ pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
     const FIOASYNC: u64 = 0x5452;
+    let req = req as u32 as u64; // an int: musl sign-extends requests with the top bit set (TIOCGPTN)
     if req == FIOCLEX || req == FIONCLEX {
         return fcntl(fd, 2, (req == FIOCLEX) as u64); // F_SETFD
     }
