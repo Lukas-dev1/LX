@@ -145,6 +145,9 @@ expect "volume: run 2 reads + appends" 0 "run1" -- run -v "$VOL:/data" alpine sh
 expect "volume: run 3 sees both runs" 0 "run1 run2" -- run -v "$VOL:/data" alpine sh -c 'tr "\n" " " < /data/log'
 [ "$(cat rootfs/voltest-suite/log 2>/dev/null | tr '\n' ' ')" = "run1 run2 " ] && ok "volume: host sees the data" || bad "volume: host sees the data"
 expect "volume: read-only"      0 "Read-only file system" -- run -v "$VOL:/data:ro" alpine sh -c 'echo x > /data/new; cat /data/log >/dev/null'
+# A named volume (lx's folder under rootfs/volumes, as lx compose makes) keeps Linux modes and owners.
+rm -rf rootfs/volumes/lxtest-named; mkdir -p rootfs/volumes/lxtest-named
+expect "named volume: modes kept" 0 "600 1:2" -- run -v "$ROOT/rootfs/volumes/lxtest-named:/data" alpine sh -c 'touch /data/f; chmod 600 /data/f; chown 1:2 /data/f; stat -c "%a %u:%g" /data/f'
 expect "container layer: changes stay in the run" 0 "done" -- run alpine sh -c 'rm -f /etc/motd; echo x > /etc/new; echo done'
 expect "container layer: next run starts pristine" 0 "pristine" -- run alpine sh -c '[ -f /etc/motd ] && [ ! -e /etc/new ] && echo pristine'
 [ "$before" = "$(img_sum)" ] && ok "image store unchanged by containers" || bad "image store unchanged by containers"
