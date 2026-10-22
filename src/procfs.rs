@@ -32,6 +32,7 @@ Pss: {:>16} kB
         "/proc/sys/kernel/osrelease" => "6.6.0-lx\n".into(),
         "/proc/sys/kernel/pid_max" => "4194304\n".into(),
         "/proc/sys/kernel/threads-max" => "1000000\n".into(),
+        "/proc/sys/kernel/cap_last_cap" => "40\n".into(), // CAP_CHECKPOINT_RESTORE, as prctl(PR_CAPBSET_READ) agrees
         "/proc/sys/vm/overcommit_memory" => "1\n".into(), // NT commits on mmap; don't make redis warn
         "/proc/sys/vm/max_map_count" => "1048576\n".into(),
         "/proc/sys/net/core/somaxconn" => "4096\n".into(),
