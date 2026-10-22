@@ -7,6 +7,12 @@ pub fn file(guest: &str) -> Option<String> {
     if let Some(rest) = self_rest(guest) {
         return match rest {
             "cgroup" => Some("0::/\n".into()), // cgroup v2, the container's root, like Docker
+            "statm" => Some(statm()),
+            "status" => Some(status()),
+            "smaps_rollup" => Some({ let (_, rss) = mem(); format!("00000000-ffffffff ---p 00000000 00:00 0 [rollup]
+Rss: {:>16} kB
+Pss: {:>16} kB
+", rss >> 10, rss >> 10) }),
             "mounts" => Some(mounts()),
             "mountinfo" => Some(MOUNTINFO.into()),
             _ => None,
@@ -93,3 +99,37 @@ fn cpuinfo() -> String {
 
 const MOUNTINFO: &str = "1 0 0:1 / / rw,relatime - overlay overlay rw\n2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n\
     3 1 0:3 / /dev rw,nosuid - tmpfs tmpfs rw\n4 3 0:4 / /dev/shm rw,nosuid,nodev,noexec - tmpfs shm rw\n";
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn K32GetProcessMemoryInfo(process: isize, counters: *mut [u64; 10], cb: u32) -> i32;
+}
+
+/// (virtual = committed bytes, resident = working set) of this process.
+fn mem() -> (u64, u64) {
+    // PROCESS_MEMORY_COUNTERS_EX: cb + PageFaultCount (u32 x2), then PeakWorkingSetSize, WorkingSetSize, quota
+    // fields x4, PagefileUsage, PeakPagefileUsage, PrivateUsage.
+    let mut c = [0u64; 10];
+    c[0] = 80;
+    unsafe { K32GetProcessMemoryInfo(crate::win::GetCurrentProcess(), &mut c, 80) };
+    (c[9].max(c[7]), c[2])
+}
+
+/// /proc/self/statm in pages: size resident shared text lib data dt (RabbitMQ's memory monitor).
+fn statm() -> String {
+    let (vsz, rss) = mem();
+    format!("{} {} 0 0 0 {} 0\n", vsz / 4096, rss / 4096, vsz / 4096)
+}
+
+/// /proc/self/status: the fields programs parse (ids, threads, memory).
+fn status() -> String {
+    let (vsz, rss) = mem();
+    let pid = crate::proc::pid();
+    let ppid = crate::proc::getppid().unwrap_or(0);
+    let name = crate::fs::exe_name();
+    let (uid, gid) = (crate::proc::UID.load(std::sync::atomic::Ordering::Relaxed), crate::proc::GID.load(std::sync::atomic::Ordering::Relaxed));
+    format!("Name:\t{name}\nUmask:\t0022\nState:\tR (running)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\n\
+             Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n\
+             SigBlk:\t0000000000000000\nCpus_allowed_list:\t0-{}\n",
+            vsz >> 10, rss >> 10, crate::thread::live(), std::thread::available_parallelism().map_or(1, |n| n.get()) - 1)
+}

@@ -2020,6 +2020,11 @@ pub fn faccessat(dirfd: u64, path: u64) -> R {
 /// The guest path of the running ELF, for /proc/self/exe (ld.so resolves $ORIGIN with it).
 static EXE: Mutex<String> = Mutex::new(String::new());
 
+/// The running program's file name, for /proc/self/status.
+pub fn exe_name() -> String {
+    EXE.lock().unwrap().rsplit('/').next().unwrap_or("").chars().take(15).collect()
+}
+
 pub fn set_exe(guest: &str) {
     *EXE.lock().unwrap() = guest.to_string();
 }

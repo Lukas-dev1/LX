@@ -228,3 +228,8 @@ pub fn sched_yield() -> R {
     unsafe { SwitchToThread() };
     Ok(0)
 }
+
+/// Running guest threads (for /proc/self/status).
+pub fn live() -> u64 {
+    LIVE.load(Relaxed)
+}
