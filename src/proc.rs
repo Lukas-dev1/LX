@@ -445,6 +445,7 @@ pub fn new_layer() -> std::io::Result<std::path::PathBuf> {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let dir = std::path::Path::new(LAYERS).join(format!("{}-{nanos}", unsafe { GetCurrentProcessId() }));
     std::fs::create_dir_all(dir.join("upper"))?;
+    fs::case_sensitive(&dir.join("upper")); // the container's own files: case-sensitive like the image
     let dir = std::fs::canonicalize(dir)?; // same verbatim form as the image root
     *LAYER.lock().unwrap() = Some(dir.clone());
     Ok(dir)
