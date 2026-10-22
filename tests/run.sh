@@ -95,6 +95,7 @@ expect "dlopen while threads run" 0 " OK"                -- rootfs/alpine /dltes
 expect "debian: python3 -c"         0 "hi"               -- run python:3.12 python3 -c "print('hi')"
 expect "debian: python3 /script.py" 0 "script ran: 3.12" -- run -v "$GUEST" python:3.12 python3 /t/hello.py
 expect "debian: AF_UNIX echo (path + abstract)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/unixtest.py
+expect "run -it --rm (Docker's no-op flags)" 0 "1 /tmp"     -- run -it -e A=1 --rm -w /tmp alpine sh -c 'echo $A $(pwd)'
 expect "AF_UNIX datagrams"         0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/dgramtest.py
 expect "debian: AF_UNIX datagrams" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/dgramtest.py
 expect "socketpair (stream, dgram, fork, mp.Pipe)" 0 "OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/pairtest.py
