@@ -31,4 +31,15 @@ os.write(w, b"x")
 ready = p.poll(1000)
 assert quiet == [] and ready and ready[0][1] & select.POLLIN, (quiet, ready)
 assert os.read(r, 10) == b"x"
+# s6-svscan's control FIFO: the reader holds a writer of its own, and others still get in, one by one.
+os.mkfifo("/tmp/ctl")
+r = os.open("/tmp/ctl", os.O_RDONLY | os.O_NONBLOCK)
+keep = os.open("/tmp/ctl", os.O_WRONLY)
+for i in range(3):
+    w = os.open("/tmp/ctl", os.O_WRONLY | os.O_NONBLOCK)
+    os.write(w, str(i).encode())
+    os.close(w)
+time.sleep(0.3)
+got = os.read(r, 10)
+assert sorted(got) == sorted(b"012"), got
 print("fifo OK", oct(stat.S_IMODE(st.st_mode)), data.decode())
