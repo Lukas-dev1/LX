@@ -439,7 +439,7 @@ pub fn release_guest_memory() {
         if (base..base + len).contains(&lo) {
             return true;
         }
-        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        release_span(base, len); // a shared image (map_image) is several allocations
         false
     });
     CODE.lock().unwrap().regions.clear(); // nothing of the old program runs any more
