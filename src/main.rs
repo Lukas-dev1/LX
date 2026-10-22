@@ -514,7 +514,7 @@ fn exec(args: &[String]) -> Result<(), String> {
             return Err(format!("container {pid}: can't join its job ({})", win::GetLastError()));
         }
         win::CloseHandle(job); // kill-on-close fires when the container's own handle goes: ours mustn't hold it open
-        env::set_var("LX_IN_JOB", "1");
+        env::set_var("LX_IN_JOB", pid.to_string()); // the container's first lx, as enter_job records it
         env::set_var("LX_PORTS", cfg["ports"].as_str().unwrap_or(""));
     }
     let mut envv: Vec<String> = cfg["env"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(String::from)).collect();
