@@ -42,4 +42,12 @@ for i in range(3):
 time.sleep(0.3)
 got = os.read(r, 10)
 assert sorted(got) == sorted(b"012"), got
+# s6's ftrig: a FIFO made under a temporary name, opened, then renamed into place; writers use the new name.
+os.mkfifo("/tmp/ev.tmp")
+r = os.open("/tmp/ev.tmp", os.O_RDONLY | os.O_NONBLOCK)
+os.rename("/tmp/ev.tmp", "/tmp/ev")
+w = os.open("/tmp/ev", os.O_WRONLY | os.O_NONBLOCK)
+os.write(w, b"s")
+time.sleep(0.2)
+assert os.read(r, 10) == b"s" and stat.S_ISFIFO(os.stat("/tmp/ev").st_mode)
 print("fifo OK", oct(stat.S_IMODE(st.st_mode)), data.decode())
