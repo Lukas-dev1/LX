@@ -589,9 +589,17 @@ fn cached<T: Clone>(facts: &FileFacts<T>, host: &Path, stamp: u64, learn: impl F
     v
 }
 
+/// Through a temporary renamed into place: a process resolving the link meanwhile must not find it empty or
+/// half written (s6-rc links services in while s6-svscan's new s6-supervise chdirs into them). The
+/// temporary's name reads as a whiteout, which directory listings skip.
 fn write_link(host: &Path, target: &str) -> io::Result<()> {
+    static N: AtomicU32 = AtomicU32::new(0);
     forget(&LINKS, host);
-    fs::write(host, [LINK_MAGIC, target.as_bytes()].concat())
+    let tmp = host.with_file_name(format!("{WHITEOUT}lxlink-{}-{}", std::process::id(), N.fetch_add(1, Relaxed)));
+    fs::write(&tmp, [LINK_MAGIC, target.as_bytes()].concat())?;
+    fs::rename(&tmp, host).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 fn ino(host: &Path) -> u64 {
