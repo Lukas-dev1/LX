@@ -9,6 +9,7 @@ mod inotify;
 mod net;
 mod proc;
 mod procfs;
+mod ptable;
 mod seccomp;
 mod signal;
 mod syscall;
@@ -653,6 +654,7 @@ fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), Strin
     syscall::install();
     let img = elf::load(&image, fs::host_of(&exe).as_deref())?;
     drop(image); // its segments are copied in; the guest never returns here to free the file's bytes
+    ptable::register(&exe, &argv); // for ps and /proc/<pid> in the container's other processes
     // Dynamically linked: the kernel's job is to map ld.so too and start there; ld.so maps the rest via mmap.
     let (entry, interp_base) = match &img.interp {
         Some(ld) => {

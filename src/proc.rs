@@ -226,6 +226,7 @@ pub fn receive_fork(state: &str, parent: &str, ready: &str) -> Result<([u64; 18]
     let [regs @ .., ppid] = nums.as_slice() else { return Err("malformed fork state".into()) };
     let regs: [u64; 18] = regs.try_into().map_err(|_| "malformed fork state")?;
     PARENT.store(*ppid as u32, Relaxed);
+    crate::ptable::fork_child();
     let ready: usize = ready.parse().map_err(|_| "bad ready handle")?;
     if unsafe { std::fs::File::from_raw_handle(ready as _) }.write_all(b"1").is_err() {
         // The parent is gone (its container is being stopped): there's no fork to finish, nor anyone to tell.
@@ -482,6 +483,7 @@ pub fn ps() -> Vec<(u32, String)> {
 
 /// Exit immediately, without DLL teardown: the guest owns the process; nothing of ours needs flushing.
 pub fn exit(code: u64) -> ! {
+    crate::ptable::unregister();
     if crate::syscall::patchlog() {
         use std::sync::atomic::Ordering::Relaxed;
         crate::syscall::dlog(format_args!(
