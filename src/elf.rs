@@ -31,7 +31,8 @@ fn u64_(f: &[u8], o: u64) -> Result<u64, String> { Ok(u64::from_le_bytes(rd(f, o
 
 struct Seg { flags: u32, off: u64, vaddr: u64, filesz: u64, memsz: u64 }
 
-pub fn load(f: &[u8]) -> Result<Image, String> {
+/// `host`: the file on disk, so its segments can be shared copy-on-write views (see syscall::map_image).
+pub fn load(f: &[u8], host: Option<&std::path::Path>) -> Result<Image, String> {
     if f.get(..4) != Some(b"\x7fELF") || f.get(4) != Some(&2) || f.get(5) != Some(&1) {
         return Err("not a 64-bit little-endian ELF".into());
     }
@@ -71,14 +72,23 @@ pub fn load(f: &[u8]) -> Result<Image, String> {
     let lo = segs.iter().map(|s| s.vaddr).min().unwrap() & !0xffff;
     let hi = segs.iter().map(|s| s.vaddr + s.memsz).max().unwrap().next_multiple_of(PAGE);
     let want = (ty == 2).then_some(lo); // ET_EXEC at its link address; ET_DYN (PIE, ld.so) anywhere
-    let base = crate::syscall::alloc(want, hi - lo)
-        .ok_or_else(|| format!("cannot map image at {lo:#x}..{hi:#x} (address in use?)"))?;
+    // Shared with every other process running this file (copy-on-write views), else a private copy.
+    let image_segs: Vec<crate::syscall::ImageSeg> = segs.iter()
+        .map(|s| crate::syscall::ImageSeg { off: s.off, addr: s.vaddr, filesz: s.filesz, memsz: s.memsz }).collect();
+    let shared = host.and_then(|h| crate::syscall::map_image(h, &image_segs, want.is_some(), lo, hi));
+    let base = match shared {
+        Some(b) => b,
+        None => crate::syscall::alloc(want, hi - lo)
+            .ok_or_else(|| format!("cannot map image at {lo:#x}..{hi:#x} (address in use?)"))?,
+    };
     let bias = base - lo;
 
     let mut sites = 0;
     for s in &segs {
         let dst = (s.vaddr + bias) as *mut u8;
-        unsafe { ptr::copy_nonoverlapping(f.as_ptr().add(s.off as usize), dst, s.filesz as usize) };
+        if shared.is_none() {
+            unsafe { ptr::copy_nonoverlapping(f.as_ptr().add(s.off as usize), dst, s.filesz as usize) };
+        }
         if s.flags & 1 != 0 {
             let mut read = |off: u64, buf: &mut [u8]| {
                 let o = off as usize;
@@ -99,9 +109,21 @@ pub fn load(f: &[u8]) -> Result<Image, String> {
         // ponytail: segments sharing a page get the later segment's protection; union them if a binary needs it.
         let start = (s.vaddr + bias) & !(PAGE - 1);
         let end = (s.vaddr + bias + s.memsz).next_multiple_of(PAGE);
-        let mut old = 0;
-        if unsafe { VirtualProtect(start as *mut _, (end - start) as usize, prot, &mut old) } == 0 {
-            return Err(format!("VirtualProtect {start:#x} failed"));
+        // Region by region: a shared image's segment is a file view plus anonymous bss, two allocations
+        // one VirtualProtect can't span. A copy-on-write view takes writable as WRITECOPY (0x08 / 0x80).
+        let mut p = start;
+        while p < end {
+            let mut m = MemoryBasicInformation::default();
+            if unsafe { VirtualQuery(p as *const _, &mut m, std::mem::size_of::<MemoryBasicInformation>()) } == 0 {
+                return Err(format!("VirtualQuery {p:#x} failed"));
+            }
+            let n = (m.base as u64 + m.region_size as u64).min(end) - p;
+            let mut old = 0;
+            let mut set = |pr: u32| unsafe { VirtualProtect(p as *mut _, n as usize, pr, &mut old) } != 0;
+            if !set(prot) && !(matches!(prot, 0x04 | 0x40) && set(prot * 2)) {
+                return Err(format!("VirtualProtect {p:#x}+{n:#x} failed"));
+            }
+            p += n;
         }
     }
 

@@ -439,7 +439,7 @@ pub fn release_guest_memory() {
         if (base..base + len).contains(&lo) {
             return true;
         }
-        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        release_span(base, len); // a shared image (map_image) is several allocations
         false
     });
     CODE.lock().unwrap().regions.clear(); // nothing of the old program runs any more
@@ -1226,7 +1226,11 @@ fn protect(addr: u64, len: u64, prot: u32) -> bool {
     each_region(addr, len, |p, n, state| {
         let mut old = 0;
         match state {
-            MEM_COMMIT => unsafe { VirtualProtect(p as *mut _, n as usize, prot, &mut old) != 0 },
+            MEM_COMMIT => unsafe {
+                // A copy-on-write file view (map_image) takes writable as WRITECOPY, not READWRITE.
+                VirtualProtect(p as *mut _, n as usize, prot, &mut old) != 0
+                    || matches!(prot, 0x04 | 0x40) && VirtualProtect(p as *mut _, n as usize, prot * 2, &mut old) != 0
+            },
             _ if prot == 0x01 => true, // reserved and staying inaccessible
             _ => unsafe { !VirtualAlloc(p as *mut _, n as usize, MEM_COMMIT, prot).is_null() },
         }
@@ -1252,7 +1256,19 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     if flags & MAP_SHARED != 0 && !reserve_only {
         return mmap_shared(addr, len, prot, flags & MAP_FIXED != 0, (flags & MAP_ANONYMOUS == 0).then_some(fd), off);
     }
-    let p = if flags & MAP_FIXED != 0 {
+    // Private file mappings share the file's pages copy-on-write where they can (see mmap_cow);
+    // a MAP_FIXED first cuts any copy-on-write view out of its way.
+    let fixed = flags & MAP_FIXED != 0;
+    let holes = if fixed { punch_views(addr, len) } else { Vec::new() };
+    let cow = if flags & MAP_ANONYMOUS == 0 { mmap_cow(addr, len, prot, fixed, fd, off, &holes) } else { None };
+    if cow.is_none() {
+        for &(a, n) in &holes {
+            place_plain(a, n, false); // ordinary reserved memory for the paths below
+        }
+    }
+    let p = if let Some(c) = cow {
+        c
+    } else if fixed {
         // Inside our reservations (ld.so carving up a library span, Go committing arena chunks): replace the
         // contents with fresh zero pages; elsewhere, a new reservation at exactly that address.
         if decommit(addr, len) {
@@ -1271,8 +1287,8 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     if reserve_only {
         return Ok(p as i64);
     }
-    if flags & MAP_ANONYMOUS == 0 {
-        // ponytail: file mappings are private copies; MAP_SHARED writes never reach the file.
+    if flags & MAP_ANONYMOUS == 0 && cow.is_none() {
+        // Not shareable (unaligned offset, odd placement): a private copy of the file's bytes.
         fs::read_at(fd, unsafe { guest_mut(p, len as usize) }, off)?;
     }
     if prot & 4 != 0 {
@@ -1447,6 +1463,7 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> R {
         protect(addr, len, 0x40);
         patch_code(addr, len as usize);
     }
+    mark_views(addr, len, prot & 2 != 0, prot & 4 != 0);
     if protect(addr, len, page_prot(prot)) { Ok(0) } else { Err(ENOMEM) }
 }
 
@@ -1581,6 +1598,9 @@ fn munmap(addr: u64, len: u64, rsp: u64) -> R {
     }
     if unmap_views(addr, len) {
         return Ok(0);
+    }
+    for (a, n) in punch_views(addr, len) {
+        place_plain(a, n, false); // a copy-on-write view's pages go; the address range stays reserved
     }
     // ponytail: decommit only; the address space stays reserved (and leaks) until exit.
     decommit(addr, len);
@@ -1835,4 +1855,358 @@ pub fn fp_area(c: &mut Context) -> &'static mut [u8] {
         // CONTEXT.FltSave (XSAVE_FORMAT) right after rip; only the trap path has a whole CONTEXT.
         unsafe { std::slice::from_raw_parts_mut((c as *mut Context as *mut u8).add(0x100), 512) }
     }
+}
+
+// ---- program images as shared copy-on-write file views ----
+//
+// Linux shares a program's pages between every process running it (page cache); copying the file in
+// gave each process its own full copy (Grafana's ~20 Go plugin processes: tens of MB each). Here a
+// placeholder reserves the image's span, and each PT_LOAD becomes a copy-on-write view of the file at
+// its exact 4K address and offset (placeholders allow 4K granularity where plain views need 64K);
+// bss becomes anonymous memory and gaps plain reservations, so the rest of lx sees ordinary regions.
+// Patching syscall sites then privatizes only the pages it writes.
+
+#[link(name = "kernelbase", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn VirtualAlloc2(process: isize, addr: *mut std::ffi::c_void, size: usize, ty: u32, prot: u32,
+                     params: *mut std::ffi::c_void, count: u32) -> *mut std::ffi::c_void;
+    fn MapViewOfFile3(section: isize, process: isize, addr: *mut std::ffi::c_void, offset: u64, size: usize,
+                      ty: u32, prot: u32, params: *mut std::ffi::c_void, count: u32) -> *mut std::ffi::c_void;
+    fn UnmapViewOfFile2(process: isize, base: *mut std::ffi::c_void, flags: u32) -> i32;
+}
+const MEM_RESERVE_PLACEHOLDER: u32 = 0x40000;
+const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+
+/// One PT_LOAD of an image: file offset, absolute address (bias applied), sizes.
+pub struct ImageSeg {
+    pub off: u64,
+    pub addr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+}
+
+/// Map `segs` of the file at `host` over [lo, hi) (64K-aligned lo; `fixed`: exactly there, else in the
+/// guest window) as copy-on-write views. Returns the base, or None to fall back to copying (a layout
+/// where segments share a page, or the file can't be mapped): checked before anything is mapped.
+pub fn map_image(host: &std::path::Path, segs: &[ImageSeg], fixed: bool, lo: u64, hi: u64) -> Option<u64> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    if std::env::var_os("LX_NOCOW").is_some() {
+        return None;
+    }
+    // Each segment's pages must be its own: no two segments in one page (older layouts do that).
+    let page = |a: u64| a & !(PAGE - 1);
+    let mut order: Vec<&ImageSeg> = segs.iter().collect();
+    order.sort_by_key(|s| s.addr);
+    for w in order.windows(2) {
+        if (w[0].addr + w[0].memsz).next_multiple_of(PAGE) > page(w[1].addr) {
+            return None;
+        }
+    }
+    let f = std::fs::OpenOptions::new().read(true).access_mode(0x8000_0000 | 0x2000_0000).open(host).ok()?; // GENERIC_READ | GENERIC_EXECUTE
+    let fsize = f.metadata().ok()?.len();
+    let section = unsafe { CreateFileMappingW(f.as_raw_handle() as isize, std::ptr::null_mut(), PAGE_EXECUTE_WRITECOPY, 0, 0, std::ptr::null()) };
+    if section == 0 {
+        return None;
+    }
+    let len = hi - lo;
+    let reserve = |a: u64| unsafe {
+        VirtualAlloc2(0, a as *mut _, len as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0)
+    } as u64;
+    let base = if fixed {
+        Some(lo).filter(|&a| reserve(a) == a)
+    } else {
+        loop {
+            let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
+            if a + len > WINDOW.1 {
+                break None;
+            }
+            if reserve(a) == a {
+                break Some(a);
+            }
+        }
+    };
+    let Some(base) = base else {
+        unsafe { CloseHandle(section) };
+        return None;
+    };
+    let bias = base - lo;
+    let me = unsafe { GetCurrentProcess() };
+    // Carve [a, a+n) out of the placeholder that starts at `cursor` (it runs to the span's end).
+    let carve = |cursor: u64, a: u64, n: u64| unsafe {
+        if a > cursor {
+            VirtualFree(cursor as *mut _, (a - cursor) as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        }
+        if a + n < base + len {
+            VirtualFree(a as *mut _, n as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        }
+    };
+    let plain = |a: u64, n: u64, commit: bool| unsafe {
+        let ty = MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | if commit { MEM_COMMIT } else { 0 };
+        !VirtualAlloc2(0, a as *mut _, n as usize, ty, if commit { PAGE_READWRITE } else { 0x01 }, std::ptr::null_mut(), 0).is_null()
+    };
+    let mut cursor = base;
+    let mut ok = true;
+    for s in order {
+        let (v0, v1) = (page(s.addr + bias), (s.addr + bias + s.filesz).next_multiple_of(PAGE));
+        let mem_end = (s.addr + bias + s.memsz).next_multiple_of(PAGE);
+        if v0 > cursor {
+            carve(cursor, v0, 0); // the gap before: back to an ordinary reservation below
+            ok &= plain(cursor, v0 - cursor, false);
+            cursor = v0;
+        }
+        if v1 > v0 {
+            carve(cursor, v0, v1 - v0);
+            let v = unsafe {
+                // Not past the file's end (the rest of that last page reads as zero).
+                MapViewOfFile3(section, me, v0 as *mut _, page(s.off), (v1 - v0).min(fsize - page(s.off)) as usize, MEM_REPLACE_PLACEHOLDER,
+                               PAGE_EXECUTE_WRITECOPY, std::ptr::null_mut(), 0)
+            } as u64;
+            ok &= v == v0;
+            // A segment with bss: zero the rest of its last file page, to the page's end, as Linux's
+            // loader does (glibc's ld.so hands that memory out as zeroed malloc memory). Without bss the
+            // page keeps the file's bytes, as on Linux. Copy-on-write privatizes just that page.
+            let tail = s.addr + bias + s.filesz;
+            if ok && tail < v1 && s.memsz > s.filesz {
+                unsafe { std::ptr::write_bytes(tail as *mut u8, 0, (v1 - tail) as usize) };
+            }
+            cursor = v1;
+        }
+        if mem_end > cursor {
+            carve(cursor, cursor, mem_end - cursor);
+            ok &= plain(cursor, mem_end - cursor, true); // bss: fresh zero pages
+            cursor = mem_end;
+        }
+    }
+    if cursor < base + len {
+        ok &= plain(cursor, base + len - cursor, false);
+    }
+    unsafe { CloseHandle(section) }; // the views keep it alive
+    if !ok {
+        release_span(base, len);
+        return None;
+    }
+    ALLOCS.lock().unwrap().push((base, len));
+    if debug() {
+        dlog(format_args!("map_image {} at {base:#x}+{len:#x}", host.display()));
+    }
+    Some(base)
+}
+
+/// Free [base, base+len) region by region: views are unmapped, anonymous pieces released. A span from
+/// map_image is several allocations, not one.
+fn release_span(base: u64, len: u64) {
+    let mut p = base;
+    while p < base + len {
+        let mut m = MemoryBasicInformation::default();
+        if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 {
+            break;
+        }
+        let end = m.base as u64 + m.region_size as u64;
+        unsafe {
+            const MEM_MAPPED: u32 = 0x40000;
+            if m.state != MEM_FREE {
+                if m.ty == MEM_MAPPED {
+                    UnmapViewOfFile(m.allocation_base as *mut _);
+                } else {
+                    VirtualFree(m.allocation_base as *mut _, 0, MEM_RELEASE);
+                }
+            }
+        }
+        p = end.max(p + PAGE);
+    }
+}
+
+// ---- private file mmaps as copy-on-write views (ld.so mapping shared libraries) ----
+//
+// ld.so maps a library's whole span from the file, then MAP_FIXEDs segments over parts of it at other
+// offsets and anonymous bss over the rest. A view can't be partly replaced, so a MAP_FIXED over one
+// turns it back into a placeholder, maps its untouched parts again from the file (re-patching code
+// parts, which is deterministic), and leaves a placeholder hole for the new mapping. A view the guest
+// made writable is turned into private memory first, so its changes survive.
+
+struct CowView {
+    base: u64,
+    len: u64,
+    section: isize, // kept open for re-mapping parts; ponytail: never closed
+    off: u64,
+    fsize: u64,     // the file's size: a view may not reach past its end
+    exec: bool,     // syscall sites were patched in (re-done after a re-map)
+    written: bool,  // the guest may have changed it: never re-mapped from the file
+}
+static COW_VIEWS: Mutex<Vec<CowView>> = Mutex::new(Vec::new());
+
+/// A copy-on-write, executable-capable section of fd's file and its size.
+fn file_section(fd: u64) -> Option<(isize, u64)> {
+    let (h, size) = fs::file_handle(fd).ok()?;
+    let h2 = unsafe { ReOpenFile(h, 0x8000_0000 | 0x2000_0000, 7, 0) }; // GENERIC_READ | GENERIC_EXECUTE
+    if h2 == -1 || h2 == 0 {
+        return None;
+    }
+    let s = unsafe { CreateFileMappingW(h2, std::ptr::null_mut(), PAGE_EXECUTE_WRITECOPY, 0, 0, std::ptr::null()) };
+    unsafe { CloseHandle(h2) };
+    (s != 0).then_some((s, size))
+}
+
+/// Split the placeholder containing [a, a+n) so that range is a placeholder of its own.
+fn carve(a: u64, n: u64) {
+    let mut m = MemoryBasicInformation::default();
+    unsafe { VirtualQuery(a as *const _, &mut m, size_of::<MemoryBasicInformation>()) };
+    let (p0, p1) = (m.allocation_base as u64, m.base as u64 + m.region_size as u64);
+    unsafe {
+        if a > p0 {
+            VirtualFree(p0 as *mut _, (a - p0) as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        }
+        if a + n < p1 {
+            VirtualFree(a as *mut _, n as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        }
+    }
+}
+
+/// Map n bytes (page-rounded hole) of the file at `off` into the placeholder at `a`; a view may not reach past
+/// the file's end, so it covers min(n, fsize - off) bytes and the rest of that page reads as zero, as on Linux.
+fn place_view(section: isize, a: u64, off: u64, n: u64, fsize: u64) -> bool {
+    carve(a, n);
+    let me = unsafe { GetCurrentProcess() };
+    let bytes = n.min(fsize.saturating_sub(off));
+    (unsafe { MapViewOfFile3(section, me, a as *mut _, off, bytes as usize, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_WRITECOPY, std::ptr::null_mut(), 0) }) as u64 == a
+}
+
+/// Fill the placeholder [a, a+n) with ordinary memory: committed zero pages, or reserved only.
+fn place_plain(a: u64, n: u64, commit: bool) -> bool {
+    carve(a, n);
+    let ty = MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | if commit { MEM_COMMIT } else { 0 };
+    !unsafe { VirtualAlloc2(0, a as *mut _, n as usize, ty, if commit { PAGE_READWRITE } else { 0x01 }, std::ptr::null_mut(), 0) }.is_null()
+}
+
+/// The protections of [a, a+n) region by region, to put back after a re-map.
+fn protections(a: u64, n: u64) -> Vec<(u64, u64, u32)> {
+    let mut out = Vec::new();
+    let mut p = a;
+    while p < a + n {
+        let mut m = MemoryBasicInformation::default();
+        if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 {
+            break;
+        }
+        let end = (m.base as u64 + m.region_size as u64).min(a + n);
+        out.push((p, end - p, m.protect));
+        p = end;
+    }
+    out
+}
+
+fn reprotect(prots: &[(u64, u64, u32)], keep: impl Fn(u64) -> bool) {
+    for &(p, n, pr) in prots {
+        if keep(p) && pr != 0 {
+            let mut old = 0;
+            unsafe { VirtualProtect(p as *mut _, n as usize, pr, &mut old) };
+        }
+    }
+}
+
+/// Make [addr, addr+len) free of copy-on-write views. Returns the placeholder holes left inside it.
+fn punch_views(addr: u64, len: u64) -> Vec<(u64, u64)> {
+    let mut views = COW_VIEWS.lock().unwrap();
+    let mut holes = Vec::new();
+    let mut i = 0;
+    while i < views.len() {
+        let v = &views[i];
+        let (vb, ve) = (v.base, v.base + v.len);
+        if ve <= addr || vb >= addr + len {
+            i += 1;
+            continue;
+        }
+        let v = views.remove(i);
+        let prots = protections(vb, v.len);
+        let me = unsafe { GetCurrentProcess() };
+        if v.written {
+            // Changed by the guest: keep the contents as private memory instead.
+            let mut copy = vec![0u8; v.len as usize];
+            unsafe { std::ptr::copy_nonoverlapping(vb as *const u8, copy.as_mut_ptr(), copy.len()) };
+            unsafe { UnmapViewOfFile2(me, vb as *mut _, MEM_PRESERVE_PLACEHOLDER) };
+            place_plain(vb, v.len, true);
+            unsafe { std::ptr::copy_nonoverlapping(copy.as_ptr(), vb as *mut u8, copy.len()) };
+            reprotect(&prots, |_| true);
+            continue;
+        }
+        unsafe { UnmapViewOfFile2(me, vb as *mut _, MEM_PRESERVE_PLACEHOLDER) };
+        let (cut0, cut1) = (vb.max(addr), ve.min(addr + len));
+        let mut keep = Vec::new();
+        if vb < cut0 {
+            keep.push((vb, cut0 - vb, v.off));
+        }
+        if cut1 < ve {
+            keep.push((cut1, ve - cut1, v.off + (cut1 - vb)));
+        }
+        for &(a, n, off) in &keep {
+            if place_view(v.section, a, off, n, v.fsize) {
+                if v.exec {
+                    patch_code(a, n as usize);
+                }
+                views.insert(i, CowView { base: a, len: n, section: v.section, off, fsize: v.fsize, exec: v.exec, written: false });
+                i += 1;
+            }
+        }
+        reprotect(&prots, |p| p < cut0 || p >= cut1);
+        holes.push((cut0, cut1 - cut0));
+    }
+    holes
+}
+
+/// mprotect on views: writable means their pages may now hold the guest's changes, executable means
+/// syscall sites got patched in (so a re-map must patch again).
+fn mark_views(addr: u64, len: u64, written: bool, exec: bool) {
+    for v in COW_VIEWS.lock().unwrap().iter_mut() {
+        if v.base < addr + len && addr < v.base + v.len {
+            v.written |= written;
+            v.exec |= exec;
+        }
+    }
+}
+
+/// A private file mapping as a copy-on-write view; `holes`: the placeholders punch_views left for a
+/// MAP_FIXED. Returns the address, or None for the ordinary copying path.
+fn mmap_cow(addr: u64, len: u64, prot: u64, fixed: bool, fd: u64, off: u64, holes: &[(u64, u64)]) -> Option<u64> {
+    if std::env::var_os("LX_NOCOW").is_some() || off % PAGE != 0 {
+        return None;
+    }
+    if debug() {
+        dlog(format_args!("mmap_cow {addr:#x}+{len:#x} off {off:#x} prot {prot} fixed {fixed} holes {holes:x?}"));
+    }
+    // MAP_FIXED only into one whole hole a punched view left (ld.so's segments); elsewhere copy.
+    if fixed && holes != [(addr, len)] {
+        return None;
+    }
+    let (section, size) = file_section(fd)?;
+    if off >= size {
+        unsafe { CloseHandle(section) };
+        return None;
+    }
+    let flen = len.min((size - off).next_multiple_of(PAGE));
+    let base = if fixed {
+        addr
+    } else {
+        let a = loop {
+            let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
+            if a + len > WINDOW.1 {
+                unsafe { CloseHandle(section) };
+                return None;
+            }
+            if unsafe { VirtualAlloc2(0, a as *mut _, len as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0) } as u64 == a {
+                break a;
+            }
+        };
+        ALLOCS.lock().unwrap().push((a, len));
+        a
+    };
+    let (view_ok, tail_ok) = (place_view(section, base, off, flen, size), flen == len || place_plain(base + flen, len - flen, true));
+    if debug() && !(view_ok && tail_ok) {
+        dlog(format_args!("mmap_cow at {base:#x}: view {view_ok} (flen {flen:#x}) tail {tail_ok} err {}", unsafe { GetLastError() }));
+    }
+    if !(view_ok && tail_ok) {
+        return None; // ponytail: a half-placed mapping is left as is; never seen
+    }
+    COW_VIEWS.lock().unwrap().push(CowView { base, len: flen, section, off, fsize: size, exec: prot & 4 != 0, written: prot & 2 != 0 });
+    Some(base)
 }

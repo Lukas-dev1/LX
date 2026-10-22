@@ -1001,6 +1001,11 @@ impl Fs {
     }
 }
 
+/// Where a guest path lives on the host (symlinks followed): the ELF loader maps program files from it.
+pub fn host_of(guest: &str) -> Option<PathBuf> {
+    with(|fs| fs.resolve("/", guest, true).ok().map(|(_, h)| h))
+}
+
 /// Resolve an executable: relative to cwd when it has a slash, else a PATH search like a shell.
 /// Returns the guest path and the file contents.
 pub fn find_exe(cmd: &str, path_var: &str) -> Result<(String, Vec<u8>), i64> {

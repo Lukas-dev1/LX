@@ -651,12 +651,13 @@ fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), Strin
 
     enter_job()?;
     syscall::install();
-    let img = elf::load(&image)?;
+    let img = elf::load(&image, fs::host_of(&exe).as_deref())?;
     drop(image); // its segments are copied in; the guest never returns here to free the file's bytes
     // Dynamically linked: the kernel's job is to map ld.so too and start there; ld.so maps the rest via mmap.
     let (entry, interp_base) = match &img.interp {
         Some(ld) => {
-            let ld = elf::load(&fs::find_exe(ld, "/").map_err(|_| format!("{exe}: interpreter {ld} not found"))?.1)?;
+            let (ld_guest, ld_bytes) = fs::find_exe(ld, "/").map_err(|_| format!("{exe}: interpreter {ld} not found"))?;
+            let ld = elf::load(&ld_bytes, fs::host_of(&ld_guest).as_deref())?;
             (ld.entry, ld.base)
         }
         None => (img.entry, 0),
