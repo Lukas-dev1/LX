@@ -76,8 +76,9 @@ pub fn serve(name: Option<&str>) -> Result<(), String> {
     eprintln!("[lx] Docker Engine API on npipe:////./pipe/{name}  (DOCKER_HOST=npipe:////./pipe/{name})");
     let mut first = 0x0008_0000; // FILE_FLAG_FIRST_PIPE_INSTANCE: fail if someone else serves this name
     loop {
-        // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED; byte mode; unlimited instances
-        let h = unsafe { CreateNamedPipeW(path.as_ptr(), 3 | 0x4000_0000 | first, 0, 255, 65536, 65536, 0, std::ptr::null_mut()) };
+        // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED; byte mode, local clients only; unlimited instances
+        // PIPE_REJECT_REMOTE_CLIENTS: this machine only (the API can run containers with any bind mount).
+        let h = unsafe { CreateNamedPipeW(path.as_ptr(), 3 | 0x4000_0000 | first, 0x8, 255, 65536, 65536, 0, std::ptr::null_mut()) };
         if h == -1 {
             return Err(format!("can't serve \\\\.\\pipe\\{name} (Windows error {}; another engine running?)", unsafe { GetLastError() }));
         }
