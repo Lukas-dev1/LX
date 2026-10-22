@@ -440,8 +440,15 @@ fn fd_alias(guest: &str) -> Option<u64> {
         "/dev/stdin" => Some(0),
         "/dev/stdout" => Some(1),
         "/dev/stderr" => Some(2),
-        _ => guest.strip_prefix("/dev/fd/").or_else(|| guest.strip_prefix("/proc/self/fd/"))?.parse().ok(),
+        _ => guest.strip_prefix("/dev/fd/").or_else(|| own_proc(guest)?.strip_prefix("fd/"))?.parse().ok(),
     }
+}
+
+/// "/proc/self/<rest>" or "/proc/<our pid>/<rest>" (as getpid says it: 1 for the container's first
+/// process, which mongo's entrypoint chowns /proc/1/fd/1 as) -> rest.
+fn own_proc(guest: &str) -> Option<&str> {
+    let (pid, rest) = guest.strip_prefix("/proc/")?.split_once('/')?;
+    (pid == "self" || crate::proc::host_pid(pid.parse().ok()?) == crate::proc::pid()).then_some(rest)
 }
 
 pub struct Fs {
@@ -2676,6 +2683,10 @@ fn chmeta(fs: &Fs, c: &[String], host: &Path, mode: Option<u64>, owner: Option<(
 
 /// chmod, fchmodat, chown, lchown, fchownat.
 pub fn chmeta_at(dirfd: u64, path: u64, follow: bool, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
+    // /proc/self/fd/N, /dev/stdout...: what the fd is (mongo's entrypoint chowns /proc/1/fd/1).
+    if follow && let Some(n) = fd_alias(&with(|fs| fs.at(dirfd, path, false))?.0) {
+        return fchmeta(n, mode, owner);
+    }
     with(|fs| {
         let (guest, host) = fs.at(dirfd, path, follow)?;
         if fs::symlink_metadata(&host).is_err() {
