@@ -1416,10 +1416,8 @@ fn open_pts(n: u32, flags: u64) -> R {
 
 // ---- FIFOs ----
 // mknod S_IFIFO leaves a marker file (stat shows a FIFO). Opening one is a named pipe named after the
-// marker: a reader creates an instance and, unless O_NONBLOCK, waits for a writer, as on Linux; a writer
-// connects to a waiting reader, waiting for one (O_NONBLOCK: ENXIO).
-// ponytail: each reader pairs with one writer at a time; after that writer closes, the reader gets EOF and
-// later writers need a new reader (shell loops reopen anyway). O_RDWR is a reader that doesn't wait.
+// marker: a reader listens there (see fifo_reader) and, unless O_NONBLOCK, waits for a writer, as on
+// Linux; a writer connects to a reader, waiting for one (O_NONBLOCK: ENXIO). O_RDWR reads, without waiting.
 
 /// mknod/mknodat: regular files and FIFOs; device nodes and sockets: EPERM.
 pub fn mknodat(dirfd: u64, path: u64, mode: u64) -> R {
@@ -1460,44 +1458,134 @@ fn open_fifo(host: &Path, flags: u64) -> R {
             if h != -1 {
                 break h;
             }
-            if nonblock {
+            // ERROR_PIPE_BUSY: a reader is there, its broker is between two writers.
+            if nonblock && unsafe { GetLastError() } != 231 {
                 return Err(crate::syscall::ENXIO);
             }
             wait()?;
         }
     } else {
-        // PIPE_ACCESS_INBOUND, byte mode, unlimited instances.
-        let h = unsafe { CreateNamedPipeW(name.as_ptr(), 0x1 | FILE_FLAG_OVERLAPPED, 0, 255, 65536, 65536, 0, std::ptr::null_mut()) };
-        if h == -1 {
-            return Err(EIO);
-        }
-        if flags & 3 == 0 && !nonblock {
-            // Wait for a writer to connect (it may have come and gone already: ERROR_PIPE_CONNECTED,
-            // ERROR_NO_DATA), or a signal.
-            let ev = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
-            let mut o = Overlapped { internal: [0; 2], offset: 0, offset_high: 0, event: ev };
-            let op = (&mut o as *mut Overlapped).cast();
-            let pending = unsafe { ConnectNamedPipe(h, op) == 0 && GetLastError() == 997 }; // ERROR_IO_PENDING
-            let mut r = Ok(());
-            while pending && unsafe { WaitForMultipleObjects(1, &ev, 0, 0) } != 0 {
-                if let Err(e) = wait() {
-                    unsafe { CancelIoEx(h, op) };
-                    let mut done = 0u32;
-                    unsafe { GetOverlappedResult(h, op, &mut done, 1) };
-                    r = Err(e);
-                    break;
-                }
-            }
-            unsafe { CloseHandle(ev) };
-            if let Err(e) = r {
-                unsafe { CloseHandle(h) };
-                return Err(e);
-            }
-        }
-        h
+        return fifo_reader(name, flags);
     };
     let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None };
     Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
+}
+
+/// A FIFO's reader. Writers connect to its named pipe, any number of them: a broker thread keeps an
+/// instance listening and copies each writer's bytes into one internal pipe, which the reader's fd reads.
+/// When the last writer has gone the reader gets EOF, unless it's O_RDWR (a writer itself), as on Linux.
+/// ponytail: the broker lives in the opening process (a child inheriting the fd still reads what comes
+/// while that process lives); writers that come after EOF get EPIPE instead of a new reader.
+fn fifo_reader(name: Vec<u16>, flags: u64) -> R {
+    use crate::win::*;
+    use std::sync::atomic::AtomicUsize;
+    static N: AtomicU32 = AtomicU32::new(0);
+    let int: Vec<u16> = format!("\\\\.\\pipe\\lx-fifo-in-{}-{}", unsafe { GetCurrentProcessId() }, N.fetch_add(1, Relaxed))
+        .encode_utf16().chain([0]).collect();
+    // The internal pipe: an overlapped inbound end for the fd (like pipe2's), a synchronous write end.
+    let r = unsafe { CreateNamedPipeW(int.as_ptr(), 0x1 | 0x4000_0000 | 0x0008_0000, 0, 1, 65536, 65536, 0, std::ptr::null_mut()) };
+    if r == -1 {
+        return Err(EIO);
+    }
+    let w = unsafe { CreateFileW(int.as_ptr(), 0x4000_0000, 0, std::ptr::null_mut(), 3, 0, 0) }; // GENERIC_WRITE, OPEN_EXISTING
+    if w == -1 {
+        unsafe { CloseHandle(r) };
+        return Err(EIO);
+    }
+    let sink = Arc::new(Mutex::new(Some(unsafe { OwnedHandle::from_raw_handle(w as _) })));
+    let writers = Arc::new(AtomicUsize::new(0));
+    let rdwr = flags & 3 == 2;
+    let (came, first) = std::sync::mpsc::channel::<()>();
+    // Set once no writer may come any more (EOF given, or the reader closed): the broker stops listening.
+    // ponytail: never closed (a copier may still set it), one handle per FIFO reader.
+    let stop = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+    let end = move |sink: &mut Option<OwnedHandle>| {
+        *sink = None;
+        unsafe { SetEvent(stop) };
+    };
+    // One overlapped operation on `h`, waited for; with `stop`, given up when that's set (or the reader closed).
+    let wait_io = move |h: isize, op: &mut Overlapped, started: bool, sink: Option<&Mutex<Option<OwnedHandle>>>| -> Option<u32> {
+        if !started {
+            match unsafe { GetLastError() } {
+                997 => {}               // ERROR_IO_PENDING
+                535 => return Some(0),  // ERROR_PIPE_CONNECTED: the writer came before we listened
+                _ => return None,       // failed: a writer that left
+            }
+        }
+        loop {
+            let hs = [op.event, stop];
+            match unsafe { WaitForMultipleObjects(if sink.is_some() { 2 } else { 1 }, hs.as_ptr(), 0, 100) } {
+                0 => break,
+                1 => {
+                    unsafe { CancelIoEx(h, (op as *mut Overlapped).cast()) };
+                    unsafe { GetOverlappedResult(h, (op as *mut Overlapped).cast(), &mut 0, 1) };
+                    return None;
+                }
+                _ => {
+                    // Has the reader closed? A zero-byte write to it fails then.
+                    let Some(sink) = sink else { continue };
+                    let mut g = sink.lock().unwrap();
+                    let gone = g.as_ref().is_none_or(|w| unsafe { WriteFile(w.as_raw_handle() as isize, [0u8].as_ptr(), 0, &mut 0, std::ptr::null_mut()) } == 0);
+                    if gone {
+                        end(&mut g);
+                    }
+                }
+            }
+        }
+        let mut n = 0u32;
+        (unsafe { GetOverlappedResult(h, (op as *mut Overlapped).cast(), &mut n, 1) } != 0).then_some(n)
+    };
+    // Inbound, overlapped, byte mode, unlimited instances: the broker waits for one writer at a time. The
+    // first one listens before open returns (s6-supervise opens its control FIFO for writing right after).
+    let listen = move || unsafe { CreateNamedPipeW(name.as_ptr(), 0x1 | 0x4000_0000, 0, 255, 65536, 65536, 0, std::ptr::null_mut()) };
+    let mut next = listen();
+    std::thread::spawn(move || loop {
+        let inst = std::mem::replace(&mut next, -1);
+        let inst = if inst == -1 { listen() } else { inst };
+        if inst == -1 {
+            return;
+        }
+        let mut o = Overlapped { internal: [0; 2], offset: 0, offset_high: 0, event: unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) } };
+        let started = unsafe { ConnectNamedPipe(inst, (&mut o as *mut Overlapped).cast()) } != 0;
+        let connected = wait_io(inst, &mut o, started, Some(&sink)).is_some();
+        unsafe { CloseHandle(o.event) };
+        if !connected || sink.lock().unwrap().is_none() {
+            unsafe { CloseHandle(inst) };
+            if sink.lock().unwrap().is_none() { return } else { continue }
+        }
+        writers.fetch_add(1, Relaxed);
+        let _ = came.send(());
+        let (sink, writers) = (sink.clone(), writers.clone());
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            let mut o = Overlapped { internal: [0; 2], offset: 0, offset_high: 0, event: unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) } };
+            loop {
+                let started = unsafe { ReadFile(inst, buf.as_mut_ptr(), buf.len() as u32, std::ptr::null_mut(), (&mut o as *mut Overlapped).cast()) } != 0;
+                let Some(n) = wait_io(inst, &mut o, started, None).filter(|&n| n > 0) else { break }; // this writer closed
+                let mut g = sink.lock().unwrap();
+                let Some(w) = g.as_ref() else { break };
+                if unsafe { WriteFile(w.as_raw_handle() as isize, buf.as_ptr(), n, &mut 0, std::ptr::null_mut()) } == 0 {
+                    end(&mut g); // the reader is gone
+                    break;
+                }
+            }
+            unsafe { CloseHandle(o.event) };
+            unsafe { CloseHandle(inst) };
+            if writers.fetch_sub(1, Relaxed) == 1 && !rdwr {
+                end(&mut sink.lock().unwrap()); // the last writer left: EOF
+            }
+        });
+    });
+    let fd = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None };
+    if flags & 3 == 0 && flags & O_NONBLOCK == 0 {
+        // Linux's open waits for a writer.
+        while first.recv_timeout(std::time::Duration::from_millis(5)).is_err() {
+            if crate::signal::deliverable() {
+                return Err(crate::syscall::EINTR); // dropping `fd` makes the broker stop at its next writer
+            }
+        }
+    }
+    Ok(add_fd(Fd::Pipe(Arc::new(fd)), flags & O_CLOEXEC != 0))
 }
 
 fn pty_ioctl(p: &Pipe, req: u64, arg: u64) -> R {
