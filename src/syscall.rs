@@ -1164,11 +1164,12 @@ pub fn cstr(addr: u64) -> Result<String, i64> {
 pub fn write_handle(h: isize, buf: u64, len: u64) -> R {
     let mut done = 0u32;
     let len = len.min(u32::MAX as u64) as u32;
-    if unsafe { WriteFile(h, buf as *const u8, len, &mut done, std::ptr::null_mut()) } != 0 {
+    let (ok, err) = crate::signal::interruptible(|| unsafe { (WriteFile(h, buf as *const u8, len, &mut done, std::ptr::null_mut()), GetLastError()) });
+    if ok != 0 {
         return Ok(done as i64);
     }
     // ERROR_NO_DATA / ERROR_BROKEN_PIPE: the reader is gone. ponytail: EPIPE without SIGPIPE.
-    match unsafe { GetLastError() } {
+    match err {
         232 | 109 => Err(EPIPE),
         995 => Err(EINTR), // a signal cancelled the write
         _ => Err(EIO),
@@ -1178,10 +1179,11 @@ pub fn write_handle(h: isize, buf: u64, len: u64) -> R {
 pub fn read_handle(h: isize, buf: u64, len: u64) -> R {
     let mut done = 0u32;
     let len = len.min(u32::MAX as u64) as u32;
-    if unsafe { ReadFile(h, buf as *mut u8, len, &mut done, std::ptr::null_mut()) } != 0 {
+    let (ok, err) = crate::signal::interruptible(|| unsafe { (ReadFile(h, buf as *mut u8, len, &mut done, std::ptr::null_mut()), GetLastError()) });
+    if ok != 0 {
         return Ok(done as i64);
     }
-    match unsafe { GetLastError() } {
+    match err {
         109 => Ok(0),       // ERROR_BROKEN_PIPE is EOF
         995 => Err(EINTR),  // ERROR_OPERATION_ABORTED: a signal cancelled the read
         _ => Err(EIO),
