@@ -132,6 +132,7 @@ expect "mongodb: mongod + mongosh aggregate" 0 "sum=42" -- run -p 27018:27017 mo
 # -e adds and overrides the image's env (PYTHON_VERSION is set by the image), -w sets the directory.
 expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERSION=9 -w /usr python:3.12-alpine sh -c 'echo A=$A V=$PYTHON_VERSION $(pwd)'
 expect "/proc/<getpid()> after exec" 0 "own pid ['0', '1', '2']" -- run python:3.12-alpine sh -c 'exec python3 -c "import os; p=f\"/proc/{os.getpid()}\"; os.stat(p); print(\"own pid\", sorted(os.listdir(p + \"/fd\"))[:3])"'
+expect "hard link counts (container files; image files stay 1)" 0 "nlink 2 1 image 1" -- run alpine sh -c 'touch /tmp/a; ln /tmp/a /tmp/b; x=$(stat -c %h /tmp/a); rm /tmp/b; echo "nlink $x $(stat -c %h /tmp/a) image $(stat -c %h /bin/busybox)"'
 expect "run -u / USER + HOME"      0 "65534:65533 HOME=/." -- run -u nobody:nogroup alpine sh -c 'echo $(id -u):$(id -g) HOME=$HOME.'
 # lx build: an image from guest/buildctx/Dockerfile, then run (and the base image keeps its /etc/motd).
 expect "lx build"                  0 "built lxtest-build:1" -- build -t lxtest-build:1 --build-arg FLAVOR=spicy guest/buildctx
