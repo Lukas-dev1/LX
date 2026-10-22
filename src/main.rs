@@ -253,7 +253,7 @@ const USAGE: &str = "usage: lx pull <image>                     e.g. lx pull ngi
                                              -w /dir sets the working directory
                                              -u user[:group] runs as that user (default: the image's USER)
        lx run -d ...                         the same in the background: prints the container's pid
-       lx build -t name[:tag] [-f Dockerfile] <dir>
+       lx build -t name[:tag] [-f Dockerfile] [--build-arg K=V] [--no-cache] <dir>
                                              builds an image from a Dockerfile
        lx logs <pid>                         output of a `lx run -d` container
        lx exec [-e ..] [-w dir] [-u user] <pid> <command> [args...]
@@ -333,8 +333,10 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     if let [cmd, rest @ ..] = args.as_slice() && cmd == "build" {
-        // lx build -t name[:tag] [-f Dockerfile] <context>
-        let (mut rest, mut tag, mut file, mut build_args) = (rest, None, None, Vec::new());
+        // lx build -t name[:tag] [-f Dockerfile] [--build-arg K=V] [--no-cache] <context>
+        let no_cache = rest.iter().any(|a| a == "--no-cache");
+        let rest: Vec<String> = rest.iter().filter(|a| *a != "--no-cache").cloned().collect();
+        let (mut rest, mut tag, mut file, mut build_args) = (rest.as_slice(), None, None, Vec::new());
         while let [flag, value, more @ ..] = rest {
             match flag.as_str() {
                 "-t" | "--tag" => tag = Some(value.clone()),
@@ -348,7 +350,7 @@ fn run() -> Result<(), String> {
         let tag = tag.ok_or("lx build: -t name[:tag] is required")?;
         let context = std::path::Path::new(context);
         let file = file.unwrap_or_else(|| context.join("Dockerfile"));
-        return build::build(&tag, context, &file, build_args);
+        return build::build(&tag, context, &file, build_args, no_cache);
     }
     if let [cmd] = args.as_slice() && cmd == "ps" {
         println!("{:<8} COMMAND", "PID");

@@ -115,6 +115,7 @@ expect "run -u / USER + HOME"      0 "65534:65533 HOME=/." -- run -u nobody:nogr
 expect "lx build"                  0 "built lxtest-build:1" -- build -t lxtest-build:1 --build-arg FLAVOR=spicy guest/buildctx
 expect "lx build: run the image"   0 "hello from lx build: spicy in /srv/app as builder, motd gone, owned.sh nobody" -- run lxtest-build:1
 expect "lx build: base untouched"  0 "motd kept" -- run alpine sh -c 'test -e /etc/motd && echo motd kept'
+expect "lx build: cache reused"    0 "(cached)" -- build -t lxtest-build:1 --build-arg FLAVOR=spicy guest/buildctx
 expect "lx build: multi-stage"     0 "built lxtest-multi:1" -- build -t lxtest-multi:1 -f guest/buildctx/Dockerfile.multi guest/buildctx
 expect "lx build: COPY --from"     0 "made in stage make, mode 600" -- run lxtest-multi:1
 expect "lx images lists a build"   0 "lxtest-multi" -- images

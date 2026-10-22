@@ -7,8 +7,8 @@
 //! kept: its changes are then moved into the image (whiteouts delete, everything else replaces), so a file
 //! the base image still links to is never written in place. COPY/ADD copy from the context; ENV, WORKDIR,
 //! USER, CMD, ENTRYPOINT, SHELL and ARG update the config. The result sits where `lx run name:tag` looks.
-//! ponytail: no build cache (every build starts over), ADD doesn't fetch URLs or unpack archives,
-//! .dockerignore isn't read, and ARG scope isn't per stage.
+//! RUN layers are cached (see "build cache" below) and .dockerignore is honoured.
+//! ponytail: ADD doesn't fetch URLs or unpack archives, and ARG scope isn't per stage.
 
 use crate::fs::{enc, get_meta, set_meta, OPAQUE, WHITEOUT};
 use crate::image::Ref;
@@ -16,13 +16,14 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// `build_args` are `--build-arg K=V`: they win over the Dockerfile's ARG defaults.
-pub fn build(tag: &str, context: &Path, dockerfile: &Path, build_args: Vec<(String, String)>) -> Result<(), String> {
+/// `build_args` are `--build-arg K=V`: they win over the Dockerfile's ARG defaults. `no_cache`: run every
+/// RUN again (`--no-cache`).
+pub fn build(tag: &str, context: &Path, dockerfile: &Path, build_args: Vec<(String, String)>, no_cache: bool) -> Result<(), String> {
     let text = std::fs::read_to_string(dockerfile).map_err(|e| format!("{}: {e}", dockerfile.display()))?;
     let target = Ref::parse(tag).dir();
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let work = target.with_file_name(format!(".build-{nanos}"));
-    let r = run_steps(&text, context, &work, build_args.into_iter().collect());
+    let r = run_steps(&text, context, &work, build_args.into_iter().collect(), no_cache);
     let r = r.and_then(|last| {
         let _ = std::fs::remove_dir_all(&target);
         std::fs::rename(&last, &target).map_err(|e| format!("{}: {e}", target.display()))?;
@@ -48,9 +49,43 @@ fn source(name: &str, stages: &[(Option<String>, PathBuf)]) -> Result<PathBuf, S
     if r.dir().join("config.json").exists() { Ok(r.dir()) } else { crate::image::pull(&r) }
 }
 
+// ---- build cache ----
+//
+// Every instruction extends a key: a hash of the stage's key so far, the instruction, and what it reads
+// (for FROM the base's config, for COPY the sources' paths, sizes and mtimes, for RUN the ARG values).
+// A RUN's layer is kept in rootfs/buildcache/<key> and hard-linked into the image; the same key later
+// links it again instead of running. ponytail: never pruned (delete rootfs/buildcache to reclaim space).
+
+const CACHE: &str = "rootfs/buildcache";
+
+fn mix(key: u64, parts: &[&[u8]]) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new(); // fixed keys: the same input hashes the same in every build
+    key.hash(&mut h);
+    parts.hash(&mut h);
+    h.finish()
+}
+
+/// A COPY source's paths, sizes and mtimes (what docker's checksum stands for, without reading contents).
+fn fingerprint(p: &Path, ignore: &Ignore, mut key: u64) -> u64 {
+    let Ok(m) = std::fs::metadata(p) else { return key };
+    let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).unwrap_or_default();
+    key = mix(key, &[p.to_string_lossy().as_bytes(), &m.len().to_le_bytes(), &t.as_nanos().to_le_bytes()]);
+    if m.is_dir() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for e in entries.iter().filter(|e| !ignore.skips(e)) {
+            key = fingerprint(e, ignore, key);
+        }
+    }
+    key
+}
+
 /// Runs the Dockerfile; returns the last stage's directory (the image).
-fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, String>) -> Result<PathBuf, String> {
+fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, String>, no_cache: bool) -> Result<PathBuf, String> {
     let mut stages: Vec<(Option<String>, PathBuf)> = Vec::new();
+    let mut stage_keys: Vec<u64> = Vec::new();
+    let mut key = 0u64;
     let mut cur = work.to_path_buf(); // this stage's directory
     let mut root = cur.join("rootfs");
     let mut config = json!({});
@@ -61,6 +96,32 @@ fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, 
         let env = env_map(&config);
         // Like Docker: commands are left to the shell (which sees ENV and ARG in its environment).
         let rest = if matches!(op.as_str(), "RUN" | "CMD" | "ENTRYPOINT") { rest } else { expand(&rest, &args, &env) };
+        key = mix(key, &[op.as_bytes(), rest.as_bytes()]);
+        match op.as_str() {
+            "FROM" => {
+                let image = rest.split_whitespace().next().unwrap_or_default();
+                key = match stages.iter().position(|(n, _)| n.as_deref() == Some(image)) {
+                    Some(i) => mix(0, &[&stage_keys[i].to_le_bytes()]),
+                    None => mix(0, &[image.as_bytes(), &source(image, &[]).ok().and_then(|d| std::fs::read(d.join("config.json")).ok()).unwrap_or_default()]),
+                };
+            }
+            "COPY" | "ADD" => {
+                for w in rest.split_whitespace() {
+                    if let Some(s) = w.strip_prefix("--from=") {
+                        let k = stages.iter().position(|(n, _)| n.as_deref() == Some(s)).map(|i| stage_keys[i]);
+                        key = mix(key, &[&k.unwrap_or_default().to_le_bytes()]);
+                    } else if !w.starts_with("--") {
+                        key = fingerprint(&context.join(w), &ignore, key);
+                    }
+                }
+            }
+            "RUN" => {
+                let mut a: Vec<String> = args.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                a.sort();
+                key = mix(key, &[a.join("\n").as_bytes()]);
+            }
+            _ => {}
+        }
         match op.as_str() {
             "FROM" => {
                 // FROM image [AS name]: a new stage, from an image or an earlier stage.
@@ -85,6 +146,7 @@ fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, 
                     config["config"] = json!({});
                 }
                 stages.push((name, cur.clone()));
+                stage_keys.push(key);
             }
             _ if stages.is_empty() && op != "ARG" => return Err(format!("{op} before FROM")),
             "ARG" => {
@@ -123,9 +185,12 @@ fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, 
                 }
             }
             "COPY" | "ADD" => copy(&rest, context, &root, &config, &stages, &ignore)?,
-            "RUN" => run(&rest, &shell, &cur, &config, &args)?,
+            "RUN" => run(&rest, &shell, &cur, &config, &args, key, no_cache)?,
             "VOLUME" | "STOPSIGNAL" | "HEALTHCHECK" | "MAINTAINER" | "ONBUILD" => {} // nothing lx acts on yet
             _ => return Err(format!("unknown instruction {op}")),
+        }
+        if let Some(k) = stage_keys.last_mut() {
+            *k = key; // COPY --from and FROM <stage> see the stage as far as it got
         }
     }
     if stages.is_empty() {
@@ -233,8 +298,14 @@ fn command(s: &str, shell: &[String]) -> Vec<String> {
     shell.iter().cloned().chain([s.to_string()]).collect()
 }
 
-/// RUN: an `lx run` of the image so far, its layer kept and moved into the image.
-fn run(rest: &str, shell: &[String], work: &Path, config: &Value, args: &HashMap<String, String>) -> Result<(), String> {
+/// RUN: an `lx run` of the image so far; its layer goes into the build cache under `key` and is linked
+/// into the image from there. With that key already cached, only the linking happens.
+fn run(rest: &str, shell: &[String], work: &Path, config: &Value, args: &HashMap<String, String>, key: u64, no_cache: bool) -> Result<(), String> {
+    let cached = Path::new(CACHE).join(format!("{key:016x}"));
+    if !no_cache && cached.join("upper").is_dir() {
+        eprintln!("[lx]   (cached)");
+        return merge(&cached.join("upper"), &work.join("rootfs")).map_err(|e| format!("RUN {rest}: {e}"));
+    }
     std::fs::write(work.join("config.json"), config.to_string()).map_err(|e| e.to_string())?;
     let layer = work.join("layer");
     let _ = std::fs::remove_dir_all(&layer);
@@ -250,15 +321,21 @@ fn run(rest: &str, shell: &[String], work: &Path, config: &Value, args: &HashMap
     if !status.success() {
         return Err(format!("RUN {rest}: exit code {}", status.code().unwrap_or(-1)));
     }
-    merge(&layer.join("upper"), &work.join("rootfs"), true).map_err(|e| format!("RUN {rest}: {e}"))?;
+    // Into the cache (lx's per-run /etc files aren't image content), then linked into the image.
+    for f in ["resolv.conf", "hosts"] {
+        let _ = std::fs::remove_file(layer.join("upper").join("etc").join(f));
+    }
+    let _ = std::fs::remove_dir_all(&cached);
+    std::fs::create_dir_all(&cached).map_err(|e| e.to_string())?;
+    std::fs::rename(layer.join("upper"), cached.join("upper")).map_err(|e| format!("RUN {rest}: caching its layer: {e}"))?;
     let _ = std::fs::remove_dir_all(&layer);
-    Ok(())
+    merge(&cached.join("upper"), &work.join("rootfs")).map_err(|e| format!("RUN {rest}: {e}"))
 }
 
-/// Move a container layer's changes into the image: whiteouts delete, an opaque directory replaces the
-/// image's, everything else replaces what's there (never written in place: it may be a hard link the
-/// base image shares). lx's own per-run files (/etc/resolv.conf, /etc/hosts) aren't image content.
-fn merge(upper: &Path, root: &Path, top: bool) -> std::io::Result<()> {
+/// Apply a cached RUN layer to the image: whiteouts delete, an opaque directory replaces the image's,
+/// files are hard-linked in, replacing what's there (never written in place: it may be a hard link the
+/// base image or the cache shares).
+fn merge(upper: &Path, root: &Path) -> std::io::Result<()> {
     if upper.join(OPAQUE).exists() {
         for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
             remove(&e.path());
@@ -283,15 +360,10 @@ fn merge(upper: &Path, root: &Path, top: bool) -> std::io::Result<()> {
             if let Some(m) = get_meta(&from) {
                 set_meta(&to, m)?;
             }
-            if top && name == "etc" {
-                for f in ["resolv.conf", "hosts"] {
-                    let _ = std::fs::remove_file(from.join(f));
-                }
-            }
-            merge(&from, &to, false)?;
+            merge(&from, &to)?;
         } else {
             remove(&to);
-            std::fs::rename(&from, &to)?;
+            std::fs::hard_link(&from, &to)?;
         }
     }
     Ok(())
