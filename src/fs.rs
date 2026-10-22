@@ -690,6 +690,11 @@ pub fn enc(name: &str) -> String {
     name.chars().map(|c| if ntfs_bad(c) { char::from_u32(0xF000 + c as u32).unwrap() } else { c }).collect()
 }
 
+/// A host name as the guest sees it (inotify's event names).
+pub fn dec_name(name: &str) -> String {
+    dec(name)
+}
+
 fn dec(name: &str) -> String {
     let back = |c: char| char::from_u32((c as u32).wrapping_sub(0xF000)).filter(|&o| ntfs_bad(o));
     name.chars().map(|c| back(c).unwrap_or(c)).collect()
@@ -1208,6 +1213,49 @@ pub fn pipe2(fds: u64, flags: u64) -> R {
     let (a, b) = with(|fs| (fs.add(own(r), 0, cloexec), fs.add(own(w), 0, cloexec)));
     unsafe { *(fds as *mut [i32; 2]) = [a as i32, b as i32] };
     Ok(0)
+}
+
+/// An fd reading an internal pipe whose write end the caller keeps (inotify's events). Returns the fd
+/// and the write end.
+pub fn internal_pipe(flags: u64) -> Result<(i64, OwnedHandle), i64> {
+    use crate::win::*;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name: Vec<u16> = format!("\\\\.\\pipe\\lx-int-{}-{n}", unsafe { GetCurrentProcessId() }).encode_utf16().chain([0]).collect();
+    // Overlapped inbound end for the fd (like pipe2's), synchronous write end for the writer.
+    let r = unsafe { CreateNamedPipeW(name.as_ptr(), 0x1 | 0x4000_0000 | 0x0008_0000, 0, 1, 65536, 65536, 0, std::ptr::null_mut()) };
+    if r == -1 {
+        return Err(EIO);
+    }
+    let w = unsafe { CreateFileW(name.as_ptr(), 0x4000_0000, 0, std::ptr::null_mut(), 3, 0, 0) };
+    if w == -1 {
+        unsafe { CloseHandle(r) };
+        return Err(EIO);
+    }
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None };
+    Ok((add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0), unsafe { OwnedHandle::from_raw_handle(w as _) }))
+}
+
+/// The pipe handle behind `fd` (inotify finds its instance by it).
+pub fn pipe_raw(fd: u64) -> Result<isize, i64> {
+    with(|fs| match fs.fd(fd)? {
+        Fd::Pipe(p) => Ok(p.raw()),
+        _ => Err(EINVAL),
+    })
+}
+
+/// What an inotify watch on guest `path` watches: the host directory where changes made in the container
+/// land (its upper-layer copy, made if needed, or the volume's), and for a file, its name in there.
+pub fn watch_target(path: u64) -> Result<(PathBuf, Option<String>), i64> {
+    with(|fs| {
+        let (guest, host) = fs.resolve(&fs.cwd.clone(), &cstr(path)?, true)?;
+        let m = attrs(&host).ok_or(ENOENT)?;
+        let comps = comps_of(&guest);
+        let (dir, name) = if m.dir { (comps.as_slice(), None) } else { (&comps[..comps.len().saturating_sub(1)], comps.last().cloned()) };
+        let host_dir = fs.writable(dir, false)?;
+        fs::create_dir_all(&host_dir).map_err(errno)?; // an image directory gets its (empty) upper copy
+        Ok((host_dir, name))
+    })
 }
 
 // ---- syscalls ----
