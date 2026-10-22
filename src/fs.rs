@@ -176,9 +176,26 @@ impl Dev {
 pub struct Pipe {
     h: OwnedHandle,
     nonblock: std::sync::atomic::AtomicBool,
+    /// A pseudo terminal's end: (its number, whether it's the master).
+    pty: Option<(u32, bool)>,
 }
 
 impl Pipe {
+    /// A pipe end from another lx process, `extra` as `extra()` made it.
+    fn inherited(h: usize, extra: &str) -> Pipe {
+        let pty = extra.get(2..).and_then(|n| n.parse().ok()).map(|n| (n, extra.as_bytes()[1] == b'm'));
+        Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: extra.starts_with('1').into(), pty }
+    }
+
+    fn extra(&self) -> String {
+        let pty = self.pty.map(|(n, master)| format!("{}{n}", if master { 'm' } else { 's' }));
+        format!("{}{}", self.nonblocking() as u8, pty.unwrap_or_default())
+    }
+
+    fn is_pts(&self) -> bool {
+        self.pty.is_some_and(|(_, master)| !master)
+    }
+
     fn raw(&self) -> isize {
         self.h.as_raw_handle() as isize
     }
@@ -871,7 +888,7 @@ pub fn proc_state(fork: bool) -> (Vec<String>, Vec<OwnedHandle>) {
 fn entry(fd: &Fd) -> Option<(&'static str, usize, String)> {
     Some(match fd {
         Fd::Handle(h) => ("h", h.as_raw_handle() as usize, String::new()),
-        Fd::Pipe(p) => ("p", p.raw() as usize, (p.nonblocking() as u8).to_string()),
+        Fd::Pipe(p) => ("p", p.raw() as usize, p.extra()),
         Fd::File { f, host } => ("f", f.as_raw_handle() as usize, host.to_string_lossy().into_owned()),
         Fd::Dir { guest, .. } => ("d", 0, guest.clone()),
         Fd::Dev(d) => (d.tag(), 0, String::new()),
@@ -892,7 +909,7 @@ pub fn export_fd(fd: u64) -> Result<(&'static str, usize, String), i64> {
 pub fn import_fd(kind: &str, h: usize, extra: &str, cloexec: bool) -> R {
     let fd = match kind {
         "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(h as _) }),
-        "p" => Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (extra == "1").into() })),
+        "p" => Fd::Pipe(Arc::new(Pipe::inherited(h, extra))),
         "f" => Fd::File { f: unsafe { File::from_raw_handle(h as _) }, host: PathBuf::from(extra) },
         "d" => Fd::Dir { guest: extra.to_string(), pos: 0 },
         "null" => Fd::Dev(Dev::Null),
@@ -938,9 +955,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
         let h: usize = h.parse().map_err(|_| bad())?;
         let fd_ = match kind.as_str() {
             "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(own(h, &mut seen) as _) }),
-            "p" => Fd::Pipe(pipes.entry(h).or_insert_with(|| {
-                Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (path == "1").into() })
-            }).clone()),
+            "p" => Fd::Pipe(pipes.entry(h).or_insert_with(|| Arc::new(Pipe::inherited(h, path))).clone()),
             "f" => Fd::File { f: unsafe { File::from_raw_handle(own(h, &mut seen) as _) }, host: PathBuf::from(path) },
             "d" => Fd::Dir { guest: path.clone(), pos: 0 },
             "null" => Fd::Dev(Dev::Null),
@@ -993,7 +1008,7 @@ pub fn pipe2(fds: u64, flags: u64) -> R {
         return Err(EIO);
     }
     let nonblock = flags & O_NONBLOCK != 0;
-    let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into() }));
+    let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None }));
     let cloexec = flags & O_CLOEXEC != 0;
     let (a, b) = with(|fs| (fs.add(own(r), 0, cloexec), fs.add(own(w), 0, cloexec)));
     unsafe { *(fds as *mut [i32; 2]) = [a as i32, b as i32] };
@@ -1037,6 +1052,9 @@ pub fn read(fd: u64, buf: u64, len: u64) -> R {
     match io_target(fd)? {
         Io::Handle(h) if is_console(h) => read_console(h, buf, len),
         Io::Handle(h) => read_handle(h, buf, len),
+        Io::Pipe(p) if p.is_pts() => pts_read(&p, buf, len),
+        // A master whose slave has hung up: EIO, as Linux has it (script and sshd wait for that).
+        Io::Pipe(p) if p.pty.is_some() => p.io(buf, len, false).and_then(|n| if n == 0 && len > 0 { Err(EIO) } else { Ok(n) }),
         Io::Pipe(p) => p.io(buf, len, false),
         Io::Sock(s) => s.recv(buf, len, 0),
         Io::Event(e) => e.read(buf, len),
@@ -1053,6 +1071,7 @@ pub fn read(fd: u64, buf: u64, len: u64) -> R {
 pub fn write(fd: u64, buf: u64, len: u64) -> R {
     match io_target(fd)? {
         Io::Handle(h) => write_handle(h, buf, len),
+        Io::Pipe(p) if p.is_pts() => pts_write(&p, buf, len),
         Io::Pipe(p) => p.io(buf, len, true),
         Io::Sock(s) => s.send(buf, len, 0),
         Io::Dev(_) => Ok(len as i64), // devices swallow writes
@@ -1132,7 +1151,7 @@ pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
     const FIOASYNC: u64 = 0x5452;
-    let req = req as u32 as u64; // an int: musl sign-extends requests with the top bit set (TIOCGPTN)
+    let req = req as u32 as u64; // an int: musl's sign-extends requests with the top bit set (TIOCGPTN)
     if req == FIOCLEX || req == FIONCLEX {
         return fcntl(fd, 2, (req == FIOCLEX) as u64); // F_SETFD
     }
@@ -1158,6 +1177,7 @@ pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
             Ok(0)
         }
         (_, Io::Handle(h)) if is_console(h) => tty_ioctl(h, req, arg),
+        (_, Io::Pipe(p)) if p.pty.is_some() => pty_ioctl(&p, req, arg),
         _ => Err(crate::syscall::ENOTTY),
     }
 }
@@ -1166,7 +1186,7 @@ pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
 // The guest's termios is kept here and mapped onto the console's modes: ICANON is line input, ECHO is
 // echo, ISIG is Ctrl-C as a signal, and raw mode reads VT sequences (arrows, ...) like a Linux tty.
 // ponytail: one termios per lx process (an exec starts from the defaults again), and the console's mode
-// isn't restored if the guest dies in raw mode; no /dev/tty, /dev/pts or ttyname.
+// isn't restored if the guest dies in raw mode; no /dev/tty or ttyname.
 
 const ICRNL: u32 = 0o400;
 const ISIG: u32 = 1;
@@ -1175,11 +1195,12 @@ const ECHO: u32 = 0o10;
 
 /// struct termios as TCGETS has it: iflag, oflag, cflag, lflag, c_line, c_cc[19]. Starts as a fresh
 /// Linux tty: ICRNL|IXON, OPOST|ONLCR, B38400|CS8|CREAD, ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN.
-static TERMIOS: Mutex<[u32; 9]> = Mutex::new([
+const DEFAULT_TERMIOS: [u32; 9] = [
     ICRNL | 0o2000, 0o5, 0o277, 0o105073,
     // c_line 0; ^C ^\ DEL ^U ^D, VTIME 0, VMIN 1; VSWTC 0, ^Q ^S ^Z, VEOL 0; ^R ^O ^W ^V, VEOL2 0.
     0x7f1c_0300, 0x0100_0415, 0x1a13_1100, 0x170f_1200, 0x0000_0016,
-]);
+];
+static TERMIOS: Mutex<[u32; 9]> = Mutex::new(DEFAULT_TERMIOS);
 
 /// Let the console interpret the escape sequences a Linux terminal does (colors, cursor moves), on
 /// stdout and stderr; the console keeps this mode for every process of the container.
@@ -1257,6 +1278,110 @@ fn tty_ioctl(h: isize, req: u64, arg: u64) -> R {
         TIOCSCTTY | TIOCSPGRP | TIOCSWINSZ => Ok(0),
         _ => Err(EINVAL),
     }
+}
+
+// ---- pseudo terminals: /dev/ptmx and /dev/pts/N ----
+// A pty is one duplex named pipe, named after the container and the pty's number: the master holds the
+// server end, and opening /dev/pts/N connects to it from any of the container's processes.
+// ponytail: the line discipline is only ONLCR on the slave's output and ICRNL on its input: no echo, line
+// editing or ^C-to-SIGINT (shells with line editing echo for themselves). A slave opens once; termios
+// and the window size are per process.
+
+static PTY_TERMIOS: Mutex<[u32; 9]> = Mutex::new(DEFAULT_TERMIOS);
+static PTY_WINSZ: Mutex<[u16; 4]> = Mutex::new([24, 80, 0, 0]);
+
+fn pts_pipe(n: u32) -> Vec<u16> {
+    let root = std::env::var("LX_IN_JOB").unwrap_or_else(|_| std::process::id().to_string());
+    format!("\\\\.\\pipe\\lx-pts-{root}-{n}").encode_utf16().chain([0]).collect()
+}
+
+fn add_pty(h: isize, n: u32, master: bool, flags: u64) -> R {
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: Some((n, master)) };
+    Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
+}
+
+fn open_ptmx(flags: u64) -> R {
+    use crate::win::*;
+    for n in 0..256 {
+        // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE; byte mode, one instance.
+        let h = unsafe { CreateNamedPipeW(pts_pipe(n).as_ptr(), 0x3 | 0x4000_0000 | 0x0008_0000, 0, 1, 65536, 65536, 0, std::ptr::null_mut()) };
+        if h != -1 {
+            return add_pty(h, n, true, flags);
+        }
+    }
+    Err(crate::syscall::EAGAIN)
+}
+
+fn open_pts(n: u32, flags: u64) -> R {
+    use crate::win::*;
+    // GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING, FILE_FLAG_OVERLAPPED
+    let h = unsafe { CreateFileW(pts_pipe(n).as_ptr(), 0xC000_0000, 0, std::ptr::null_mut(), 3, 0x4000_0000, 0) };
+    if h == -1 {
+        return Err(if unsafe { GetLastError() } == 2 { ENOENT } else { EIO });
+    }
+    add_pty(h, n, false, flags)
+}
+
+fn pty_ioctl(p: &Pipe, req: u64, arg: u64) -> R {
+    const TCGETS: u64 = 0x5401;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
+    const TIOCGPTPEER: u64 = 0x5441;
+    const TIOCGPTN: u64 = 0x8004_5430;
+    const TIOCSPTLCK: u64 = 0x4004_5431;
+    let Some((n, master)) = p.pty else { return Err(crate::syscall::ENOTTY) };
+    match req {
+        TIOCGPTN if master => {
+            unsafe { *(arg as *mut u32) = n };
+            Ok(0)
+        }
+        TIOCSPTLCK => Ok(0),
+        TIOCGPTPEER if master => open_pts(n, arg),
+        TCGETS => {
+            unsafe { *(arg as *mut [u32; 9]) = *PTY_TERMIOS.lock().unwrap() };
+            Ok(0)
+        }
+        0x5402..=0x5404 => {
+            *PTY_TERMIOS.lock().unwrap() = unsafe { *(arg as *const [u32; 9]) };
+            Ok(0)
+        }
+        TIOCGWINSZ => {
+            unsafe { *(arg as *mut [u16; 4]) = *PTY_WINSZ.lock().unwrap() };
+            Ok(0)
+        }
+        TIOCSWINSZ => {
+            *PTY_WINSZ.lock().unwrap() = unsafe { *(arg as *const [u16; 4]) };
+            Ok(0)
+        }
+        _ => tty_ioctl(0, req, arg), // the process group calls
+    }
+}
+
+/// The slave's input: with ICRNL, Enter's CR becomes LF.
+fn pts_read(p: &Pipe, buf: u64, len: u64) -> R {
+    let n = p.io(buf, len, false)?;
+    if PTY_TERMIOS.lock().unwrap()[0] & ICRNL != 0 {
+        unsafe { guest_mut(buf, n as usize) }.iter_mut().filter(|b| **b == b'\r').for_each(|b| *b = b'\n');
+    }
+    Ok(n)
+}
+
+/// The slave's output: with OPOST|ONLCR, LF goes out as CRLF.
+fn pts_write(p: &Pipe, buf: u64, len: u64) -> R {
+    const OPOST_ONLCR: u32 = 1 | 4;
+    if PTY_TERMIOS.lock().unwrap()[1] & OPOST_ONLCR != OPOST_ONLCR {
+        return p.io(buf, len, true);
+    }
+    let data = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let mut out = Vec::with_capacity(data.len() * 2);
+    for &b in data {
+        if b == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    // ponytail: a short write of the converted bytes counts as all of them.
+    p.io(out.as_ptr() as u64, out.len() as u64, true).map(|_| len as i64)
 }
 
 /// A console read, the way a tty delivers it: with ICRNL, Enter's CR (and the console's CRLF in line
@@ -1479,6 +1604,12 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
     }
     if guest == "/dev/tty" {
         return Err(crate::syscall::ENXIO); // no controlling terminal, like `docker run` without -t
+    }
+    if guest == "/dev/ptmx" {
+        return open_ptmx(flags);
+    }
+    if let Some(n) = guest.strip_prefix("/dev/pts/").and_then(|n| n.parse().ok()) {
+        return open_pts(n, flags);
     }
     with(|fs| {
         if let Some(d) = Dev::of(&guest) {
