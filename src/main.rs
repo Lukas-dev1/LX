@@ -136,6 +136,7 @@ pub mod win {
         pub fn GetCurrentProcessorNumber() -> u32;
         pub fn PeekNamedPipe(h: isize, buf: *mut c_void, len: u32, read: *mut u32, avail: *mut u32, left: *mut u32) -> i32;
         pub fn DuplicateHandle(sp: isize, h: isize, tp: isize, out: *mut isize, access: u32, inherit: i32, opts: u32) -> i32;
+        pub fn ReOpenFile(h: isize, access: u32, share: u32, flags: u32) -> isize;
         pub fn ReadProcessMemory(p: isize, from: *const c_void, to: *mut c_void, len: usize, done: *mut usize) -> i32;
         pub fn TlsAlloc() -> u32;
         pub fn TlsGetValue(idx: u32) -> *mut c_void;

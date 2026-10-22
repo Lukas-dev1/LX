@@ -1733,6 +1733,7 @@ pub fn close(fd: u64) -> R {
         if let Fd::File { f, host } = &s.fd {
             let h = f.as_raw_handle() as isize;
             LOCKS.lock().unwrap().retain(|l| l.0 != h); // NT drops the handle's locks with it
+            forget_lock_via(h);
             drop_posix_locks(host);
         }
         Ok(0)
@@ -1783,6 +1784,7 @@ fn drop_posix_locks(host: &Path) {
         nt_unlock(lh, s, l);
         false
     });
+    forget_lock_via(lh);
     unsafe { crate::win::CloseHandle(lh) };
 }
 
@@ -1798,17 +1800,50 @@ fn ov(at: u64) -> Overlapped {
     Overlapped { internal: [0; 2], offset: at as u32, offset_high: (at >> 32) as u32, event: 0 }
 }
 
+/// LockFileEx wants read or write data access, which an append-only handle (O_WRONLY|O_APPEND, like
+/// dnf's log) lacks: such a handle's locks are taken through a read handle on the same file instead,
+/// (handle, read handle), until the handle is closed.
+static LOCK_VIA: Mutex<Vec<(isize, isize)>> = Mutex::new(Vec::new());
+
+fn lock_via(h: isize) -> isize {
+    LOCK_VIA.lock().unwrap().iter().find(|v| v.0 == h).map_or(h, |v| v.1)
+}
+
+/// `h` is being closed: close its read handle too (which drops the locks held through it).
+fn forget_lock_via(h: isize) {
+    let mut via = LOCK_VIA.lock().unwrap();
+    if let Some(i) = via.iter().position(|v| v.0 == h) {
+        unsafe { crate::win::CloseHandle(via.swap_remove(i).1) };
+    }
+}
+
 fn nt_try_lock(h: isize, start: u64, len: u64, excl: bool) -> bool {
     const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1;
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
     let flags = LOCKFILE_FAIL_IMMEDIATELY | if excl { LOCKFILE_EXCLUSIVE_LOCK } else { 0 };
-    let mut o = ov(start);
-    unsafe { crate::win::LockFileEx(h, flags, 0, len as u32, (len >> 32) as u32, (&mut o as *mut Overlapped).cast()) != 0 }
+    let lock = |via: isize| {
+        let mut o = ov(start);
+        unsafe { crate::win::LockFileEx(via, flags, 0, len as u32, (len >> 32) as u32, (&mut o as *mut Overlapped).cast()) != 0 }
+    };
+    let via = lock_via(h);
+    if lock(via) {
+        return true;
+    }
+    if via != h || unsafe { crate::win::GetLastError() } != 5 {
+        return false; // ERROR_LOCK_VIOLATION: someone holds it
+    }
+    // ERROR_ACCESS_DENIED: GENERIC_READ, sharing everything.
+    let r = unsafe { crate::win::ReOpenFile(h, 0x8000_0000, 7, 0) };
+    if r == -1 {
+        return false;
+    }
+    LOCK_VIA.lock().unwrap().push((h, r));
+    lock(r)
 }
 
 fn nt_unlock(h: isize, start: u64, len: u64) {
     let mut o = ov(start);
-    unsafe { crate::win::UnlockFileEx(h, 0, len as u32, (len >> 32) as u32, (&mut o as *mut Overlapped).cast()) };
+    unsafe { crate::win::UnlockFileEx(lock_via(h), 0, len as u32, (len >> 32) as u32, (&mut o as *mut Overlapped).cast()) };
 }
 
 /// Take a lock; with `wait`, retry until it's free or a signal arrives (F_SETLKW / flock without LOCK_NB).
