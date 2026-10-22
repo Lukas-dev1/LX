@@ -112,6 +112,7 @@ expect "flock/lockf on an append-only fd" 0 "flock held free" -- run -v "$GUEST"
 expect "short timed waits sleep ~1 ms (no spin, no 15 ms tick)" 0 "OK" -- run -v "$GUEST" python:3.12 python3 /t/timedwait.py
 expect "erlang: VM, 1000 processes, os:cmd port" 0 "sum=6 procs=1000 port-ok" -- run rabbitmq:3-alpine erl -noshell -eval 'io:format("sum=~p procs=~p ~s~n",[lists:sum([1,2,3]), length([spawn(fun() -> ok end) || _ <- lists:seq(1,1000)]), os:cmd("echo port-ok")]), halt().'
 expect "/proc/self/fd lists open fds" 0 "0 1 2 3" -- run alpine sh -c 'ls /proc/self/fd | tr "\n" " "'
+expect "fsync of a read-only fd" 0 "fsync read-only OK" -- run -v "$GUEST" python:3.12 python3 /t/fsyncro.py
 expect "SIGSEGV reaches the guest's handler" 139 "Fatal Python error: Segmentation fault" -- run python:3.12 python3 -X faulthandler -c "import ctypes; ctypes.string_at(0)"
 expect "httpd: config check (ErrorLog /proc/self/fd/2)" 0 "Syntax OK" -- run httpd:alpine httpd -t
 expect "fchmodat2 by path and by fd" 0 "fchmodat2 640 604" -- run -v "$GUEST" python:3.12 python3 /t/fchmodat2.py

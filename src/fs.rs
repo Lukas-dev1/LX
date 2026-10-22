@@ -2096,7 +2096,15 @@ fn posix_lock(fd: u64, cmd: u64, arg: u64) -> R {
 /// fsync / fdatasync: flush the file to disk (databases rely on it for durability).
 pub fn fsync(fd: u64) -> R {
     with(|fs| match fs.fd(fd)? {
-        Fd::File { f, .. } => f.sync_all().map(|_| 0).map_err(errno),
+        // NT flushes only through a handle with write access; Linux fsyncs a read-only fd too (dnf does,
+        // after downloading through another): flush through a writable open of the file, or there's
+        // nothing of ours to flush.
+        Fd::File { f, host } => match f.sync_all() {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                Ok(OpenOptions::new().write(true).open(host).and_then(|w| w.sync_all()).map_or(0, |_| 0))
+            }
+            r => r.map(|_| 0).map_err(errno),
+        },
         _ => Ok(0), // pipes, sockets, devices, directories: nothing to flush
     })
 }
