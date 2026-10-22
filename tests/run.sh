@@ -267,6 +267,15 @@ stop_test handler 7 "got TERM"
 stop_test busy 143
 stop_test exec 143
 
+# lx stop -t: a container that ignores SIGTERM is killed after the given time (1 s here, not 10).
+tag=stopt-$$
+$LX run alpine sh -c "trap '' TERM; while :; do sleep 0.1; done # $tag" < /dev/null > /dev/null 2>&1 &
+job=$!
+for _ in $(seq 100); do cpid=$($LX ps | awk -v t="$tag" 'index($0, t) {print $1; exit}'); [ -n "$cpid" ] && break; sleep 0.1; done
+sleep 1
+start=$(date +%s); $LX stop -t 1 "$cpid" > /dev/null 2>&1; wait $job; code=$?; took=$(( $(date +%s) - start ))
+if [ $code = 137 ] && [ $took -le 5 ]; then ok "lx stop -t 1"; else bad "lx stop -t 1: exit $code after ${took}s"; fi
+
 # lx exec: a command in a running container sees its files, env and directory (here as another user),
 # and an exec'd process ends with the container.
 tag=exectest-$$
