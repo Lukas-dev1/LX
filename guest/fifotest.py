@@ -34,7 +34,7 @@ assert os.read(r, 10) == b"x"
 # s6-svscan's control FIFO: the reader holds a writer of its own, and others still get in, one by one.
 os.mkfifo("/tmp/ctl")
 r = os.open("/tmp/ctl", os.O_RDONLY | os.O_NONBLOCK)
-keep = os.open("/tmp/ctl", os.O_WRONLY)
+keep = os.open("/tmp/ctl", os.O_WRONLY | os.O_NONBLOCK)  # at once: s6-supervise does
 for i in range(3):
     w = os.open("/tmp/ctl", os.O_WRONLY | os.O_NONBLOCK)
     os.write(w, str(i).encode())
