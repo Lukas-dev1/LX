@@ -1072,6 +1072,14 @@ fn sockopt(level: u64, name: u64) -> Option<(i32, i32)> {
 
 pub fn sys_setsockopt(fd: u64, level: u64, name: u64, val: u64, len: u64) -> R {
     let s = fs::sock(fd)?;
+    if (level, name) == (1, 15) && is_udp(s.s) && len >= 4 && unsafe { *(val as *const i32) } != 0 {
+        // SO_REUSEPORT on UDP (nginx's `listen 443 quic reuseport`: a socket per worker on one address):
+        // Windows' SO_REUSEADDR lets them share it. ponytail: TCP keeps ignoring it, since SO_REUSEADDR
+        // on a Windows TCP listener would let another process take the port.
+        let on = 1i32;
+        unsafe { setsockopt(s.s, 0xffff, 0x0004, (&on as *const i32).cast(), 4) };
+        return Ok(0);
+    }
     let Some((l, n)) = sockopt(level, name) else { return Ok(0) };
     if unsafe { setsockopt(s.s, l, n, val as *const u8, len.min(64) as i32) } != 0 { Err(last_err()) } else { Ok(0) }
 }
