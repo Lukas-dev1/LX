@@ -396,7 +396,12 @@ fn run() -> Result<(), String> {
         let (mut volumes, mut envs, mut workdir, mut user) = (Vec::new(), Vec::new(), None, None);
         let (mut entrypoint, mut keep_layer, mut name) = (None, None, None);
         let mut extra_hosts: Vec<(String, String)> = Vec::new();
-        while let [flag, value, more @ ..] = rest {
+        while let [flag, more @ ..] = rest {
+            if NO_OP_FLAGS.contains(&flag.as_str()) {
+                rest = more;
+                continue;
+            }
+            let [value, more @ ..] = more else { break };
             match flag.as_str() {
                 // --add-host name:ip, like Docker (lx compose names the other services this way).
                 "--add-host" => {
@@ -497,12 +502,17 @@ fn container(id: &str) -> Result<u32, String> {
     proc::container_pid(id).ok_or(format!("{id}: no such container (see lx ps)"))
 }
 
-/// Where `-d`/`--detach` is among `lx run`'s flags (each of the others takes a value).
+/// `lx run` flags without a value, accepted for Docker's sake: stdin is always attached and containers
+/// are always removed when they exit.
+const NO_OP_FLAGS: [&str; 7] = ["-i", "-t", "-it", "-ti", "--interactive", "--tty", "--rm"];
+
+/// Where `-d`/`--detach` is among `lx run`'s flags (the others take a value, or are NO_OP_FLAGS).
 fn detach_flag(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while let Some(a) = args.get(i) {
         match a.as_str() {
             "-d" | "--detach" => return Some(i),
+            a if NO_OP_FLAGS.contains(&a) => i += 1,
             a if a.starts_with('-') => i += 2,
             _ => return None, // the image
         }
