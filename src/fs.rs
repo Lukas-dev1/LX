@@ -21,7 +21,18 @@ use crate::net::{Epoll, Sock};
 const LINK_MAGIC: &[u8] = b"\0lxlink\0";
 /// Marker at a bound AF_UNIX path (the real socket file lives at a short hashed host path, see net.rs).
 const SOCK_MAGIC: &[u8] = b"\0lxsock\0";
-const FIFO_MAGIC: &[u8] = b"\0lxfifo\0"; // as long as SOCK_MAGIC: stat reads such a small file once
+/// A FIFO's marker is this and an 8-byte id, which names its pipe: the FIFO stays itself when renamed
+/// (s6's ftrig makes one under a temporary name, opens it, then renames it into place).
+const FIFO_MAGIC: &[u8] = b"\0lxfifo\0";
+const FIFO_LEN: u64 = 16;
+
+fn fifo_id(host: &Path) -> Option<u64> {
+    if !attrs(host).is_some_and(|m| !m.dir && m.len == FIFO_LEN) {
+        return None;
+    }
+    let d = fs::read(host).ok()?;
+    Some(u64::from_le_bytes(d.strip_prefix(FIFO_MAGIC)?.try_into().ok()?))
+}
 pub const AT_FDCWD: u64 = -100i64 as u64;
 pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_EMPTY_PATH: u64 = 0x1000;
@@ -1429,7 +1440,9 @@ pub fn mknodat(dirfd: u64, path: u64, mode: u64) -> R {
                 return Err(EEXIST);
             }
             let host = fs.writable(&comps_of(&guest), false)?;
-            fs::write(&host, FIFO_MAGIC).map_err(errno)?;
+            let mut id = DefaultHasher::new();
+            (&host, std::process::id(), std::time::SystemTime::now()).hash(&mut id);
+            fs::write(&host, [FIFO_MAGIC, &id.finish().to_le_bytes()].concat()).map_err(errno)?;
             if fs.keeps_meta(&comps_of(&guest)) {
                 let _ = set_meta(&host, new_meta(mode));
             }
@@ -1439,10 +1452,10 @@ pub fn mknodat(dirfd: u64, path: u64, mode: u64) -> R {
     }
 }
 
-fn open_fifo(host: &Path, flags: u64) -> R {
+fn open_fifo(id: u64, flags: u64) -> R {
     use crate::win::*;
     const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
-    let name: Vec<u16> = format!("\\\\.\\pipe\\lx-fifo-{:x}", ino(host)).encode_utf16().chain([0]).collect();
+    let name: Vec<u16> = format!("\\\\.\\pipe\\lx-fifo-{id:x}").encode_utf16().chain([0]).collect();
     let nonblock = flags & O_NONBLOCK != 0;
     let wait = || {
         if crate::signal::deliverable() {
@@ -1868,8 +1881,8 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
     if let Some(n) = fd_alias(&guest) {
         return dup(n, 0, cloexec);
     }
-    if attrs(&host).is_some_and(|m| !m.dir && m.len == FIFO_MAGIC.len() as u64) && fs::read(&host).is_ok_and(|d| d == FIFO_MAGIC) {
-        return open_fifo(&host, flags); // outside the fs lock: it may wait for the other end
+    if let Some(id) = fifo_id(&host) {
+        return open_fifo(id, flags); // outside the fs lock: it may wait for the other end
     }
     if guest == "/dev/tty" {
         return Err(crate::syscall::ENXIO); // no controlling terminal, like `docker run` without -t
@@ -2526,11 +2539,11 @@ pub fn fchmeta(fd: u64, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
 fn stat_of(host: &Path) -> Result<[u64; 18], i64> {
     let m = attrs(host).ok_or(ENOENT)?;
     let link = link_target(host, &m);
-    let marker = if !m.dir && m.len == SOCK_MAGIC.len() as u64 { fs::read(host).ok() } else { None };
+    let sock = !m.dir && m.len == SOCK_MAGIC.len() as u64 && fs::read(host).is_ok_and(|d| d == SOCK_MAGIC);
     let (mode, size, nlink) = match &link {
         _ if m.dir => (0o040755, 4096, 2),
-        _ if marker.as_deref() == Some(SOCK_MAGIC) => (0o140755, 0, 1), // S_IFSOCK
-        _ if marker.as_deref() == Some(FIFO_MAGIC) => (0o010644, 0, 1), // S_IFIFO
+        _ if sock => (0o140755, 0, 1), // S_IFSOCK
+        _ if fifo_id(host).is_some() => (0o010644, 0, 1), // S_IFIFO
         Some(t) => (0o120777, t.len() as u64, 1),
         None => (0o100755, m.len, 1),
     };
