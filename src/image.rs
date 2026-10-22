@@ -234,6 +234,7 @@ pub fn pull(r: &Ref) -> Result<PathBuf, String> {
         let _ = std::fs::remove_file(&plain);
         let _ = std::fs::remove_file(blob);
     }
+    std::fs::write(dir.join(fs::MARKED), b"").map_err(|e| e.to_string())?; // unpack marked every link
     std::fs::rename(&config, dir.join("config.json")).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_dir_all(&tmp);
     r.record_name(&dir);

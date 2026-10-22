@@ -137,6 +137,10 @@ fn run_steps(text: &str, context: &Path, work: &Path, mut args: HashMap<String, 
                 std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
                 config = json!({});
                 shell = vec!["/bin/sh".to_string(), "-c".to_string()];
+                // Every marker this build makes carries the attribute; the base's did if it's stamped.
+                if image == "scratch" || source(image, &stages)?.join(crate::fs::MARKED).exists() {
+                    std::fs::write(cur.join(crate::fs::MARKED), b"").map_err(|e| e.to_string())?;
+                }
                 if image != "scratch" {
                     let base = source(image, &stages)?;
                     link_tree(&base.join("rootfs"), &root).map_err(|e| format!("copying {image}: {e}"))?;
@@ -554,6 +558,9 @@ fn copy_in(from: &Path, to: &Path, owner: Option<(u32, u32)>, imaged: bool, igno
     }
     remove(to);
     std::fs::copy(from, to)?;
+    if imaged {
+        crate::fs::mark_if_marker(to); // COPY --from an image made before marker attributes
+    }
     let mut head = [0u8; 4];
     let n = std::io::Read::read(&mut std::fs::File::open(from)?, &mut head)?;
     let exec = head[..n].starts_with(b"#!") || head[..n].starts_with(b"\x7fELF");
