@@ -2281,7 +2281,11 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
                 .open(&host)
                 .map_err(errno)?;
             if flags & O_CREAT != 0 && meta.is_none() && fs.keeps_meta(&comps_of(&guest)) {
-                let _ = set_meta(&host, new_meta_in(&host, mode, false));
+                let m = new_meta_in(&host, mode, false);
+                forget(&METAS, &host);
+                if !set_meta_on(f.as_raw_handle() as isize, m) {
+                    let _ = set_meta(&host, m); // opened without FILE_WRITE_EA (read-only): by path
+                }
             }
             Fd::File { f, host }
         };
@@ -2816,15 +2820,59 @@ fn meta_stream(host: &Path) -> PathBuf {
     p.into()
 }
 
+// Mode, uid and gid live in an NTFS extended attribute, "LX" (12 bytes): set through a handle we may
+// already hold, read with one attribute-only open; the :lx stream used before took a second file open
+// to write (~600 us a new file against ~20) and to read, and is still read for older layers and images.
+unsafe extern "system" {
+    fn NtSetEaFile(h: isize, iosb: *mut [usize; 2], buf: *const u8, len: u32) -> i32;
+    fn NtQueryEaFile(h: isize, iosb: *mut [usize; 2], buf: *mut u8, len: u32, single: u8, list: *const u8, list_len: u32,
+                     index: *const u32, restart: u8) -> i32;
+}
+
+/// FILE_FULL_EA_INFORMATION for "LX" = m: next 0, flags 0, name length, value length, "LX\0", value.
+fn ea_entry(m: [u32; 3]) -> Vec<u8> {
+    let mut b = vec![0, 0, 0, 0, 0, 2, 12, 0];
+    b.extend(b"LX\0");
+    b.extend(m.iter().flat_map(|v| v.to_le_bytes()));
+    b
+}
+
+/// Set our metadata on an open file or directory (it needs FILE_WRITE_EA).
+fn set_meta_on(h: isize, m: [u32; 3]) -> bool {
+    let e = ea_entry(m);
+    let mut iosb = [0usize; 2];
+    unsafe { NtSetEaFile(h, &mut iosb, e.as_ptr(), e.len() as u32) == 0 }
+}
+
+/// A handle with just `access` (FILE_READ_EA / FILE_WRITE_EA) to a file or directory, not its data.
+fn ea_handle(host: &Path, access: u32) -> Option<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    OpenOptions::new().access_mode(access).share_mode(7).custom_flags(0x0200_0000).open(host).ok() // BACKUP_SEMANTICS
+}
+
 pub fn get_meta(host: &Path) -> Option<[u32; 3]> {
-    let b = fs::read(meta_stream(host)).ok()?;
-    let v = |i: usize| Some(u32::from_le_bytes(b.get(i * 4..i * 4 + 4)?.try_into().ok()?));
-    Some([v(0)?, v(1)?, v(2)?])
+    let from_ea = ea_handle(host, 0x8).and_then(|f| { // FILE_READ_EA
+        // The query names the one EA we want: FILE_GET_EA_INFORMATION { next 0, length 2, "LX\0" }.
+        let want = [0u8, 0, 0, 0, 2, b'L', b'X', 0];
+        let (mut out, mut iosb) = ([0u8; 64], [0usize; 2]);
+        let st = unsafe { NtQueryEaFile(f.as_raw_handle() as isize, &mut iosb, out.as_mut_ptr(), 64, 1, want.as_ptr(), 8, std::ptr::null(), 1) };
+        // A file without it answers with the name and an empty value.
+        (st == 0 && u16::from_le_bytes([out[6], out[7]]) == 12).then(|| {
+            let v = |i: usize| u32::from_le_bytes(out[11 + i * 4..15 + i * 4].try_into().unwrap());
+            [v(0), v(1), v(2)]
+        })
+    });
+    from_ea.or_else(|| {
+        let b = fs::read(meta_stream(host)).ok()?;
+        let v = |i: usize| Some(u32::from_le_bytes(b.get(i * 4..i * 4 + 4)?.try_into().ok()?));
+        Some([v(0)?, v(1)?, v(2)?])
+    })
 }
 
 pub fn set_meta(host: &Path, m: [u32; 3]) -> io::Result<()> {
     forget(&METAS, host);
-    fs::write(meta_stream(host), m.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
+    let f = ea_handle(host, 0x10).ok_or_else(|| io::Error::from_raw_os_error(5))?; // FILE_WRITE_EA
+    if set_meta_on(f.as_raw_handle() as isize, m) { Ok(()) } else { Err(io::Error::from_raw_os_error(5)) }
 }
 
 /// What a newly created file or directory gets: `mode` less the umask, owned by the effective ids.
@@ -3690,6 +3738,27 @@ fn markers_are_flagged() {
     assert_eq!(read_link(&upper.join("copied")).as_deref(), Some("target"));
     MARKED_ROOTS.write().unwrap().clear();
     fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn meta_in_an_ea_and_from_an_old_stream() {
+    let d = std::env::temp_dir().join(format!("lx-meta-{}", std::process::id()));
+    fs::create_dir_all(&d).unwrap();
+    let (f, old, dir) = (d.join("f"), d.join("old"), d.join("sub"));
+    fs::write(&f, "x").unwrap();
+    fs::write(&old, "x").unwrap();
+    fs::create_dir(&dir).unwrap();
+    assert_eq!(get_meta(&f), None);
+    set_meta(&f, [0o640, 7, 8]).unwrap();
+    assert_eq!(get_meta(&f), Some([0o640, 7, 8]));
+    set_meta(&f, [0o600, 9, 10]).unwrap(); // a change replaces it
+    assert_eq!(get_meta(&f), Some([0o600, 9, 10]));
+    set_meta(&dir, [0o2755, 0, 5]).unwrap(); // directories too
+    assert_eq!(get_meta(&dir), Some([0o2755, 0, 5]));
+    // Layers and images from before keep their :lx stream, and it still reads.
+    fs::write(meta_stream(&old), [0o644u32, 1, 2].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+    assert_eq!(get_meta(&old), Some([0o644, 1, 2]));
+    fs::remove_dir_all(d).unwrap();
 }
 
 #[test]
