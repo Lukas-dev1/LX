@@ -1453,6 +1453,7 @@ pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
             unsafe { *(arg as *mut i32) = avail as i32 };
             Ok(0)
         }
+        (0x8910..=0x89ff, Io::Sock(_)) => crate::net::if_ioctl(req, arg), // SIOCGIF*
         (_, Io::Handle(h)) if is_console(h) => tty_ioctl(h, req, arg),
         (_, Io::Pipe(p)) if p.pty.is_some() => pty_ioctl(&p, req, arg),
         _ => Err(crate::syscall::ENOTTY),
