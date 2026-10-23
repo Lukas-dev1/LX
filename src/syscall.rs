@@ -1809,8 +1809,13 @@ fn clock_nanosleep(clock: u64, flags: u64, req: u64) -> R {
     } else {
         want
     };
-    std::thread::sleep(wait);
-    Ok(0)
+    if wait < std::time::Duration::from_millis(1) {
+        std::thread::sleep(wait); // too short for a signal to matter; the ms wait below would round it
+        return Ok(0);
+    }
+    // A signal cuts it short (EINTR), as for nanosleep: Python's and glibc's sleep() come here.
+    // ponytail: no remaining time written back, like nanosleep.
+    signal::interruptible_sleep(((wait.as_nanos() + 999_999) / 1_000_000).min(u32::MAX as u128 - 1) as u32)
 }
 
 /// A `struct timeval *` timeout in ms; NULL means wait forever (-1).
