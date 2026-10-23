@@ -2148,6 +2148,17 @@ pub fn writev(fd: u64, iov: u64, cnt: u64) -> R {
     Ok(total)
 }
 
+/// Make `f` sparse, so growing it with ftruncate leaves a hole, as on Linux, instead of NTFS allocating
+/// the new size on disk. Best effort: a volume without sparse files just allocates.
+fn set_sparse(f: &File) {
+    unsafe extern "system" {
+        fn DeviceIoControl(h: isize, code: u32, inb: *mut u8, inn: u32, outb: *mut u8, outn: u32, got: *mut u32, ov: *mut u8) -> i32;
+    }
+    const FSCTL_SET_SPARSE: u32 = 0x900C4;
+    let mut got = 0u32;
+    unsafe { DeviceIoControl(f.as_raw_handle() as isize, FSCTL_SET_SPARSE, std::ptr::null_mut(), 0, std::ptr::null_mut(), 0, &mut got, std::ptr::null_mut()) };
+}
+
 /// A file holding `bytes` that Windows deletes when its last handle closes (forks inherit the handle):
 /// how synthetic /proc files become ordinary fds that read, seek, fstat and mmap.
 fn scratch_file(fs: &Fs, bytes: &[u8]) -> io::Result<(File, PathBuf)> {
@@ -2161,6 +2172,7 @@ fn scratch_file(fs: &Fs, bytes: &[u8]) -> io::Result<(File, PathBuf)> {
     const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
     let mut f = OpenOptions::new().read(true).write(true).create_new(true)
         .custom_flags(FILE_FLAG_DELETE_ON_CLOSE).attributes(FILE_ATTRIBUTE_TEMPORARY).open(&host)?;
+    set_sparse(&f); // CoreCLR ftruncates its memfd to 16 GB
     f.write_all(bytes)?;
     f.rewind()?;
     Ok((f, host))
@@ -3204,10 +3216,17 @@ pub fn symlinkat(target: u64, dirfd: u64, path: u64) -> R {
 
 /// truncate(path) / ftruncate(fd).
 pub fn truncate(dirfd: u64, path: u64, fd: Option<u64>, len: u64) -> R {
+    // Growing leaves a hole, as on Linux (`truncate -s 10G` must not take 10 GB of the host's disk).
+    let set = |f: &File| {
+        if f.metadata().is_ok_and(|m| len > m.len()) {
+            set_sparse(f);
+        }
+        f.set_len(len).map(|_| 0).map_err(errno)
+    };
     with(|fs| {
         let f = match fd {
             Some(fd) => match fs.fd(fd)? {
-                Fd::File { f, .. } => return f.set_len(len).map(|_| 0).map_err(errno),
+                Fd::File { f, .. } => return set(f),
                 _ => return Err(EINVAL),
             },
             None => {
@@ -3215,7 +3234,7 @@ pub fn truncate(dirfd: u64, path: u64, fd: Option<u64>, len: u64) -> R {
                 fs.writable(&comps_of(&guest), true)?
             }
         };
-        OpenOptions::new().write(true).open(f).and_then(|f| f.set_len(len)).map(|_| 0).map_err(errno)
+        set(&OpenOptions::new().write(true).open(f).map_err(errno)?)
     })
 }
 
