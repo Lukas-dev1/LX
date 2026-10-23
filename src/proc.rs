@@ -39,16 +39,56 @@ pub fn set_id(id: &AtomicU32, v: u64) -> R {
 /// uid, gid and umask go to every later lx process of this one (fork and exec start new ones) in the
 /// host environment, which the guest never sees: `su postgres -c pg_ctl` must exec pg_ctl as postgres.
 pub fn save_ids() {
-    let v = format!("{} {} {}", UID.load(Relaxed), GID.load(Relaxed), fs::UMASK.load(Relaxed));
+    let groups: Vec<String> = GROUPS.lock().unwrap().iter().map(u32::to_string).collect();
+    let v = format!("{} {} {} {}", UID.load(Relaxed), GID.load(Relaxed), fs::UMASK.load(Relaxed), groups.join(","));
     unsafe { std::env::set_var("LX_IDS", v) };
 }
 
 pub fn load_ids() {
     let Ok(v) = std::env::var("LX_IDS") else { return };
-    let n: Vec<u32> = v.split(' ').filter_map(|x| x.parse().ok()).collect();
+    let mut f = v.split(' ');
+    let n: Vec<u32> = f.by_ref().take(3).filter_map(|x| x.parse().ok()).collect();
     if let [uid, gid, mask] = n[..] {
         (UID.store(uid, Relaxed), GID.store(gid, Relaxed), fs::UMASK.store(mask, Relaxed));
     }
+    *GROUPS.lock().unwrap() = f.next().unwrap_or("").split(',').filter_map(|g| g.parse().ok()).collect();
+}
+
+/// Supplementary groups (setgroups; su, login and initgroups set them), inherited like the ids.
+static GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// getgroups(size, list): with size 0 only the count; a list too short is EINVAL.
+pub fn getgroups(size: u64, list: u64) -> R {
+    let g = GROUPS.lock().unwrap().clone();
+    if size as i32 == 0 {
+        return Ok(g.len() as i64);
+    }
+    if (size as i32) < g.len() as i32 {
+        return Err(syscall::EINVAL);
+    }
+    let bytes: Vec<u8> = g.iter().flat_map(|x| x.to_le_bytes()).collect();
+    syscall::put_guest(list, &bytes)?;
+    Ok(g.len() as i64)
+}
+
+/// setgroups(size, list): root only (CAP_SETGID), at most NGROUPS_MAX (65536).
+pub fn setgroups(size: u64, list: u64) -> R {
+    if size as i32 > 65536 || (size as i32) < 0 {
+        return Err(syscall::EINVAL);
+    }
+    if UID.load(Relaxed) != 0 {
+        return Err(syscall::EPERM);
+    }
+    syscall::check_guest(list, size as usize * 4, false)?;
+    let g: Vec<u32> = (0..size as usize).map(|i| unsafe { *(list as *const u32).add(i) }).collect();
+    *GROUPS.lock().unwrap() = g;
+    save_ids();
+    Ok(0)
+}
+
+/// Whether the caller is in group `gid` (its own or a supplementary one), for permission checks.
+pub fn in_group(gid: u32) -> bool {
+    GID.load(Relaxed) == gid || GROUPS.lock().unwrap().contains(&gid)
 }
 
 pub fn get_res(id: &AtomicU32, out: [u64; 3]) -> R {

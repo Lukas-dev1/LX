@@ -3074,7 +3074,7 @@ pub fn faccessat(dirfd: u64, path: u64, mode: u64) -> R {
     let ok = if me == 0 {
         mode & 1 == 0 || m.dir || perm & 0o111 != 0
     } else {
-        let bits = if me == uid { perm >> 6 } else if my_gid == gid { perm >> 3 } else { perm } & 7;
+        let bits = if me == uid { perm >> 6 } else if my_gid == gid || crate::proc::in_group(gid) { perm >> 3 } else { perm } & 7;
         mode as u32 & !bits == 0
     };
     if ok { Ok(0) } else { Err(EACCES) }

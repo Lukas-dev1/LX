@@ -1186,8 +1186,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         157 if a[0] == 22 => crate::seccomp::set(a[1], a[2]), // PR_SET_SECCOMP
         157 => prctl(a[0], a[1]),
         317 => crate::seccomp::seccomp(a[0], a[1], a[2]),
-        115 => Ok(0),                  // getgroups: no supplementary groups
-        116 => Ok(0),                  // setgroups: accepted
+        115 => proc::getgroups(a[0], a[1]),
+        116 => proc::setgroups(a[0], a[1]),
         109 => proc::setpgid(a[0] as u32, a[1] as u32),
         110 => proc::getppid(),
         111 => proc::getpgid(0), // getpgrp
