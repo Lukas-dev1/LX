@@ -53,6 +53,7 @@ cc_static 2 rootfs/sigfdtest guest/sigfdtest.c
 cc_static 2 rootfs/sigfutex guest/sigfutex.c
 cc_static 2 rootfs/restarttest guest/restarttest.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
+cc_static 2 rootfs/shfutex guest/shfutex.c
 cc_static 2 rootfs/sysbench guest/sysbench.c
 cc_static 2 rootfs/xmmtest guest/xmmtest.c
 cc_static 2 rootfs/sigxmm guest/sigxmm.c
@@ -97,6 +98,7 @@ expect "signalfd in epoll, woken by a child's signal" 0 "OK" -- rootfs /sigfdtes
 expect "SIGTERM reaches threads parked in futexes (Go idle)" 0 "sigfutex OK" -- rootfs /sigfutex
 expect "SA_RESTART: an interrupted read continues" 0 "read=1" -- rootfs /restarttest
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
+expect "a shared futex wakes another process (FUTEX_WAKE counts it)" 0 "woke=1 child=0" -- rootfs /shfutex
 expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regress.sh
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
 expect "the first process is pid 1"  0 "pid1 OK" -- run -v "$GUEST" alpine sh /t/pid1.sh
@@ -112,6 +114,7 @@ expect "inotify: container dir and image dir" 0 "inotify OK etc delete motd" -- 
 expect "eventfd keeps its fd number in a forked child" 0 "eventfd fork OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/eventfdfork.py
 expect "seccomp: a filter here and in an exec'd child" 0 "seccomp OK child filtered 2" -- run -v "$GUEST" python:3.12 python3 /t/seccomptest.py
 expect "debian: pty (openpty, pty.fork)" 0 "pty OK" -- run -v "$GUEST" python:3.12 python3 /t/ptytest.py
+expect "a MAP_SHARED mapping past EOF sees the file grow (bbolt)" 0 "grown b'a' b'b'" -- run -v "$GUEST" python:3.12 python3 /t/mmapgrow.py
 expect "FIFOs: mkfifo, open waits, ENXIO, poll" 0 "fifo OK 0o600 through the fifo" -- run -v "$GUEST" python:3.12 python3 /t/fifotest.py
 expect "exec with a 5000-byte argument (MAX_ARG_STRLEN, not PATH_MAX)" 0 "5001" -- run alpine sh -c 'a=$(printf "%05000d" 0); /bin/echo "$a" | wc -c'
 expect "FIFOs in a shell loop" 0 "got round 2" -- run alpine sh -c 'mkfifo /tmp/p; for i in 1 2; do (echo round $i > /tmp/p &); read line < /tmp/p; echo "got $line"; done'
@@ -147,8 +150,11 @@ expect "mongodb: mongod + mongosh aggregate" 0 "sum=42" -- run -p 27018:27017 mo
 expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERSION=9 -w /usr python:3.12-alpine sh -c 'echo A=$A V=$PYTHON_VERSION $(pwd)'
 expect "/proc/<getpid()> after exec" 0 "own pid ['0', '1', '2']" -- run python:3.12-alpine sh -c 'exec python3 -c "import os; p=f\"/proc/{os.getpid()}\"; os.stat(p); print(\"own pid\", sorted(os.listdir(p + \"/fd\"))[:3])"'
 expect "hard link counts (container files; image files stay 1)" 0 "nlink 2 1 image 1" -- run alpine sh -c 'touch /tmp/a; ln /tmp/a /tmp/b; x=$(stat -c %h /tmp/a); rm /tmp/b; echo "nlink $x $(stat -c %h /tmp/a) image $(stat -c %h /bin/busybox)"'
+expect "chown drops setuid/setgid; chmod g+s outside the group is dropped" 0 "chown:755 sgid:777" -- run alpine sh -c 'cd /tmp && touch f && chmod 6755 f && chown 0:0 f && mkdir d && chown 65534:0 d && chmod 777 d && su -s /bin/sh nobody -c "chmod 2777 d"; echo "chown:$(stat -c %a f) sgid:$(stat -c %a d)"'
+expect "a 300-byte name is ENAMETOOLONG" 0 "too long" -- run alpine sh -c 'cd $(printf "%0300d" 0) 2>&1; true'
 expect "procps ps, vmstat (/proc/stat, /proc/vmstat)" 0 "ps ok vmstat ok" -- run python:3.12 sh -c 'ps aux > /dev/null && p="ps ok"; vmstat > /dev/null && echo "$p vmstat ok"'
 expect "access(X_OK) as root needs an x bit; nobody needs its own bits" 0 "x:no w:no r:yes" -- run alpine sh -c 'touch /tmp/f; chmod 604 /tmp/f; [ -x /tmp/f ] && x=yes || x=no; su -s /bin/sh nobody -c "[ -w /tmp/f ] && w=yes || w=no; [ -r /tmp/f ] && r=yes || r=no; echo x:$x w:\$w r:\$r"'
+expect "/proc/self/maps lists mapped code" 0 "maps ok" -- run alpine sh -c 'grep -q " r-xp " /proc/self/maps && echo maps ok'
 expect "pty: ttyname, slave opened twice" 0 "pts ok x" -- run python:3.12-alpine python3 -c 'import os,pty; m,s=pty.openpty(); n=os.ttyname(s); f=os.open(n, os.O_RDWR); os.write(f, b"x"); print("pts ok", os.read(m, 1).decode())'
 expect "a signal cuts clock_nanosleep short (Python's time.sleep)" 0 "woke after 1" -- run python:3.12-alpine python3 -c 'import signal,sys,time; t=time.time(); signal.signal(signal.SIGALRM, lambda *_: (print("woke after", round(time.time()-t)), sys.exit(0))); signal.alarm(1); time.sleep(10)'
 expect "#! script run through a link sees the link's name" 0 "/tmp/l ./l" -- run alpine sh -c 'printf "#!/bin/sh\necho \$0\n" > /tmp/s; chmod +x /tmp/s; ln -s /tmp/s /tmp/l; cd /tmp; echo $(/tmp/l) $(./l)'
@@ -188,6 +194,7 @@ rm -rf rootfs/volumes/lxtest-named; mkdir -p rootfs/volumes/lxtest-named
 expect "named volume: modes kept" 0 "600 1:2" -- run -v "$ROOT/rootfs/volumes/lxtest-named:/data" alpine sh -c 'touch /data/f; chmod 600 /data/f; chown 1:2 /data/f; stat -c "%a %u:%g" /data/f'
 expect "container layer: changes stay in the run" 0 "done" -- run alpine sh -c 'rm -f /etc/motd; echo x > /etc/new; echo done'
 expect "container layer: next run starts pristine" 0 "pristine" -- run alpine sh -c '[ -f /etc/motd ] && [ ! -e /etc/new ] && echo pristine'
+expect "a dir moved over a deleted image tree doesn't show the image's old contents" 0 "hidden" -- run alpine sh -c 'mv /usr/share /tmp/gone && mkdir /usr/share && mkdir /tmp/d && mv /tmp/d /usr/share/apk && if [ -e /usr/share/apk/keys ]; then echo LEAK; else echo hidden; fi'
 [ "$before" = "$(img_sum)" ] && ok "image store unchanged by containers" || bad "image store unchanged by containers"
 
 # ---- repeated runs: every run must print OK; the trap fallback and FS faults must stay unused ----
@@ -344,6 +351,8 @@ for _ in $(seq 40); do
 done
 $LX stop "lxipA-$$" > /dev/null 2>&1; $LX stop "lxipB-$$" > /dev/null 2>&1
 if [ "$got" = "AB" ]; then ok "two containers on the same port"; else bad "two containers on the same port: got '$got'"; fi
+expect "netlink: ip addr lists lo (Go's net.Interfaces, getifaddrs)" 0 "inet 127.0.0.1/8 scope host lo" -- run alpine ip addr
+expect "SIOCGIFINDEX / SIOCGIFNAME (musl's if_nametoindex)" 0 "lo is 1 lo" -- run python:3.12-alpine python3 -c 'import socket; print("lo is", socket.if_nametoindex("lo"), socket.if_indextoname(1))'
 
 # Another container's published port is reached at its container port (web:80 of a -p 8098:80 service).
 $LX run -d --name "lxpp-$$" --ip 127.77.0.1 -p 8098:8088 busybox sh -c "mkdir /w; echo pp > /w/i; httpd -f -p 8088 -h /w" < /dev/null > /dev/null 2>&1

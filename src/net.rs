@@ -134,6 +134,8 @@ pub struct Sock {
     peer: Mutex<Option<Vec<u8>>>,
     /// AF_UNIX SOCK_DGRAM: a loopback UDP socket underneath (see unix_dgram).
     udgram: bool,
+    /// AF_NETLINK (NETLINK_ROUTE): the same, answering its own requests (see netlink_reply).
+    netlink: bool,
 }
 
 impl Drop for Sock {
@@ -146,7 +148,7 @@ impl Sock {
     fn new(s: usize, nonblock: bool) -> Sock {
         let mut on = 1u32;
         unsafe { ioctlsocket(s, FIONBIO, &mut on) }; // always non-blocking underneath
-        Sock { s, nonblock: AtomicBool::new(nonblock), eagain: AtomicU32::new(0), unix: Mutex::new(None), peer: Mutex::new(None), udgram: false }
+        Sock { s, nonblock: AtomicBool::new(nonblock), eagain: AtomicU32::new(0), unix: Mutex::new(None), peer: Mutex::new(None), udgram: false, netlink: false }
     }
 
     /// A socket handle inherited from the parent lx (fork/exec); `tag` is what inherit_tag() gave.
@@ -154,12 +156,14 @@ impl Sock {
         init();
         let mut k = Sock::new(s, tag.starts_with('1'));
         k.udgram = tag.ends_with('u');
+        k.netlink = tag.ends_with('n');
         k
     }
 
-    /// What a child lx needs to rebuild this socket: "1"/"0" (non-blocking), "u" for AF_UNIX datagrams.
+    /// What a child lx needs to rebuild this socket: "1"/"0" (non-blocking), "u" for AF_UNIX datagrams,
+    /// "n" for netlink.
     pub fn inherit_tag(&self) -> String {
-        format!("{}{}", self.nonblocking() as u8, if self.udgram { "u" } else { "" })
+        format!("{}{}", self.nonblocking() as u8, if self.udgram { "u" } else if self.netlink { "n" } else { "" })
     }
 
     pub fn nonblocking(&self) -> bool {
@@ -225,6 +229,14 @@ impl Sock {
     }
 
     pub fn send(&self, buf: u64, len: u64, flags: u64) -> R {
+        if self.netlink {
+            // A request to the "kernel": its answer goes to our own port, for recv to read.
+            let req = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
+            let reply = netlink_reply(req, nl_pid()).ok_or(EINVAL)?;
+            let a = loopback(udgram_port(self));
+            unsafe { sendto(self.s, reply.as_ptr(), reply.len() as i32, 0, a.as_ptr(), 16) };
+            return Ok(len as i64);
+        }
         let len = len.min(i32::MAX as u64) as i32;
         self.op(POLLOUT, flags & MSG_DONTWAIT != 0, || {
             let n = unsafe { send(self.s, buf as *const u8, len, msg_flags(flags)) };
@@ -278,6 +290,159 @@ fn addr_out(a: &[u8], p: u64, lenp: u64) {
         std::ptr::copy_nonoverlapping(a.as_ptr(), p as *mut u8, n);
         *(lenp as *mut u32) = a.len() as u32;
     }
+}
+
+// ---- AF_NETLINK, NETLINK_ROUTE: the interface and address dumps ----
+//
+// Go's net.Interfaces / InterfaceAddrs and glibc's getifaddrs ask the kernel with RTM_GETLINK and
+// RTM_GETADDR dumps. The container sees one interface, lo, holding 127.0.0.1/8, its own loopback
+// address (LX_IP) and ::1. ponytail: dumps only; other requests get EOPNOTSUPP, no multicast groups.
+
+const AF_NETLINK: u64 = 16;
+
+/// The port id a netlink socket is bound to, as getsockname and the replies give it.
+fn nl_pid() -> u32 {
+    crate::proc::getpid().unwrap_or(0) as u32
+}
+
+/// struct sockaddr_nl { family, pad, pid, groups }.
+fn nl_addr(pid: u32) -> Vec<u8> {
+    let mut a = vec![AF_NETLINK as u8, 0, 0, 0];
+    a.extend(pid.to_le_bytes());
+    a.extend(0u32.to_le_bytes());
+    a
+}
+
+fn nl_msg(out: &mut Vec<u8>, ty: u16, seq: u32, pid: u32, body: &[u8]) {
+    const NLM_F_MULTI: u16 = 2;
+    out.extend((16 + body.len() as u32).to_le_bytes());
+    out.extend(ty.to_le_bytes());
+    out.extend(NLM_F_MULTI.to_le_bytes());
+    out.extend(seq.to_le_bytes());
+    out.extend(pid.to_le_bytes());
+    out.extend(body);
+    out.resize(out.len().next_multiple_of(4), 0);
+}
+
+fn rta(out: &mut Vec<u8>, ty: u16, data: &[u8]) {
+    out.extend((4 + data.len() as u16).to_le_bytes());
+    out.extend(ty.to_le_bytes());
+    out.extend(data);
+    out.resize(out.len().next_multiple_of(4), 0);
+}
+
+/// The kernel's answer to one request (nlmsghdr + rtgenmsg/ifinfomsg/ifaddrmsg), ending in NLMSG_DONE.
+fn netlink_reply(req: &[u8], pid: u32) -> Option<Vec<u8>> {
+    const RTM_NEWLINK: u16 = 16;
+    const RTM_GETLINK: u16 = 18;
+    const RTM_NEWADDR: u16 = 20;
+    const RTM_GETADDR: u16 = 22;
+    if req.len() < 16 {
+        return None;
+    }
+    let ty = u16::from_le_bytes([req[4], req[5]]);
+    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+    let family = req.get(16).copied().unwrap_or(0);
+    let mut out = Vec::new();
+    match ty {
+        RTM_GETLINK => {
+            // ifinfomsg { family, pad, type ARPHRD_LOOPBACK, index 1, flags UP|LOOPBACK|RUNNING, change }
+            let mut b = vec![0, 0];
+            b.extend(772u16.to_le_bytes());
+            b.extend(1i32.to_le_bytes());
+            b.extend((0x1u32 | 0x8 | 0x40).to_le_bytes());
+            b.extend(0u32.to_le_bytes());
+            rta(&mut b, 3, b"lo\0"); // IFLA_IFNAME
+            rta(&mut b, 4, &65536u32.to_le_bytes()); // IFLA_MTU
+            rta(&mut b, 1, &[0; 6]); // IFLA_ADDRESS
+            rta(&mut b, 2, &[0; 6]); // IFLA_BROADCAST
+            nl_msg(&mut out, RTM_NEWLINK, seq, pid, &b);
+        }
+        RTM_GETADDR => {
+            let mut v4 = vec![[127, 0, 0, 1]];
+            v4.extend(own_ip().filter(|ip| *ip != [127, 0, 0, 1]));
+            let mut addrs: Vec<(u8, u8, Vec<u8>)> = v4.into_iter().map(|ip| (2, 8, ip.to_vec())).collect();
+            let mut one = [0u8; 16];
+            one[15] = 1;
+            addrs.push((10, 128, one.to_vec()));
+            for (fam, prefix, ip) in addrs.into_iter().filter(|a| family == 0 || a.0 == family) {
+                // ifaddrmsg { family, prefixlen, flags IFA_F_PERMANENT, scope RT_SCOPE_HOST, index 1 }
+                let mut b = vec![fam, prefix, 0x80, 254];
+                b.extend(1u32.to_le_bytes());
+                rta(&mut b, 1, &ip); // IFA_ADDRESS
+                if fam == 2 {
+                    rta(&mut b, 2, &ip); // IFA_LOCAL
+                    rta(&mut b, 3, b"lo\0"); // IFA_LABEL
+                }
+                nl_msg(&mut out, RTM_NEWADDR, seq, pid, &b);
+            }
+        }
+        _ => {
+            // NLMSG_ERROR: the error, then the request's header.
+            let mut b = (-95i32).to_le_bytes().to_vec(); // EOPNOTSUPP
+            b.extend(&req[..16]);
+            nl_msg(&mut out, 2, seq, pid, &b);
+            return Some(out);
+        }
+    }
+    nl_msg(&mut out, 3, seq, pid, &0i32.to_le_bytes()); // NLMSG_DONE
+    Some(out)
+}
+
+/// The ifreq ioctls (SIOCGIF*) for lo, the container's one interface, as the netlink dumps show it.
+/// struct ifreq { char name[16]; union { sockaddr, short flags, int index/mtu/qlen, ... } }.
+pub fn if_ioctl(req: u64, arg: u64) -> R {
+    const ENODEV: i64 = 19;
+    let ifr = unsafe { std::slice::from_raw_parts_mut(arg as *mut u8, 40) };
+    let put_i32 = |ifr: &mut [u8], v: i32| ifr[16..20].copy_from_slice(&v.to_le_bytes());
+    let put_in = |ifr: &mut [u8], ip: [u8; 4]| {
+        ifr[16..32].fill(0);
+        ifr[16] = AF_INET as u8;
+        ifr[20..24].copy_from_slice(&ip);
+    };
+    match req {
+        0x8912 => {
+            // SIOCGIFCONF: struct ifconf { int len; char *buf } gets one ifreq, lo's.
+            let conf = unsafe { &mut *(arg as *mut [u64; 2]) };
+            if conf[1] != 0 && conf[0] as u32 >= 40 {
+                let r = unsafe { std::slice::from_raw_parts_mut(conf[1] as *mut u8, 40) };
+                r.fill(0);
+                r[..2].copy_from_slice(b"lo");
+                put_in(r, [127, 0, 0, 1]);
+            }
+            conf[0] = conf[0] & !0xffff_ffff | 40;
+            return Ok(0);
+        }
+        0x8910 => {
+            // SIOCGIFNAME: index -> name
+            if i32::from_le_bytes(ifr[16..20].try_into().unwrap()) != 1 {
+                return Err(ENODEV);
+            }
+            ifr[..16].fill(0);
+            ifr[..2].copy_from_slice(b"lo");
+            return Ok(0);
+        }
+        _ => {}
+    }
+    if &ifr[..3] != b"lo\0" {
+        return Err(ENODEV);
+    }
+    match req {
+        0x8913 => ifr[16..18].copy_from_slice(&0x49u16.to_le_bytes()), // SIOCGIFFLAGS: UP|LOOPBACK|RUNNING
+        0x8915 => put_in(ifr, [127, 0, 0, 1]),                       // SIOCGIFADDR
+        0x891b => put_in(ifr, [255, 0, 0, 0]),                       // SIOCGIFNETMASK
+        0x8921 => put_i32(ifr, 65536),                               // SIOCGIFMTU
+        0x8927 => {
+            // SIOCGIFHWADDR: ARPHRD_LOOPBACK, all zeros
+            ifr[16..32].fill(0);
+            ifr[16..18].copy_from_slice(&772u16.to_le_bytes());
+        }
+        0x8933 => put_i32(ifr, 1),    // SIOCGIFINDEX
+        0x8942 => put_i32(ifr, 1000), // SIOCGIFTXQLEN
+        0x8914 | 0x8916 | 0x891c | 0x8922 | 0x8924 | 0x8943 => return Err(crate::syscall::EPERM), // the SIOCSIF* sets
+        _ => return Err(crate::syscall::ENOTTY),
+    }
+    Ok(0)
 }
 
 // ---- published ports (`lx run -p`) ----
@@ -693,6 +858,14 @@ const SOCK_CLOEXEC: u64 = 0o2000000;
 
 pub fn sys_socket(domain: u64, ty: u64, proto: u64) -> R {
     init();
+    if domain == AF_NETLINK {
+        if proto != 0 {
+            return Err(93); // EPROTONOSUPPORT: only NETLINK_ROUTE
+        }
+        let mut sock = unix_dgram(ty & SOCK_NONBLOCK != 0)?;
+        (sock.udgram, sock.netlink) = (false, true);
+        return Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0));
+    }
     let af = family(domain)?;
     let base = (ty & 0xf) as i32; // SOCK_STREAM 1, SOCK_DGRAM 2, SOCK_RAW 3: same numbers
     if af == 1 && base == 2 {
@@ -769,6 +942,9 @@ fn stream_pair(nb: bool) -> Result<(Sock, Sock), i64> {
 
 pub fn sys_bind(fd: u64, addr: u64, len: u64) -> R {
     let s = fs::sock(fd)?;
+    if s.netlink {
+        return Ok(0); // the port id is ours already; no multicast groups
+    }
     if is_unix_addr(addr, len) {
         return unix_bind(&s, addr, len);
     }
@@ -894,7 +1070,7 @@ pub fn sys_connect(fd: u64, addr: u64, len: u64) -> R {
 
 pub fn sys_sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, alen: u64) -> R {
     let s = fs::sock(fd)?;
-    if addr == 0 {
+    if addr == 0 || s.netlink {
         return s.send(buf, len, flags);
     }
     let a = if s.udgram && is_unix_addr(addr, alen) {
@@ -921,7 +1097,9 @@ pub fn sys_recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, lenp: u6
         let n = unsafe { recvfrom(s.s, buf as *mut u8, len, msg_flags(flags), a.as_mut_ptr(), &mut alen) };
         if n < 0 { Err(last_err()) } else { Ok(n as i64) }
     })?;
-    if s.udgram && alen >= 4 {
+    if s.netlink {
+        addr_out(&nl_addr(0), addr, lenp); // from the kernel
+    } else if s.udgram && alen >= 4 {
         unix_out(std::fs::read(udgram_names(u16::from_be_bytes([a[2], a[3]]))).ok(), addr, lenp);
     } else if alen > 0 {
         addr_out(&a[..alen as usize], addr, lenp);
@@ -1126,6 +1304,10 @@ pub fn sys_shutdown(fd: u64, how: u64) -> R {
 
 pub fn sys_getsockname(fd: u64, addr: u64, lenp: u64, peer: bool) -> R {
     let s = fs::sock(fd)?;
+    if s.netlink {
+        addr_out(&nl_addr(if peer { 0 } else { nl_pid() }), addr, lenp);
+        return Ok(0);
+    }
     let mut a = [0u8; 128];
     let mut alen = a.len() as i32;
     let r = unsafe { if peer { getpeername(s.s, a.as_mut_ptr(), &mut alen) } else { getsockname(s.s, a.as_mut_ptr(), &mut alen) } };
@@ -1255,6 +1437,37 @@ pub struct Epoll {
     entries: Vec<Entry>,
 }
 
+/// Adding epoll `inner` to `epfd`: ELOOP if `epfd` is inside it (a cycle), EINVAL past Linux's 4 levels.
+fn nests(inner: &Mutex<Epoll>, epfd: i32, depth: u32) -> Result<(), i64> {
+    if depth > 4 {
+        return Err(EINVAL);
+    }
+    let fds: Vec<i32> = inner.lock().unwrap().entries.iter().map(|x| x.fd).collect();
+    for fd in fds {
+        if fd == epfd {
+            return Err(40); // ELOOP
+        }
+        if let Ok(e) = fs::epoll(fd as u64) {
+            nests(&e, epfd, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+/// An epoll fd in poll, select or another epoll: readable when one of its entries is ready (level).
+/// ponytail: nesting is followed 4 deep at most; Linux refuses deeper or looping nests (ELOOP) instead.
+pub fn epoll_ready(ep: &Mutex<Epoll>) -> bool {
+    thread_local!(static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+    if DEPTH.get() >= 4 {
+        return false;
+    }
+    let fds: Vec<(i32, i16)> = ep.lock().unwrap().entries.iter().filter(|x| !x.disabled).map(|x| (x.fd, (x.events & 0xffff) as i16)).collect();
+    DEPTH.set(DEPTH.get() + 1);
+    let r = fds.iter().any(|&(fd, ev)| fs::readiness(fd, ev) & !0x20 != 0);
+    DEPTH.set(DEPTH.get() - 1);
+    r
+}
+
 /// An epoll's registrations for a fork/exec child: "fd:events:data:disabled" joined by ';'. Linux shares
 /// the instance across fork; the child gets an equal one over the same fd numbers (php-fpm's workers use
 /// the master's). ponytail: edge state starts fresh, and later changes on either side aren't shared.
@@ -1272,6 +1485,9 @@ pub fn epoll_import(s: &str) -> Epoll {
 }
 
 pub fn sys_epoll_create(flags: u64) -> R {
+    if flags & !0o2000000 != 0 {
+        return Err(EINVAL); // only EPOLL_CLOEXEC
+    }
     Ok(fs::add_fd(Fd::Epoll(Arc::new(Mutex::new(Epoll::default()))), flags & 0o2000000 != 0))
 }
 
@@ -1284,8 +1500,20 @@ pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, ev: u64) -> R {
         (0, 0)
     };
     let fd = fd as i32;
-    if fs::readiness(fd, 0) & 0x20 != 0 {
+    if fs::is_file(fd as u64) {
+        return Err(crate::syscall::EPERM); // regular files and directories are always ready: not pollable
+    }
+    if fd < 0 || fs::readiness(fd, 0) & 0x20 != 0 {
         return Err(9); // EBADF
+    }
+    if fd as u64 == epfd {
+        return Err(EINVAL);
+    }
+    if ev == 0 && op != 2 {
+        return Err(crate::syscall::EFAULT);
+    }
+    if op == 1 && let Ok(inner) = fs::epoll(fd as u64) {
+        nests(&inner, epfd as i32, 1)?;
     }
     let mut e = ep.lock().unwrap();
     let pos = e.entries.iter().position(|x| x.fd == fd);

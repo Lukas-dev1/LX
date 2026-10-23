@@ -579,7 +579,7 @@ pub fn restore<'a>(f: &'a [String], parent: isize) -> Result<((u64, u64), &'a [S
             return Err(format!("shared mapping {base:#x}+{len:#x} can't be placed in the child ({})", unsafe { GetLastError() }));
         }
         unsafe { SetHandleInformation(section, 1, 0) };
-        VIEWS.lock().unwrap().push(View { base, len, section, off, access });
+        VIEWS.lock().unwrap().push(View { base, len, section, off, access, full: len, file: 0, prot: (0, 0) });
     }
     let used = f.len() - it.len();
     Ok((stack, &f[used..]))
@@ -874,6 +874,7 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
             (c.rax, c.rcx, c.r11, c.rip) = (ret as u64, next, c.eflags as u64, next); // kernel ABI: rcx=rip, r11=rflags
             resume_with_signals(c)
         }
+        STATUS_ACCESS_VIOLATION if grow_view(rec.info[1] as u64, rec.info[0] == 1) => resume(c, c.rip),
         STATUS_ACCESS_VIOLATION if ts().fs != 0 && lost_fs_base(c, rec.info[1] as u64, end) => {
             FS_FAULTS.fetch_add(1, Relaxed);
             if patchlog() { dlog(format_args!("FS-base fault at rip {:#x} rsp {:#x}", c.rip, c.rsp)); }
@@ -1000,8 +1001,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         295 | 327 => fs::preadv(a[0], a[1], a[2], a[3], false), // preadv, preadv2 (flags ignored)
         296 | 328 => fs::preadv(a[0], a[1], a[2], a[3], true),  // pwritev, pwritev2
         285 => fs::fallocate(a[0], a[1], a[2], a[3]),
-        37 => { signal::set_alarm(a[0] * 1000, 0); Ok(0) } // alarm
+        37 => Ok(signal::set_alarm(a[0] * 1000, 0).0.div_ceil(1000) as i64), // alarm: the seconds left of the old one
         38 => setitimer(a[0], a[1], a[2]),
+        36 => getitimer(a[0], a[1]),
         90 => fs::chmeta_at(CWD, a[0], true, Some(a[1]), None),                     // chmod
         91 => fs::fchmeta(a[0], Some(a[1]), None),                                  // fchmod
         268 => fs::chmeta_at(a[0], a[1], true, Some(a[2]), None),                   // fchmodat (no flags)
@@ -1042,6 +1044,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         54 => net::sys_setsockopt(a[0], a[1], a[2], a[3], a[4]),
         55 => net::sys_getsockopt(a[0], a[1], a[2], a[3], a[4]),
         288 => net::sys_accept(a[0], a[1], a[2], a[3]),
+        213 if (a[0] as i32) <= 0 => Err(EINVAL), // epoll_create: size must be positive (and is ignored)
         213 => net::sys_epoll_create(0),
         291 => net::sys_epoll_create(a[0]),
         233 => net::sys_epoll_ctl(a[0], a[1], a[2], a[3]),
@@ -1056,7 +1059,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         141 => Ok(0),  // setpriority. ponytail: accepted, not applied
         32 => fs::dup(a[0], 0, false),
         33 => fs::dup3(a[0], a[1], 0),
-        35 => nanosleep(a[0]),
+        35 => nanosleep(a[0], a[1]),
         39 => proc::getpid(),
         186 => thread::gettid(),
         24 => thread::sched_yield(),
@@ -1131,9 +1134,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         282 => fs::signalfd(a[0], a[1], a[2], 0),
         289 => fs::signalfd(a[0], a[1], a[2], a[3]),
         218 => { ts().clear_tid = a[0]; thread::gettid() } // set_tid_address
-        230 => clock_nanosleep(a[0], a[1], a[2]),
+        230 => clock_nanosleep(a[0], a[1], a[2], a[3]),
         228 => clock_gettime(a[0], a[1]),
-        229 => clock_getres(a[1]),
+        229 => clock_getres(a[0], a[1]),
         201 => time(a[0]),
         221 => Ok(0),                  // fadvise64: advice only
         237 | 238 => Ok(0),            // mbind, set_mempolicy: NUMA placement has no meaning here; accept it
@@ -1161,6 +1164,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         // tkill, tgkill. ponytail: signals are process-wide; whichever thread returns from a syscall next runs it.
         200 => signal::send_thread(a[0], a[1]),        // tkill
         234 => if crate::proc::host_pid(a[0] as u32) == crate::proc::pid() { signal::send_thread(a[1], a[2]) } else { proc::kill(a[0] as i32 as i64, a[2]) }, // tgkill
+        292 if a[2] & !0o2000000 != 0 || a[0] == a[1] => Err(EINVAL), // dup3: only O_CLOEXEC, and old != new
         292 => fs::dup3(a[0], a[1], a[2]),
         293 => fs::pipe2(a[0], a[1]),
         253 => crate::inotify::init(0),
@@ -1382,6 +1386,10 @@ fn set_view_code(base: u64, ranges: Vec<(u64, u64)>) {
 // address instead (`snapshot` / `restore`). Views must start on NT's 64K granularity, so an offset that
 // isn't 64K-aligned maps from the aligned offset below it and returns a pointer into the view.
 // ponytail: munmap of part of a view unmaps all of it; mremap of a view makes a private copy.
+//
+// A file mapping longer than the file (bbolt maps ahead, then writes the file longer) can't be one
+// view: NT views end at the file's end. The rest stays a placeholder (`full`), and a fault there after
+// the file grew maps a longer view into it (`grow_view`). ponytail: a forked child's copy doesn't grow.
 
 struct View {
     base: u64,
@@ -1389,6 +1397,11 @@ struct View {
     section: isize,
     off: u64,
     access: u32,
+    /// Address space held for the view, past `len` as a placeholder (== len when it can't grow).
+    full: u64,
+    /// For growing: the file (a duplicate handle, 0 if none) and the section and view protections.
+    file: isize,
+    prot: (u32, u32),
 }
 static VIEWS: Mutex<Vec<View>> = Mutex::new(Vec::new());
 
@@ -1401,6 +1414,7 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
     let delta = off % 0x10000;
     let aoff = off - delta;
     let mut vlen = delta + len;
+    let mut sprot = PAGE_READWRITE;
     let section = match file {
         None => unsafe { CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null()) },
         Some(fd) => {
@@ -1412,10 +1426,12 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
             vlen = vlen.min(size - aoff);
             let exec = prot & 4 != 0;
             let rw = if exec { 0x40 } else { PAGE_READWRITE }; // PAGE_EXECUTE_READWRITE
+            sprot = rw;
             let mut s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), rw, 0, 0, std::ptr::null()) };
             if s == 0 && !write {
                 // A file opened read-only can still be mapped for reading.
-                s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), if exec { 0x20 } else { 0x02 }, 0, 0, std::ptr::null()) };
+                sprot = if exec { 0x20 } else { 0x02 };
+                s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) };
             }
             if s == 0 {
                 return Err(EACCES);
@@ -1427,6 +1443,10 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
         return Err(ENOMEM);
     }
     let access = if write { FILE_MAP_WRITE } else { FILE_MAP_READ } | if prot & 4 != 0 { FILE_MAP_EXECUTE } else { 0 };
+    let full = (delta + len).next_multiple_of(PAGE);
+    if let Some(fd) = file.filter(|_| !fixed && full > vlen.next_multiple_of(PAGE)) {
+        return mmap_growable(section, sprot, access, fd, aoff, vlen, full, prot).map(|base| (base + delta) as i64);
+    }
     let view_at = |base: u64| unsafe { MapViewOfFileEx(section, access, (aoff >> 32) as u32, aoff as u32, vlen as usize, base as *mut _) } as u64;
     let base = if fixed {
         if delta != 0 {
@@ -1470,8 +1490,100 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
         let mut old = 0;
         unsafe { VirtualProtect(base as *mut _, vlen as usize, 0x01, &mut old) }; // PROT_NONE
     }
-    VIEWS.lock().unwrap().push(View { base, len: vlen, section, off: aoff, access });
+    VIEWS.lock().unwrap().push(View { base, len: vlen, section, off: aoff, access, full: vlen, file: 0, prot: (0, 0) });
     Ok((base + delta) as i64)
+}
+
+/// A shared file mapping of `full` bytes whose file holds only `vlen` of them from `off`: the view in
+/// a placeholder of the whole length, the rest left a placeholder for `grow_view`.
+fn mmap_growable(section: isize, sprot: u32, access: u32, fd: u64, off: u64, vlen: u64, full: u64, prot: u64) -> Result<u64, i64> {
+    let vprot = match (access & FILE_MAP_WRITE != 0, prot & 4 != 0) {
+        (true, true) => 0x40,
+        (true, false) => PAGE_READWRITE,
+        (false, true) => 0x20,
+        (false, false) => 0x02,
+    };
+    let fail = |e| {
+        unsafe { CloseHandle(section) };
+        Err(e)
+    };
+    let base = loop {
+        let a = NEXT.fetch_add(full.next_multiple_of(0x10000), Relaxed);
+        if a + full > WINDOW.1 {
+            return fail(ENOMEM);
+        }
+        if unsafe { VirtualAlloc2(0, a as *mut _, full as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0) } as u64 == a {
+            break a;
+        }
+    };
+    carve(base, vlen.next_multiple_of(PAGE));
+    let me = unsafe { GetCurrentProcess() };
+    if unsafe { MapViewOfFile3(section, me, base as *mut _, off, vlen as usize, MEM_REPLACE_PLACEHOLDER, vprot, std::ptr::null_mut(), 0) } as u64 != base {
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        return fail(ENOMEM);
+    }
+    if prot == 0 {
+        let mut old = 0;
+        unsafe { VirtualProtect(base as *mut _, vlen as usize, 0x01, &mut old) }; // PROT_NONE
+    }
+    let (h, _) = fs::file_handle(fd)?;
+    let mut file = 0isize;
+    unsafe { crate::win::DuplicateHandle(me, h, me, &mut file, 0, 0, 2) }; // DUPLICATE_SAME_ACCESS
+    VIEWS.lock().unwrap().push(View { base, len: vlen, section, off, access, full, file, prot: (sprot, vprot) });
+    Ok(base)
+}
+
+/// A fault at `addr` past the end of a growable view: if its file has grown since, map the longer view
+/// (in the same placeholder, so the address range stays ours) and have the guest retry. Also true when
+/// another thread just did that and the page is there now.
+fn grow_view(addr: u64, write: bool) -> bool {
+    // Every access violation comes through here: if lx itself faulted holding VIEWS, give up after a
+    // second (and crash with the fault) rather than deadlock; another thread holds it only briefly.
+    let start = std::time::Instant::now();
+    let mut views = loop {
+        match VIEWS.try_lock() {
+            Ok(v) => break v,
+            Err(_) if start.elapsed().as_secs() >= 1 => return false,
+            Err(_) => std::thread::yield_now(),
+        }
+    };
+    let Some(v) = views.iter_mut().find(|v| v.full > v.len && (v.base..v.base + v.full).contains(&addr)) else {
+        return false;
+    };
+    if addr < v.base + v.len.next_multiple_of(PAGE) {
+        // Mapped already: retry if it allows this access (it was being re-mapped), else a real fault.
+        let mut m = MemoryBasicInformation::default();
+        unsafe { VirtualQuery(addr as *const _, &mut m, size_of::<MemoryBasicInformation>()) };
+        return m.state == 0x1000 && if write { matches!(m.protect, 0x04 | 0x40) } else { m.protect & 0xfe != 0 };
+    }
+    let file = std::mem::ManuallyDrop::new(unsafe { <std::fs::File as std::os::windows::io::FromRawHandle>::from_raw_handle(v.file as _) });
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let new = size.saturating_sub(v.off).min(v.full);
+    if v.base + new <= addr {
+        return false; // still past the end: Linux would raise SIGBUS
+    }
+    let section = unsafe { CreateFileMappingW(v.file, std::ptr::null_mut(), v.prot.0, 0, 0, std::ptr::null()) };
+    if section == 0 {
+        return false;
+    }
+    let me = unsafe { GetCurrentProcess() };
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+    let ok = unsafe {
+        UnmapViewOfFile2(me, v.base as *mut _, MEM_PRESERVE_PLACEHOLDER);
+        VirtualFree(v.base as *mut _, v.full as usize, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+        carve(v.base, new.next_multiple_of(PAGE));
+        MapViewOfFile3(section, me, v.base as *mut _, v.off, new as usize, MEM_REPLACE_PLACEHOLDER, v.prot.1, std::ptr::null_mut(), 0) as u64 == v.base
+    };
+    if debug() {
+        dlog(format_args!("shared view {:#x}: grown {:#x} -> {new:#x} for {addr:#x}: {ok}", v.base, v.len));
+    }
+    if !ok {
+        unsafe { CloseHandle(section) };
+        return false;
+    }
+    unsafe { CloseHandle(v.section) };
+    (v.section, v.len) = (section, new);
+    true
 }
 
 /// Unmap every shared view overlapping [addr, addr+len). Returns whether there was one.
@@ -1479,10 +1591,14 @@ fn unmap_views(addr: u64, len: u64) -> bool {
     let mut views = VIEWS.lock().unwrap();
     let before = views.len();
     views.retain(|v| {
-        if v.base < addr + len && addr < v.base + v.len {
+        if v.base < addr + len && addr < v.base + v.full {
             unsafe {
                 UnmapViewOfFile(v.base as *mut _);
                 CloseHandle(v.section);
+                if v.full > v.len {
+                    VirtualFree((v.base + v.len.next_multiple_of(PAGE)) as *mut _, 0, MEM_RELEASE); // the placeholder
+                    CloseHandle(v.file);
+                }
             }
             false
         } else {
@@ -1730,8 +1846,23 @@ fn time(out: u64) -> R {
     Ok(s as i64)
 }
 
+/// The clock ids Linux knows (10 was CLOCK_SGI_CYCLE, gone). Negative ids name another process's
+/// or thread's CPU clock. ponytail: those aren't supported (EINVAL).
+fn valid_clock(clock: u64) -> bool {
+    matches!(clock, 0..=9 | 11)
+}
+
+/// A struct timespec Linux accepts: 0 <= tv_nsec < 1e9 and tv_sec >= 0.
+fn valid_timespec(ts: u64) -> bool {
+    let [s, ns] = unsafe { *(ts as *const [i64; 2]) };
+    s >= 0 && (0..1_000_000_000).contains(&ns)
+}
+
 /// All our clocks tick in nanoseconds (QueryPerformanceCounter is finer than that on modern hardware).
-fn clock_getres(ts: u64) -> R {
+fn clock_getres(clock: u64, ts: u64) -> R {
+    if !valid_clock(clock) {
+        return Err(EINVAL);
+    }
     if ts != 0 {
         unsafe { *(ts as *mut [u64; 2]) = [0, 1] };
     }
@@ -1739,6 +1870,9 @@ fn clock_getres(ts: u64) -> R {
 }
 
 fn clock_gettime(clock: u64, ts: u64) -> R {
+    if !valid_clock(clock) {
+        return Err(EINVAL);
+    }
     let (s, ns) = now(clock);
     unsafe { *(ts as *mut [u64; 2]) = [s, ns] };
     Ok(0)
@@ -1752,9 +1886,17 @@ fn gettimeofday(tv: u64) -> R {
     Ok(0)
 }
 
-fn nanosleep(ts: u64) -> R {
-    // ponytail: on EINTR the remaining time isn't written back; callers (sleep) just exit.
-    signal::interruptible_sleep(timespec_ms(ts).clamp(0, u32::MAX as i64 - 1) as u32)
+fn nanosleep(ts: u64, rem: u64) -> R {
+    if !valid_timespec(ts) {
+        return Err(EINVAL);
+    }
+    let start = Instant::now();
+    let r = signal::interruptible_sleep(timespec_ms(ts).clamp(0, u32::MAX as i64 - 1) as u32);
+    if r == Err(EINTR) {
+        let [s, ns] = unsafe { *(ts as *const [u64; 2]) };
+        remaining(rem, std::time::Duration::new(s, ns as u32), start);
+    }
+    r
 }
 
 /// Limits like a Docker container's defaults (8 MB stack, the rest unlimited), except a 1024 soft
@@ -1789,18 +1931,32 @@ fn setitimer(which: u64, new: u64, old: u64) -> R {
     if which != 0 {
         return Err(EINVAL); // ITIMER_VIRTUAL / ITIMER_PROF
     }
+    let [is, ius, vs, vus] = if new != 0 { unsafe { *(new as *const [u64; 4]) } } else { [0; 4] }; // NULL disarms
+    let (left, iv) = signal::set_alarm(vs * 1000 + vus.div_ceil(1000), is * 1000 + ius.div_ceil(1000));
     if old != 0 {
-        unsafe { *(old as *mut [u64; 4]) = [0; 4] };
-    }
-    if new != 0 {
-        let [is, ius, vs, vus] = unsafe { *(new as *const [u64; 4]) };
-        signal::set_alarm(vs * 1000 + vus / 1000, is * 1000 + ius / 1000);
+        unsafe { *(old as *mut [u64; 4]) = [iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000] };
     }
     Ok(0)
 }
 
-fn clock_nanosleep(clock: u64, flags: u64, req: u64) -> R {
+fn getitimer(which: u64, cur: u64) -> R {
+    if which != 0 {
+        return Err(EINVAL); // ITIMER_VIRTUAL / ITIMER_PROF
+    }
+    let (left, iv) = signal::alarm_left();
+    unsafe { *(cur as *mut [u64; 4]) = [iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000] };
+    Ok(0)
+}
+
+fn clock_nanosleep(clock: u64, flags: u64, req: u64, rem: u64) -> R {
     const TIMER_ABSTIME: u64 = 1;
+    if clock == 3 {
+        return Err(95); // EOPNOTSUPP: the thread CPU clock can't be slept on
+    }
+    if !valid_clock(clock) || flags & !TIMER_ABSTIME != 0 || !valid_timespec(req) {
+        return Err(EINVAL);
+    }
+    let start = Instant::now();
     let [s, ns] = unsafe { *(req as *const [u64; 2]) };
     let want = std::time::Duration::new(s, ns as u32);
     let wait = if flags & TIMER_ABSTIME != 0 {
@@ -1814,8 +1970,19 @@ fn clock_nanosleep(clock: u64, flags: u64, req: u64) -> R {
         return Ok(0);
     }
     // A signal cuts it short (EINTR), as for nanosleep: Python's and glibc's sleep() come here.
-    // ponytail: no remaining time written back, like nanosleep.
-    signal::interruptible_sleep(((wait.as_nanos() + 999_999) / 1_000_000).min(u32::MAX as u128 - 1) as u32)
+    let r = signal::interruptible_sleep(((wait.as_nanos() + 999_999) / 1_000_000).min(u32::MAX as u128 - 1) as u32);
+    if r == Err(EINTR) && flags & TIMER_ABSTIME == 0 {
+        remaining(rem, wait, start);
+    }
+    r
+}
+
+/// After an interrupted relative sleep: what was left of `wait`, into `rem` (if given).
+fn remaining(rem: u64, wait: std::time::Duration, start: Instant) {
+    if rem != 0 {
+        let left = wait.saturating_sub(start.elapsed());
+        unsafe { *(rem as *mut [u64; 2]) = [left.as_secs(), left.subsec_nanos() as u64] };
+    }
 }
 
 /// A `struct timeval *` timeout in ms; NULL means wait forever (-1).
@@ -2289,4 +2456,34 @@ fn mmap_cow(addr: u64, len: u64, prot: u64, fixed: bool, fd: u64, off: u64, hole
     // Executable: mmap patches it (exec_ranges) right after and records which ranges (set_view_code).
     COW_VIEWS.lock().unwrap().push(CowView { base, len: flen, section, off, fsize: size, code: Vec::new(), written: prot & 2 != 0 });
     Some(base)
+}
+
+/// /proc/self/maps: the guest's allocations and views as NT sees them now, one line per run of pages
+/// with the same state and protection. ponytail: no file names, offsets or [heap]/[stack] labels.
+pub fn maps() -> String {
+    let mut ranges: Vec<(u64, u64, bool)> = ALLOCS.lock().unwrap().iter().map(|&(b, l)| (b, l, false)).collect();
+    ranges.extend(VIEWS.lock().unwrap().iter().map(|v| (v.base, v.len, true)));
+    ranges.extend(COW_VIEWS.lock().unwrap().iter().map(|v| (v.base, v.len, false)));
+    ranges.extend(SHM_AT.lock().unwrap().iter().map(|&(b, l)| (b, l, true)));
+    ranges.sort();
+    let (mut out, mut done) = (String::new(), 0u64);
+    for (base, len, shared) in ranges {
+        let mut p = base.max(done);
+        while p < base + len {
+            let mut m = MemoryBasicInformation::default();
+            if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 {
+                break;
+            }
+            let end = ((m.base + m.region_size) as u64).min(base + len);
+            if m.state != MEM_FREE {
+                let perms = match if m.state == MEM_COMMIT { m.protect & 0xff } else { 1 } {
+                    0x02 => "r--", 0x04 | 0x08 => "rw-", 0x10 => "--x", 0x20 => "r-x", 0x40 | 0x80 => "rwx", _ => "---",
+                };
+                out += &format!("{p:08x}-{end:08x} {perms}{} 00000000 00:00 0\n", if shared { 's' } else { 'p' });
+            }
+            p = end;
+        }
+        done = done.max(base + len);
+    }
+    out
 }
