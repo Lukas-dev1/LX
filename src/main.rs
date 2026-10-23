@@ -327,6 +327,7 @@ fn run() -> Result<(), String> {
     if let [flag, state, parent, ready] = args.as_slice() && flag == "--fork" {
         // We are the child of a guest fork(): rebuild its address space from the parent, resume after the syscall.
         enter_job()?;
+        signal::HELD.store(true, std::sync::atomic::Ordering::SeqCst);
         syscall::install();
         let (regs, (lo, hi)) = proc::receive_fork(state, parent, ready)?;
         syscall::enter(regs, lo, hi)

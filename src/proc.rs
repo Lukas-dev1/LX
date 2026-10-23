@@ -244,6 +244,7 @@ pub fn receive_fork(state: &str, parent: &str, ready: &str) -> Result<([u64; 18]
     let parent = unsafe { OwnedHandle::from_raw_handle(parent as _) };
     let (stack, rest) = syscall::restore(rest, parent.as_raw_handle() as isize)?;
     let rest = signal::restore(rest)?;
+    signal::release();
     let rest = crate::jump::restore(rest)?;
     let nums: Vec<u64> = rest.iter().map(|s| s.parse().map_err(|_| "malformed fork state")).collect::<Result<_, _>>()?;
     let [regs @ .., ppid] = nums.as_slice() else { return Err("malformed fork state".into()) };
