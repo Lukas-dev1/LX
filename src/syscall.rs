@@ -931,13 +931,28 @@ fn lost_fs_base(c: &Context, fault_addr: u64, code_end: u64) -> bool {
     (0..ins.op_count()).any(|op| ins.virtual_address(op, 0, reg) == Some(fault_addr))
 }
 
+/// " in <file> at file offset <n>" when `rip` is in a file's copy-on-write view (shared libraries), for crash
+/// reports: which library and where, without a map of the guest's address space.
+fn code_file(rip: u64) -> String {
+    unsafe extern "system" {
+        fn K32GetMappedFileNameW(process: isize, addr: *const std::ffi::c_void, name: *mut u16, size: u32) -> u32;
+    }
+    let mut name = [0u16; 512];
+    let n = unsafe { K32GetMappedFileNameW(GetCurrentProcess(), rip as *const _, name.as_mut_ptr(), name.len() as u32) } as usize;
+    let Some(v) = COW_VIEWS.try_lock().ok().and_then(|vs| vs.iter().find(|v| (v.base..v.base + v.len).contains(&rip)).map(|v| (v.base, v.off))) else {
+        return String::new();
+    };
+    let path = String::from_utf16_lossy(&name[..n]);
+    format!(" in {} at file offset {:#x}", path.rsplit('\\').next().unwrap_or(&path), v.1 + (rip - v.0))
+}
+
 fn guest_crash(rec: &ExceptionRecord, c: &Context) -> ! {
     // One line, one write: several threads may fault at once.
     let mut m = MemoryBasicInformation::default();
     unsafe { VirtualQuery(rec.info[1] as *const _, &mut m, size_of::<MemoryBasicInformation>()) };
-    let msg = format!("[lx] guest fault {:#x} at rip {:#x} (addr {:#x}: state {:#x} protect {:#x} alloc {:#x}) tid {} rsp {:#x} fs {:#x}
+    let msg = format!("[lx] guest fault {:#x} at rip {:#x}{} (addr {:#x}: state {:#x} protect {:#x} alloc {:#x}) tid {} rsp {:#x} fs {:#x}
 ",
-        rec.code, c.rip, rec.info[1], m.state, m.protect, m.allocation_base, unsafe { GetCurrentThreadId() }, c.rsp, ts().fs);
+        rec.code, c.rip, code_file(c.rip), rec.info[1], m.state, m.protect, m.allocation_base, unsafe { GetCurrentThreadId() }, c.rsp, ts().fs);
     let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
     proc::exit(139) // 128 + SIGSEGV, like a shell would report
 }
