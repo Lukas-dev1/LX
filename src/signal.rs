@@ -189,6 +189,12 @@ pub fn send_thread(tid: u64, sig: u64) -> R {
 struct Ctx([u8; 1232]); // CONTEXT: ContextFlags 0x30, Rcx 0x80, R11 0xd0, Rip 0xf8
 
 fn kick(h: isize, t: &crate::syscall::ThreadState) {
+    // Off unless LX_KICK=1: `go build` deadlocked in a third of runs with it (heavy SIGURG preemption
+    // across ~30 threads), cause not yet found. Without it a handled signal waits for the next syscall.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("LX_KICK").is_some()) {
+        return;
+    }
     if h == 0 || t.kicked.load(SeqCst) {
         return; // not a guest thread, or a kick on its way already
     }
