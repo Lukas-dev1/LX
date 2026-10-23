@@ -67,6 +67,7 @@ pub fn mark_if_marker(p: &Path) {
 }
 
 fn note_marked_roots(root: &Path, upper: Option<&Path>) {
+    *LAYER_ROOTS.write().unwrap() = upper.into_iter().chain([root]).map(Path::to_path_buf).collect();
     let mut roots = MARKED_ROOTS.write().unwrap();
     roots.clear();
     roots.extend(upper.map(Path::to_path_buf));
@@ -606,7 +607,11 @@ pub fn unix_path(path: &str) -> Result<(String, bool, String), i64> {
 fn container_name(fs: &Fs) -> String {
     match fs.upper.as_ref().and_then(|u| u.parent()).and_then(|l| l.file_name()) {
         Some(n) => n.to_string_lossy().into_owned(),
-        None => format!("root-{:08x}", ino(&fs.root) as u32), // plain `lx <rootfs> cmd`: one per rootfs
+        None => {
+            let mut h = DefaultHasher::new();
+            fs.root.hash(&mut h);
+            format!("root-{:08x}", h.finish() as u32) // plain `lx <rootfs> cmd`: one per rootfs
+        }
     }
 }
 
@@ -715,9 +720,17 @@ fn write_link(host: &Path, target: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// The container's layer roots (upper, then image), for ino().
+static LAYER_ROOTS: std::sync::RwLock<Vec<PathBuf>> = std::sync::RwLock::new(Vec::new());
+
+/// An inode number for a host path: a hash of its path inside its layer, so copying an image entry up
+/// into the container's layer keeps its number (GNU tar compares a directory's dev/ino before and after
+/// extracting into it: "Directory renamed before its status could be extracted", wordpress).
 fn ino(host: &Path) -> u64 {
+    let roots = LAYER_ROOTS.read().unwrap();
+    let p = roots.iter().find_map(|r| host.strip_prefix(r).ok()).unwrap_or(host);
     let mut h = DefaultHasher::new();
-    host.hash(&mut h);
+    p.hash(&mut h);
     h.finish() | 1
 }
 
