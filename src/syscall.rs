@@ -1059,7 +1059,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         141 => Ok(0),  // setpriority. ponytail: accepted, not applied
         32 => fs::dup(a[0], 0, false),
         33 => fs::dup3(a[0], a[1], 0),
-        35 => nanosleep(a[0]),
+        35 => nanosleep(a[0], a[1]),
         39 => proc::getpid(),
         186 => thread::gettid(),
         24 => thread::sched_yield(),
@@ -1134,9 +1134,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         282 => fs::signalfd(a[0], a[1], a[2], 0),
         289 => fs::signalfd(a[0], a[1], a[2], a[3]),
         218 => { ts().clear_tid = a[0]; thread::gettid() } // set_tid_address
-        230 => clock_nanosleep(a[0], a[1], a[2]),
+        230 => clock_nanosleep(a[0], a[1], a[2], a[3]),
         228 => clock_gettime(a[0], a[1]),
-        229 => clock_getres(a[1]),
+        229 => clock_getres(a[0], a[1]),
         201 => time(a[0]),
         221 => Ok(0),                  // fadvise64: advice only
         237 | 238 => Ok(0),            // mbind, set_mempolicy: NUMA placement has no meaning here; accept it
@@ -1846,8 +1846,23 @@ fn time(out: u64) -> R {
     Ok(s as i64)
 }
 
+/// The clock ids Linux knows (10 was CLOCK_SGI_CYCLE, gone). Negative ids name another process's
+/// or thread's CPU clock. ponytail: those aren't supported (EINVAL).
+fn valid_clock(clock: u64) -> bool {
+    matches!(clock, 0..=9 | 11)
+}
+
+/// A struct timespec Linux accepts: 0 <= tv_nsec < 1e9 and tv_sec >= 0.
+fn valid_timespec(ts: u64) -> bool {
+    let [s, ns] = unsafe { *(ts as *const [i64; 2]) };
+    s >= 0 && (0..1_000_000_000).contains(&ns)
+}
+
 /// All our clocks tick in nanoseconds (QueryPerformanceCounter is finer than that on modern hardware).
-fn clock_getres(ts: u64) -> R {
+fn clock_getres(clock: u64, ts: u64) -> R {
+    if !valid_clock(clock) {
+        return Err(EINVAL);
+    }
     if ts != 0 {
         unsafe { *(ts as *mut [u64; 2]) = [0, 1] };
     }
@@ -1855,6 +1870,9 @@ fn clock_getres(ts: u64) -> R {
 }
 
 fn clock_gettime(clock: u64, ts: u64) -> R {
+    if !valid_clock(clock) {
+        return Err(EINVAL);
+    }
     let (s, ns) = now(clock);
     unsafe { *(ts as *mut [u64; 2]) = [s, ns] };
     Ok(0)
@@ -1868,9 +1886,17 @@ fn gettimeofday(tv: u64) -> R {
     Ok(0)
 }
 
-fn nanosleep(ts: u64) -> R {
-    // ponytail: on EINTR the remaining time isn't written back; callers (sleep) just exit.
-    signal::interruptible_sleep(timespec_ms(ts).clamp(0, u32::MAX as i64 - 1) as u32)
+fn nanosleep(ts: u64, rem: u64) -> R {
+    if !valid_timespec(ts) {
+        return Err(EINVAL);
+    }
+    let start = Instant::now();
+    let r = signal::interruptible_sleep(timespec_ms(ts).clamp(0, u32::MAX as i64 - 1) as u32);
+    if r == Err(EINTR) {
+        let [s, ns] = unsafe { *(ts as *const [u64; 2]) };
+        remaining(rem, std::time::Duration::new(s, ns as u32), start);
+    }
+    r
 }
 
 /// Limits like a Docker container's defaults (8 MB stack, the rest unlimited), except a 1024 soft
@@ -1922,8 +1948,15 @@ fn getitimer(which: u64, cur: u64) -> R {
     Ok(0)
 }
 
-fn clock_nanosleep(clock: u64, flags: u64, req: u64) -> R {
+fn clock_nanosleep(clock: u64, flags: u64, req: u64, rem: u64) -> R {
     const TIMER_ABSTIME: u64 = 1;
+    if clock == 3 {
+        return Err(95); // EOPNOTSUPP: the thread CPU clock can't be slept on
+    }
+    if !valid_clock(clock) || flags & !TIMER_ABSTIME != 0 || !valid_timespec(req) {
+        return Err(EINVAL);
+    }
+    let start = Instant::now();
     let [s, ns] = unsafe { *(req as *const [u64; 2]) };
     let want = std::time::Duration::new(s, ns as u32);
     let wait = if flags & TIMER_ABSTIME != 0 {
@@ -1937,8 +1970,19 @@ fn clock_nanosleep(clock: u64, flags: u64, req: u64) -> R {
         return Ok(0);
     }
     // A signal cuts it short (EINTR), as for nanosleep: Python's and glibc's sleep() come here.
-    // ponytail: no remaining time written back, like nanosleep.
-    signal::interruptible_sleep(((wait.as_nanos() + 999_999) / 1_000_000).min(u32::MAX as u128 - 1) as u32)
+    let r = signal::interruptible_sleep(((wait.as_nanos() + 999_999) / 1_000_000).min(u32::MAX as u128 - 1) as u32);
+    if r == Err(EINTR) && flags & TIMER_ABSTIME == 0 {
+        remaining(rem, wait, start);
+    }
+    r
+}
+
+/// After an interrupted relative sleep: what was left of `wait`, into `rem` (if given).
+fn remaining(rem: u64, wait: std::time::Duration, start: Instant) {
+    if rem != 0 {
+        let left = wait.saturating_sub(start.elapsed());
+        unsafe { *(rem as *mut [u64; 2]) = [left.as_secs(), left.subsec_nanos() as u64] };
+    }
 }
 
 /// A `struct timeval *` timeout in ms; NULL means wait forever (-1).
