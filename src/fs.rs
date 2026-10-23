@@ -2147,8 +2147,6 @@ pub fn writev(fd: u64, iov: u64, cnt: u64) -> R {
     Ok(total)
 }
 
-/// A file holding `bytes` that Windows deletes when its last handle closes (forks inherit the handle):
-/// how synthetic /proc files become ordinary fds that read, seek, fstat and mmap.
 /// Make `f` sparse, so growing it with ftruncate leaves a hole, as on Linux, instead of NTFS allocating
 /// the new size on disk. Best effort: a volume without sparse files just allocates.
 fn set_sparse(f: &File) {
@@ -2160,6 +2158,8 @@ fn set_sparse(f: &File) {
     unsafe { DeviceIoControl(f.as_raw_handle() as isize, FSCTL_SET_SPARSE, std::ptr::null_mut(), 0, std::ptr::null_mut(), 0, &mut got, std::ptr::null_mut()) };
 }
 
+/// A file holding `bytes` that Windows deletes when its last handle closes (forks inherit the handle):
+/// how synthetic /proc files become ordinary fds that read, seek, fstat and mmap.
 fn scratch_file(fs: &Fs, bytes: &[u8]) -> io::Result<(File, PathBuf)> {
     use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
