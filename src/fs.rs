@@ -2567,6 +2567,7 @@ fn posix_lock(fd: u64, cmd: u64, arg: u64) -> R {
     const F_RDLCK: i16 = 0;
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
+    crate::syscall::check_guest(arg, 32, true)?; // struct flock, before the fd, as Linux copies it in first
     let (h, pos, size) = with(|fs| match fs.fd(fd)? {
         Fd::File { f, host } => {
             let pos = f.stream_position().unwrap_or(0);
@@ -2905,6 +2906,9 @@ pub fn chmeta_at(dirfd: u64, path: u64, follow: bool, mode: Option<u64>, owner: 
 
 /// fchmodat2: fchmodat with its flags (AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH for the dirfd itself).
 pub fn fchmodat2(dirfd: u64, path: u64, mode: u64, flags: u64) -> R {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
     if flags & AT_EMPTY_PATH != 0 && cstr(path)?.is_empty() {
         return fchmeta(dirfd, Some(mode), None);
     }

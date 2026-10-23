@@ -143,6 +143,7 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
         0 | 9 => {
             // FUTEX_WAIT (relative timeout), FUTEX_WAIT_BITSET (absolute). ponytail: bitsets ignored.
             let expect = val as u32;
+            syscall::check_guest(uaddr, 4, false)?; // a bad uaddr is EFAULT (LTP), not a fault in lx
             if cur() != expect {
                 return Err(EAGAIN);
             }
