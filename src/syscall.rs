@@ -1052,7 +1052,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         441 => net::sys_epoll_wait(a[0], a[1], a[2], timespec_ms(a[3])),
         20 => fs::writev(a[0], a[1], a[2]),
         22 => fs::pipe2(a[0], 0),
-        21 => fs::faccessat(CWD, a[0]),
+        21 => fs::faccessat(CWD, a[0], a[1]),
         28 => madvise(a[0], a[1], a[2]),
         149..=152 | 325 => Ok(0), // mlock, munlock, mlockall, munlockall, mlock2. ponytail: pages may still be paged out
         140 => Ok(20), // getpriority: the raw call answers 20 - nice; everyone runs at nice 0 (rpm asks)
@@ -1159,7 +1159,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         264 | 316 => fs::renameat(a[0], a[1], a[2], a[3]),
         266 => fs::symlinkat(a[0], a[1], a[2]),
         267 => fs::readlinkat(a[0], a[1], a[2], a[3]),
-        269 | 439 => fs::faccessat(a[0], a[1]),
+        269 | 439 => fs::faccessat(a[0], a[1], a[2]),
         273 => Ok(0),                  // set_robust_list
         // tkill, tgkill. ponytail: signals are process-wide; whichever thread returns from a syscall next runs it.
         200 => signal::send_thread(a[0], a[1]),        // tkill
