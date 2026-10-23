@@ -1560,9 +1560,8 @@ fn tty_ioctl(h: isize, req: u64, arg: u64) -> R {
 // ---- pseudo terminals: /dev/ptmx and /dev/pts/N ----
 // A pty is one duplex named pipe, named after the container and the pty's number: the master holds the
 // server end, and opening /dev/pts/N connects to it from any of the container's processes.
-// ponytail: the line discipline is only ONLCR on the slave's output and ICRNL on its input: no echo, line
-// editing or ^C-to-SIGINT (shells with line editing echo for themselves). A slave opens once; termios
-// and the window size are per process.
+// ponytail: the line discipline is ONLCR on the slave's output, ICRNL, ECHO and ^C on its input: no line
+// editing or buffering until a newline. A slave opens once; termios and the window size are per process.
 
 static PTY_TERMIOS: Mutex<[u32; 9]> = Mutex::new(DEFAULT_TERMIOS);
 static PTY_WINSZ: Mutex<[u16; 4]> = Mutex::new([24, 80, 0, 0]);
@@ -1831,13 +1830,36 @@ fn pty_ioctl(p: &Pipe, req: u64, arg: u64) -> R {
     }
 }
 
-/// The slave's input: with ICRNL, Enter's CR becomes LF.
+/// The slave's input: with ICRNL, Enter's CR becomes LF; with ISIG, ^C is SIGINT to the reader; with
+/// ECHO, what's read goes back out to the master.
 fn pts_read(p: &Pipe, buf: u64, len: u64) -> R {
     let n = p.io(buf, len, false)?;
-    if PTY_TERMIOS.lock().unwrap()[0] & ICRNL != 0 {
-        unsafe { guest_mut(buf, n as usize) }.iter_mut().filter(|b| **b == b'\r').for_each(|b| *b = b'\n');
+    let t = *PTY_TERMIOS.lock().unwrap();
+    let data = unsafe { guest_mut(buf, n as usize) };
+    if t[0] & ICRNL != 0 {
+        data.iter_mut().filter(|b| **b == b'\r').for_each(|b| *b = b'\n');
     }
-    Ok(n)
+    let mut n = n as usize;
+    let vintr = (t[4] >> 8) as u8; // c_cc[VINTR], after c_line
+    if t[3] & ISIG != 0 && data.contains(&vintr) {
+        // ponytail: the signal goes to the reader, not the foreground process group lx doesn't track.
+        n = 0;
+        for i in 0..data.len() {
+            if data[i] != vintr {
+                data[n] = data[i];
+                n += 1;
+            }
+        }
+        let _ = crate::signal::raise(2);
+        if n == 0 {
+            return Err(crate::syscall::EINTR); // not EOF: a handler (SA_RESTART) reads on
+        }
+    }
+    if t[3] & ECHO != 0 && n > 0 {
+        // ponytail: echoed as is, no ECHOE erase or ECHOCTL ^X forms.
+        let _ = pts_write(p, buf, n as u64);
+    }
+    Ok(n as i64)
 }
 
 /// The slave's output: with OPOST|ONLCR, LF goes out as CRLF.
