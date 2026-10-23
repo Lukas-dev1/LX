@@ -70,6 +70,15 @@ pub fn pid() -> u32 {
     }
 }
 
+/// Windows exit code of an lx process a signal killed: this tag | the signal, so wait4 reports
+/// WIFSIGNALED. The container's first process (what Windows and Docker see) exits 128 + signal instead.
+pub const SIGNALED: u32 = 0x4C58_0000;
+
+/// The process dies of `sig` (default action, SIGKILL, seccomp).
+pub fn die(sig: u64) -> ! {
+    exit(SIGNALED as u64 | (sig & 0x7f))
+}
+
 /// The container's first process (whose lx is LX_IN_JOB). The guest sees it as pid 1, as in Docker:
 /// s6-overlay, tini and dumb-init insist on being pid 1. lx keeps the real pids inside (signal mailboxes
 /// are named by them); `guest_pid` and `host_pid` translate at the syscall boundary.
@@ -307,7 +316,9 @@ pub fn wait4(pid: i64, status: u64, options: u64) -> R {
         let mut code = 0u32;
         unsafe { GetExitCodeProcess(kid.process.as_raw_handle() as isize, &mut code) };
         if status != 0 {
-            unsafe { *(status as *mut i32) = ((code & 0xff) << 8) as i32 }; // WIFEXITED, WEXITSTATUS = code
+            // WIFSIGNALED with the signal, or WIFEXITED with WEXITSTATUS = code.
+            let st = if code & 0xFFFF_0000 == SIGNALED { code & 0x7f } else { (code & 0xff) << 8 };
+            unsafe { *(status as *mut i32) = st as i32 };
         }
         return Ok(kid.pid as i64);
     }
@@ -524,8 +535,14 @@ pub fn exit(code: u64) -> ! {
     // Close the guest's fds first: TerminateProcess drops sockets abortively, and a peer of an AF_UNIX
     // pair then reads ECONNRESET where Linux gives EOF (erts and its erl_child_setup).
     fs::close_all();
+    let code = code as u32;
+    let code = match code & 0xFFFF_0000 == SIGNALED {
+        true if root() == 0 || root() == unsafe { GetCurrentProcessId() } => 128 + (code & 0x7f), // like a shell
+        true => code,
+        false => code & 0xff,
+    };
     unsafe {
-        TerminateProcess(GetCurrentProcess(), code as u32 & 0xff);
+        TerminateProcess(GetCurrentProcess(), code);
     }
     unreachable!()
 }

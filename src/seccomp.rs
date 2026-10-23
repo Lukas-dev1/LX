@@ -96,7 +96,7 @@ pub fn check(nr: u64, a: &[u64; 6], ip: u64) -> Option<R> {
             let _ = crate::signal::raise(31); // SIGSYS, delivered as the syscall returns
             Some(Err(ENOSYS))
         }
-        _ => crate::proc::exit(128 + 31), // KILL_THREAD/KILL_PROCESS: the process dies of SIGSYS
+        _ => crate::proc::die(31), // KILL_THREAD/KILL_PROCESS: the process dies of SIGSYS
     }
 }
 
