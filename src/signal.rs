@@ -189,10 +189,9 @@ pub fn send_thread(tid: u64, sig: u64) -> R {
 struct Ctx([u8; 1232]); // CONTEXT: ContextFlags 0x30, Rcx 0x80, R11 0xd0, Rip 0xf8
 
 fn kick(h: isize, t: &crate::syscall::ThreadState) {
-    // Off unless LX_KICK=1: `go build` deadlocked in a third of runs with it (heavy SIGURG preemption
-    // across ~30 threads), cause not yet found. Without it a handled signal waits for the next syscall.
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("LX_KICK").is_some()) {
+    // LX_NOKICK=1 turns kicks off (a handled signal then waits for the thread's next syscall).
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("LX_NOKICK").is_ok_and(|v| v == "1")) {
         return;
     }
     if h == 0 || t.kicked.load(SeqCst) {
@@ -217,6 +216,10 @@ unsafe fn kick_once(h: isize, t: &crate::syscall::ThreadState, c: &mut Ctx, q: i
         fn GetThreadContext(h: isize, c: *mut u8) -> i32;
         fn SetThreadContext(h: isize, c: *const u8) -> i32;
     }
+    // One kick at a time in the process: two threads signalling each other (Go's threads preempt one
+    // another) each sat in SuspendThread on the other, waiting for it to stop, and neither ever did.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut again = false;
     unsafe {
         if SuspendThread(h) == u32::MAX {
