@@ -225,7 +225,7 @@ repeat() { # repeat <name> <n> <lx args...>
     if LX_PATCHLOG=1 timeout 120 $LX "$@" < /dev/null > "$OUT/rep" 2>&1 && grep -q " OK$" "$OUT/rep"; then
       good=$((good + 1))
     else
-      echo "  run $i of $name failed (exit $?); its output:"; head -20 "$OUT/rep" | sed 's/^/    /' # rare failures need it
+      echo "  run $i of $name failed (exit $?); its output:"; grep -v "^\[lx" "$OUT/rep" | tail -20 | sed 's/^/    /' # rare failures need it
     fi
     traps=$((traps + $(grep -o "[0-9]* fallback traps\|[0-9]* FS-base faults" "$OUT/rep" | awk '{s += $1} END {print s + 0}')))
   done
