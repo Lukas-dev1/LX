@@ -997,6 +997,11 @@ pub static IN_SYSCALL: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), A
 
 fn dispatch(c: &mut Context) -> i64 {
     let a = [c.rdi, c.rsi, c.rdx, c.r10, c.r8, c.r9];
+    // mmap, mprotect, munmap, mremap, brk, shmat/shmdt, truncate/ftruncate (views re-mapped): what a
+    // page that put_guest checked once may no longer be.
+    if matches!(c.rax, 9 | 10 | 11 | 12 | 25 | 30 | 67 | 76 | 77) {
+        MAP_GEN.fetch_add(1, Relaxed);
+    }
     for (slot, v) in IN_SYSCALL.iter().zip([c.rax + 1, a[0], a[1], a[2]]) {
         slot.store(v, Relaxed);
     }
@@ -1068,6 +1073,11 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         37 => Ok(signal::set_alarm(a[0] * 1000, 0).0.div_ceil(1000) as i64), // alarm: the seconds left of the old one
         38 => setitimer(a[0], a[1], a[2]),
         36 => getitimer(a[0], a[1]),
+        // Setting the clock: a container may not (Docker's seccomp profile answers EPERM too).
+        // adjtimex/clock_adjtime with modes 0 only read: the clock is in sync, nothing being adjusted.
+        227 | 164 => Err(EPERM), // clock_settime, settimeofday
+        159 => adjtimex_read(a[0]),
+        305 => if valid_clock(a[0]) { adjtimex_read(a[1]) } else { Err(EINVAL) }, // clock_adjtime
         222 => signal::timer_create(a[0], a[1], a[2]),
         223 => signal::timer_settime(a[0], a[1], a[2], a[3]),
         224 => signal::timer_gettime(a[0], a[1]),
@@ -1181,8 +1191,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         157 if a[0] == 22 => crate::seccomp::set(a[1], a[2]), // PR_SET_SECCOMP
         157 => prctl(a[0], a[1]),
         317 => crate::seccomp::seccomp(a[0], a[1], a[2]),
-        115 => Ok(0),                  // getgroups: no supplementary groups
-        116 => Ok(0),                  // setgroups: accepted
+        115 => proc::getgroups(a[0], a[1]),
+        116 => proc::setgroups(a[0], a[1]),
         109 => proc::setpgid(a[0] as u32, a[1] as u32),
         110 => proc::getppid(),
         111 => proc::getpgid(0), // getpgrp
@@ -1229,6 +1239,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         264 | 316 => fs::renameat(a[0], a[1], a[2], a[3]),
         266 => fs::symlinkat(a[0], a[1], a[2]),
         267 => fs::readlinkat(a[0], a[1], a[2], a[3]),
+        439 if a[3] & !0x1300 != 0 => Err(EINVAL), // faccessat2: AT_SYMLINK_NOFOLLOW, AT_EACCESS, AT_EMPTY_PATH
         269 | 439 => fs::faccessat(a[0], a[1], a[2]),
         273 => Ok(0),                  // set_robust_list
         // tkill, tgkill. ponytail: signals are process-wide; whichever thread returns from a syscall next runs it.
@@ -1241,6 +1252,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         294 => crate::inotify::init(a[0]),
         254 => crate::inotify::add_watch(a[0], a[1], a[2]),
         255 => crate::inotify::rm_watch(a[0], a[1]),
+        318 if a[2] & !7 != 0 => Err(EINVAL), // getrandom: GRND_NONBLOCK, GRND_RANDOM, GRND_INSECURE only
         318 => getrandom(a[0], a[1]),
         334 => Err(ENOSYS),            // rseq: optional, glibc copes
         nr => {
@@ -1281,9 +1293,23 @@ pub fn cstr_max(addr: u64, max: usize) -> Result<String, i64> {
     if addr == 0 {
         return Err(EFAULT);
     }
+    // Scanned one readable region at a time: a bad pointer (LTP's EFAULT checks) is EFAULT, not a
+    // fault inside lx. Usually one VirtualQuery: a path sits in one region.
     let p = addr as *const u8;
-    let len = (0..max).find(|&i| unsafe { *p.add(i) } == 0).ok_or(E2BIG)?;
-    Ok(String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned())
+    let mut i = 0;
+    loop {
+        let here = addr + i as u64;
+        let end = readable_end(here).ok_or(EFAULT)?;
+        let stop = ((end - here) as usize).min(max - i);
+        if let Some(n) = (0..stop).find(|&k| unsafe { *p.add(i + k) } == 0) {
+            let len = i + n;
+            return Ok(String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned());
+        }
+        i += stop;
+        if i >= max {
+            return Err(E2BIG);
+        }
+    }
 }
 
 /// Copy `bytes` to guest memory at `addr`, or EFAULT unless every page it covers is committed and
@@ -1292,6 +1318,16 @@ pub fn cstr_max(addr: u64, max: usize) -> Result<String, i64> {
 /// may point anywhere (LTP's EFAULT checks); bulk copies go through ReadFile, which probes itself.
 pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
     let end = addr.checked_add(bytes.len() as u64).ok_or(EFAULT)?;
+    // The hot callers (clock_gettime, gettimeofday: lx has no vDSO) write the same page again and again:
+    // once checked, it stays writable until the map changes (MAP_GEN), so skip the VirtualQuery.
+    thread_local!(static CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) });
+    let page = addr & !(PAGE - 1);
+    let same_page = end > addr && (end - 1) & !(PAGE - 1) == page;
+    let epoch = MAP_GEN.load(Relaxed);
+    if same_page && CHECKED.get() == (page, epoch) {
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+        return Ok(0);
+    }
     let mut p = addr;
     while p < end {
         let mut m = MemoryBasicInformation::default();
@@ -1301,9 +1337,15 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
         }
         p = (m.base + m.region_size) as u64; // usually one query: the result fits one region
     }
+    if same_page {
+        CHECKED.set((page, epoch));
+    }
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
     Ok(0)
 }
+
+/// Bumped by every syscall that changes the address space (see dispatch): put_guest's page cache.
+static MAP_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// Read `N` bytes of guest memory at `addr`, or EFAULT unless every page is committed and readable.
 pub fn get_guest<const N: usize>(addr: u64) -> Result<[u8; N], i64> {
@@ -1319,6 +1361,30 @@ pub fn get_guest_vec(addr: u64, n: usize) -> Option<Vec<u8>> {
 }
 
 /// Whether [addr, addr+n) is committed guest memory we may read.
+/// The end of the readable region holding `addr`, if it is readable.
+fn readable_end(addr: u64) -> Option<u64> {
+    let mut m = MemoryBasicInformation::default();
+    let ok = unsafe { VirtualQuery(addr as *const _, &mut m, size_of::<MemoryBasicInformation>()) } != 0
+        && m.state == MEM_COMMIT && m.protect & 0x101 == 0 && m.protect & 0xff != 0x10;
+    ok.then(|| (m.base + m.region_size) as u64)
+}
+
+/// EFAULT unless [addr, addr+n) is committed and readable (`write`: and writable): for syscalls that
+/// work on a guest buffer in place.
+pub fn check_guest(addr: u64, n: usize, write: bool) -> Result<(), i64> {
+    let Some(end) = addr.checked_add(n as u64) else { return Err(EFAULT) };
+    let mut p = addr;
+    while p < end {
+        let mut m = MemoryBasicInformation::default();
+        if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 || m.state != MEM_COMMIT
+            || if write { !matches!(m.protect, 0x04 | 0x08 | 0x40 | 0x80) } else { m.protect & 0x101 != 0 || m.protect & 0xff == 0x10 } {
+            return Err(EFAULT);
+        }
+        p = (m.base + m.region_size) as u64;
+    }
+    Ok(())
+}
+
 fn readable(addr: u64, n: usize) -> bool {
     let Some(end) = addr.checked_add(n as u64) else { return false };
     let mut p = addr;
@@ -1978,6 +2044,24 @@ fn time(out: u64) -> R {
     Ok(s as i64)
 }
 
+/// adjtimex as a reader: struct timex with modes 0 gets "synchronized" (TIME_OK), anything else is a change
+/// a container may not make. Offsets: modes 0, status 32, constant 40, precision 48, tolerance 56,
+/// time (timeval) 64, tick 80.
+fn adjtimex_read(tx: u64) -> R {
+    let modes = u32::from_le_bytes(get_guest::<4>(tx)?);
+    if modes != 0 {
+        return Err(EPERM);
+    }
+    let (s, ns) = now(0);
+    let mut t = [0u8; 208];
+    t[64..72].copy_from_slice(&s.to_le_bytes());
+    t[72..80].copy_from_slice(&(ns / 1000).to_le_bytes());
+    t[80..88].copy_from_slice(&10_000u64.to_le_bytes()); // tick: 10000 us, as USER_HZ 100 has it
+    t[48..56].copy_from_slice(&1u64.to_le_bytes()); // precision 1 us
+    put_guest(tx, &t)?;
+    Ok(0) // TIME_OK
+}
+
 /// The clock ids Linux knows (10 was CLOCK_SGI_CYCLE, gone). Negative ids name another process's
 /// or thread's CPU clock. ponytail: those aren't supported (EINVAL).
 fn valid_clock(clock: u64) -> bool {
@@ -2006,8 +2090,10 @@ fn clock_gettime(clock: u64, ts: u64) -> R {
         return Err(EINVAL);
     }
     let (s, ns) = now(clock);
-    unsafe { *(ts as *mut [u64; 2]) = [s, ns] };
-    Ok(0)
+    let mut b = [0u8; 16]; // no allocation: this is the most frequent syscall (no vDSO)
+    b[..8].copy_from_slice(&s.to_le_bytes());
+    b[8..].copy_from_slice(&ns.to_le_bytes());
+    put_guest(ts, &b)
 }
 
 fn gettimeofday(tv: u64, tz: u64) -> R {
@@ -2147,6 +2233,7 @@ fn timespec_ms(ts: u64) -> i64 {
 
 pub fn getrandom(buf: u64, len: u64) -> R {
     let len = len.min(u32::MAX as u64);
+    check_guest(buf, len as usize, true)?;
     unsafe { BCryptGenRandom(std::ptr::null_mut(), buf as *mut u8, len as u32, 2) };
     Ok(len as i64)
 }

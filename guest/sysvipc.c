@@ -45,10 +45,12 @@ int main(void) {
     int st2; waitpid(c2, &st2, 0);
     struct seminfo si;
     int info = semctl(0, 0, IPC_INFO, &si) >= 0 && si.semmsl > 0;
+    int byidx = 0; // SEM_STAT walks the table by index and returns the set's id (ipcs)
+    for (int i = 0; i < 128; i++) if (semctl(i, 0, SEM_STAT, &ds) == sem) byidx = 1;
     int k = semget(0x4c58, 1, IPC_CREAT | 0600), k2 = semget(0x4c58, 1, 0);
     semctl(sem, 0, IPC_RMID); msgctl(q, IPC_RMID, 0); semctl(k, 0, IPC_RMID);
     int gone = semctl(sem, 0, GETVAL) < 0 && errno == EINVAL;
-    printf("sysv waiting=%d got=%s n=%zd child=%d nowait=%s/%s nsems=%d perm=%d info=%d key=%d gone=%d\n", waiting, m.text, n,
-           WEXITSTATUS(st), e1 == EAGAIN ? "EAGAIN" : "?", e2 == ENOMSG ? "ENOMSG" : "?", nsems, WEXITSTATUS(st2) == 0, info, k == k2, gone);
+    printf("sysv waiting=%d got=%s n=%zd child=%d nowait=%s/%s nsems=%d perm=%d info=%d stat=%d key=%d gone=%d\n", waiting, m.text, n,
+           WEXITSTATUS(st), e1 == EAGAIN ? "EAGAIN" : "?", e2 == ENOMSG ? "ENOMSG" : "?", nsems, WEXITSTATUS(st2) == 0, info, byidx, k == k2, gone);
     return 0;
 }

@@ -38,8 +38,12 @@ Pss: {:>16} kB
         "/proc/loadavg" => format!("0.00 0.00 0.00 1/1 {}\n", crate::proc::getpid().unwrap_or(0)),
         "/proc/version" => "Linux version 6.6.0-lx (lx) #1 SMP lx\n".into(),
         "/proc/sys/kernel/hostname" => "lx\n".into(),
+        "/proc/cmdline" => "BOOT_IMAGE=/boot/vmlinuz-6.6.0-lx root=/dev/sda1 ro quiet\n".into(),
+        "/proc/sys/kernel/tainted" => "0\n".into(), // nothing has tainted this kernel
+        "/proc/sys/fs/pipe-max-size" => "1048576\n".into(),
         "/proc/sys/kernel/osrelease" => "6.6.0-lx\n".into(),
         "/proc/sys/kernel/pid_max" => "4194304\n".into(),
+        "/proc/sys/kernel/ngroups_max" => "65536\n".into(), // NGROUPS_MAX: setgroups' limit
         "/proc/sys/kernel/threads-max" => "1000000\n".into(),
         "/proc/sys/kernel/cap_last_cap" => "40\n".into(), // CAP_CHECKPOINT_RESTORE, as prctl(PR_CAPBSET_READ) agrees
         "/proc/sys/vm/overcommit_memory" => "1\n".into(), // NT commits on mmap; don't make redis warn
@@ -53,18 +57,21 @@ Pss: {:>16} kB
 
 /// /proc/<pid>/{cmdline,comm,stat,status} from the container's process table (ps, pgrep, pidof).
 fn table_file(pid: u32, rest: &str) -> Option<String> {
-    let p = crate::ptable::get(pid)?;
+    let mut p = crate::ptable::get(pid)?;
+    if crate::proc::host_pid(pid) == crate::proc::pid() {
+        p.state = 'R'; // the reader itself is running, however long its own read has taken
+    }
     Some(match rest {
         "cmdline" => String::from_utf8_lossy(&p.cmdline).into_owned(),
         "comm" => format!("{}\n", p.comm),
         // pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime
         // cutime cstime priority nice threads itrealvalue starttime vsize rss ... (52 fields)
         "stat" => format!("{} ({}) {} {} {} {} 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 {} 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-            p.pid, p.comm, if p.sleeping { 'S' } else { 'R' }, p.ppid, crate::proc::getpgid(p.pid).unwrap_or(p.pid as i64),
+            p.pid, p.comm, p.state, p.ppid, crate::proc::getpgid(p.pid).unwrap_or(p.pid as i64),
             crate::proc::getsid(p.pid).unwrap_or(p.pid as i64), p.start_ms / 10),
         "status" => format!("Name:\t{}\nUmask:\t0022\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
                              Uid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t1\n",
-            p.comm, if p.sleeping { "S (sleeping)" } else { "R (running)" }, p.pid, p.pid, p.ppid, u = p.uid, g = p.gid),
+            p.comm, match p.state { 'S' => "S (sleeping)", 'Z' => "Z (zombie)", _ => "R (running)" }, p.pid, p.pid, p.ppid, u = p.uid, g = p.gid),
         _ => return None,
     })
 }
@@ -180,7 +187,8 @@ fn status() -> String {
     let name = crate::fs::exe_name();
     let (uid, gid) = (crate::proc::UID.load(std::sync::atomic::Ordering::Relaxed), crate::proc::GID.load(std::sync::atomic::Ordering::Relaxed));
     format!("Name:\t{name}\nUmask:\t0022\nState:\tR (running)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\n\
-             Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n\
+             Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nGroups:\t{}\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n\
              SigBlk:\t0000000000000000\nCpus_allowed_list:\t0-{}\n",
+            crate::proc::groups().iter().map(|g| format!("{g} ")).collect::<String>(),
             vsz >> 10, rss >> 10, crate::thread::live(), std::thread::available_parallelism().map_or(1, |n| n.get()) - 1)
 }

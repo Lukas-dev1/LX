@@ -102,7 +102,7 @@ expect "signalfd in epoll, woken by a child's signal" 0 "OK" -- rootfs /sigfdtes
 expect "SIGTERM reaches threads parked in futexes (Go idle)" 0 "sigfutex OK" -- rootfs /sigfutex
 expect "SA_RESTART: an interrupted read continues" 0 "read=1" -- rootfs /restarttest
 expect "POSIX timers: a periodic timer_create timer keeps firing" 0 "ticks=3 armed=1" -- rootfs /ptimer
-expect "SysV semaphores and message queues across fork" 0 "sysv waiting=1 got=hello n=16 child=0 nowait=EAGAIN/ENOMSG nsems=2 perm=1 info=1 key=1 gone=1" -- rootfs /sysvipc
+expect "SysV semaphores and message queues across fork" 0 "sysv waiting=1 got=hello n=16 child=0 nowait=EAGAIN/ENOMSG nsems=2 perm=1 info=1 stat=1 key=1 gone=1" -- rootfs /sysvipc
 expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
 expect "waitid: P_PID, WNOWAIT, CLD_KILLED, WNOHANG" 0 "peek=1 reap=1 killed=1 none=1" -- rootfs /waitidtest
@@ -159,13 +159,24 @@ expect "run -e / -w"               0 "A=1 V=9 /usr" -- run -e A=1 -e PYTHON_VERS
 expect "/proc/<getpid()> after exec" 0 "own pid ['0', '1', '2']" -- run python:3.12-alpine sh -c 'exec python3 -c "import os; p=f\"/proc/{os.getpid()}\"; os.stat(p); print(\"own pid\", sorted(os.listdir(p + \"/fd\"))[:3])"'
 expect "hard link counts (container files; image files stay 1)" 0 "nlink 2 1 image 1" -- run alpine sh -c 'touch /tmp/a; ln /tmp/a /tmp/b; x=$(stat -c %h /tmp/a); rm /tmp/b; echo "nlink $x $(stat -c %h /tmp/a) image $(stat -c %h /bin/busybox)"'
 expect "fstat counts a container file's hard links (image files stay 1)" 0 "fstat nlink 2 1 image 1" -- run python:3.12-alpine python3 -c 'import os; fd=os.open("/tmp/a",os.O_RDWR|os.O_CREAT); os.link("/tmp/a","/tmp/b"); n1=os.fstat(fd).st_nlink; os.unlink("/tmp/b"); n2=os.fstat(fd).st_nlink; print("fstat nlink", n1, n2, "image", os.fstat(os.open("/usr/lib/libz.so.1",0)).st_nlink)'
+expect "lchown sets a symlink's own owner; chown follows it" 0 "f=1000:1001 l=2000:2001 lmode=777" -- run alpine sh -c 'cd /tmp; touch f; chown 1000:1001 f; ln -s f l; chown -h 2000:2001 l; echo "f=$(stat -c %u:%g f) l=$(stat -c %u:%g l) lmode=$(stat -c %a l)"'
+expect "a set-group-ID directory's group goes to what's made in it" 0 "f=1234 sub=1234:2755 fifo=1234" -- run alpine sh -c 'mkdir /tmp/g && chown 0:1234 /tmp/g && chmod 2777 /tmp/g && su -s /bin/sh nobody -c "touch /tmp/g/f; mkdir /tmp/g/sub; mkfifo /tmp/g/p"; echo "f=$(stat -c %g /tmp/g/f) sub=$(stat -c %g:%a /tmp/g/sub) fifo=$(stat -c %g /tmp/g/p)"'
 expect "ftruncate grows a file with a hole (size and data right)" 0 "big 1073741824 hi" -- run alpine sh -c 'truncate -s 1G /tmp/big; echo hi | dd of=/tmp/big bs=1 seek=1000 conv=notrunc 2>/dev/null; echo "big $(stat -c %s /tmp/big) $(dd if=/tmp/big bs=1 skip=1000 count=2 2>/dev/null)"'
 expect "ftruncate shrinks a mapped file (shared and private views)" 0 "shrunk 4096 b'a' b'P' b'aZ'" -- run python:3.12-alpine python3 -c 'import mmap,os; fd=os.open("/tmp/m",os.O_RDWR|os.O_CREAT); os.write(fd,b"a"*16384); m=mmap.mmap(fd,16384); p=mmap.mmap(fd,16384,flags=mmap.MAP_PRIVATE); p[0:1]=b"P"; os.ftruncate(fd,4096); m[1:2]=b"Z"; os.lseek(fd,0,0); print("shrunk",os.fstat(fd).st_size,m[0:1],p[0:1],os.read(fd,2))'
 expect "chown drops setuid/setgid; chmod g+s outside the group is dropped" 0 "chown:755 sgid:777" -- run alpine sh -c 'cd /tmp && touch f && chmod 6755 f && chown 0:0 f && mkdir d && chown 65534:0 d && chmod 777 d && su -s /bin/sh nobody -c "chmod 2777 d"; echo "chown:$(stat -c %a f) sgid:$(stat -c %a d)"'
 expect "a 300-byte name is ENAMETOOLONG" 0 "too long" -- run alpine sh -c 'cd $(printf "%0300d" 0) 2>&1; true'
 expect "procps ps, vmstat (/proc/stat, /proc/vmstat)" 0 "ps ok vmstat ok" -- run python:3.12 sh -c 'ps aux > /dev/null && p="ps ok"; vmstat > /dev/null && echo "$p vmstat ok"'
+expect "an exited child is a zombie until reaped (none when SIGCHLD is ignored)" 0 "default: Z then gone; SIG_IGN: gone" -- run python:3.12-alpine python3 -c 'import os,time,signal
+st=lambda p: (lambda f: f.read().split()[2])(open("/proc/%d/stat" % p)) if os.path.exists("/proc/%d" % p) else "gone"
+c=os.fork()
+if c == 0: os._exit(3)
+time.sleep(0.5); a=st(c); os.waitpid(c,0); b=st(c)
+signal.signal(signal.SIGCHLD, signal.SIG_IGN); d=os.fork()
+if d == 0: os._exit(0)
+time.sleep(0.5); print("default: %s then %s; SIG_IGN: %s" % (a, b, st(d)))'
 expect "/proc/<pid>/stat: S for a process blocked in a syscall, R for one running" 0 "sleep:S busy:R self:R" -- run alpine sh -c 'sleep 5 & s=$!; (while :; do :; done) & b=$!; sleep 1; echo "sleep:$(cut -d" " -f3 /proc/$s/stat) busy:$(cut -d" " -f3 /proc/$b/stat) self:$(cut -d" " -f3 /proc/self/stat)"; kill $b'
 expect "access(X_OK) as root needs an x bit; nobody needs its own bits" 0 "x:no w:no r:yes" -- run alpine sh -c 'touch /tmp/f; chmod 604 /tmp/f; [ -x /tmp/f ] && x=yes || x=no; su -s /bin/sh nobody -c "[ -w /tmp/f ] && w=yes || w=no; [ -r /tmp/f ] && r=yes || r=no; echo x:$x w:\$w r:\$r"'
+expect "supplementary groups: su shows them in id" 0 "groups=1000(u1),1001(g1)" -- run alpine sh -c 'adduser -D u1; addgroup g1; addgroup u1 g1; su u1 -c id'
 expect "/proc/self/maps lists mapped code" 0 "maps ok" -- run alpine sh -c 'grep -q " r-xp " /proc/self/maps && echo maps ok'
 expect "pty: ttyname, slave opened twice" 0 "pts ok x" -- run python:3.12-alpine python3 -c 'import os,pty; m,s=pty.openpty(); n=os.ttyname(s); f=os.open(n, os.O_RDWR); os.write(f, b"x"); print("pts ok", os.read(m, 1).decode())'
 expect "a signal cuts clock_nanosleep short (Python's time.sleep)" 0 "woke after 1" -- run python:3.12-alpine python3 -c 'import signal,sys,time; t=time.time(); signal.signal(signal.SIGALRM, lambda *_: (print("woke after", round(time.time()-t)), sys.exit(0))); signal.alarm(1); time.sleep(10)'
@@ -218,7 +229,7 @@ repeat() { # repeat <name> <n> <lx args...>
     if LX_PATCHLOG=1 timeout 120 $LX "$@" < /dev/null > "$OUT/rep" 2>&1 && grep -q " OK$" "$OUT/rep"; then
       good=$((good + 1))
     else
-      echo "  run $i of $name failed (exit $?); its output:"; head -20 "$OUT/rep" | sed 's/^/    /' # rare failures need it
+      echo "  run $i of $name failed (exit $?); its output:"; grep -v "^\[lx" "$OUT/rep" | tail -20 | sed 's/^/    /' # rare failures need it
     fi
     traps=$((traps + $(grep -o "[0-9]* fallback traps\|[0-9]* FS-base faults" "$OUT/rep" | awk '{s += $1} END {print s + 0}')))
   done

@@ -1730,7 +1730,7 @@ pub fn mknodat(dirfd: u64, path: u64, mode: u64) -> R {
             fs::write(&host, [FIFO_MAGIC, &id.finish().to_le_bytes()].concat()).map_err(errno)?;
             mark(&host);
             if fs.keeps_meta(&comps_of(&guest)) {
-                let _ = set_meta(&host, new_meta(mode));
+                let _ = set_meta(&host, new_meta_in(&host, mode, false));
             }
             Ok(0)
         }),
@@ -2281,7 +2281,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
                 .open(&host)
                 .map_err(errno)?;
             if flags & O_CREAT != 0 && meta.is_none() && fs.keeps_meta(&comps_of(&guest)) {
-                let _ = set_meta(&host, new_meta(mode));
+                let _ = set_meta(&host, new_meta_in(&host, mode, false));
             }
             Fd::File { f, host }
         };
@@ -2573,6 +2573,7 @@ fn posix_lock(fd: u64, cmd: u64, arg: u64) -> R {
     const F_RDLCK: i16 = 0;
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
+    crate::syscall::check_guest(arg, 32, true)?; // struct flock, before the fd, as Linux copies it in first
     let (h, pos, size) = with(|fs| match fs.fd(fd)? {
         Fd::File { f, host } => {
             let pos = f.stream_position().unwrap_or(0);
@@ -2720,6 +2721,31 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
     })
 }
 
+/// F_GETPIPE_SZ / F_SETPIPE_SZ: a pipe's capacity as the guest set it (64 KB until then). Linux rounds a
+/// request up to a power-of-two number of pages; more than /proc/sys/fs/pipe-max-size (1 MB) is EPERM
+/// without CAP_SYS_RESOURCE.
+/// ponytail: only remembered (NT's own pipe buffer doesn't change), per pipe end rather than per pipe,
+/// keyed by the end's handle and never forgotten, so a reused handle value starts with the old size;
+/// no EBUSY for shrinking below the queued data.
+fn pipe_size(fd: u64, set: Option<u64>) -> R {
+    static SIZES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+    let key = with(|fs| match fs.fd(fd)? {
+        Fd::Pipe(p) if p.pty.is_none() => Ok(p.raw() as usize),
+        _ => Err(EBADF),
+    }).map_err(|_| EINVAL)?;
+    let mut sizes = SIZES.lock().unwrap();
+    let sizes = sizes.get_or_insert_with(HashMap::new);
+    match set {
+        None => Ok(*sizes.get(&key).unwrap_or(&65536) as i64),
+        Some(n) if n > 1 << 20 => Err(crate::syscall::EPERM),
+        Some(n) => {
+            let n = n.max(4096).next_power_of_two();
+            sizes.insert(key, n);
+            Ok(n as i64)
+        }
+    }
+}
+
 pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
     match cmd {
         5 | 6 | 7 | 36 | 37 | 38 => posix_lock(fd, cmd, arg), // F_GETLK/SETLK/SETLKW and the OFD variants
@@ -2736,6 +2762,10 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         }),
         // F_SETFL / F_GETFL: O_NONBLOCK matters for sockets. ponytail: ignored on pipes and files.
         8 => with(|fs| fs.fd(fd).map(|_| 0)), // F_SETOWN: only matters for SIGIO, which we don't send
+        // F_SETSIG / F_GETSIG: which signal SIGIO would be. ponytail: no SIGIO, so it's only checked.
+        10 => if arg > 64 { Err(EINVAL) } else { with(|fs| fs.fd(fd).map(|_| 0)) },
+        11 => with(|fs| fs.fd(fd).map(|_| 0)),
+        1031 | 1032 => pipe_size(fd, (cmd == 1031).then_some(arg)), // F_SETPIPE_SZ, F_GETPIPE_SZ
         4 => with(|fs| match fs.fd(fd)? {
             Fd::Socket(s) => { s.set_nonblocking(arg & O_NONBLOCK != 0); Ok(0) }
             Fd::Event(e) => { e.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
@@ -2800,6 +2830,19 @@ pub fn set_meta(host: &Path, m: [u32; 3]) -> io::Result<()> {
 /// What a newly created file or directory gets: `mode` less the umask, owned by the effective ids.
 fn new_meta(mode: u64) -> [u32; 3] {
     [mode as u32 & 0o7777 & !UMASK.load(Relaxed), crate::proc::UID.load(Relaxed), crate::proc::GID.load(Relaxed)]
+}
+
+/// new_meta for an entry created at `host`: in a set-group-ID directory it takes the directory's group,
+/// and a new directory there is set-group-ID too, as on Linux.
+fn new_meta_in(host: &Path, mode: u64, dir: bool) -> [u32; 3] {
+    let mut m = new_meta(mode);
+    if let Some([_, _, gid]) = host.parent().and_then(get_meta).filter(|p| p[0] & 0o2000 != 0) {
+        m[2] = gid;
+        if dir {
+            m[0] |= 0o2000;
+        }
+    }
+    m
 }
 
 /// umask(mask): returns the old one; later lx processes (fork, exec) get the new one (proc::save_ids).
@@ -2869,6 +2912,9 @@ pub fn chmeta_at(dirfd: u64, path: u64, follow: bool, mode: Option<u64>, owner: 
 
 /// fchmodat2: fchmodat with its flags (AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH for the dirfd itself).
 pub fn fchmodat2(dirfd: u64, path: u64, mode: u64, flags: u64) -> R {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
     if flags & AT_EMPTY_PATH != 0 && cstr(path)?.is_empty() {
         return fchmeta(dirfd, Some(mode), None);
     }
@@ -2920,8 +2966,9 @@ fn stat_of_attrs(host: &Path, m: Attrs) -> Result<[u64; 18], i64> {
     for i in [9, 11, 13] {
         (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
     }
-    if link.is_none() {
-        with_meta(&mut s, host);
+    with_meta(&mut s, host);
+    if link.is_some() {
+        s[3] = (s[3] & !0o7777) | 0o777; // a symlink's own owner (lchown) counts; its mode is always 0777
     }
     Ok(s)
 }
@@ -3084,7 +3131,7 @@ pub fn faccessat(dirfd: u64, path: u64, mode: u64) -> R {
     let ok = if me == 0 {
         mode & 1 == 0 || m.dir || perm & 0o111 != 0
     } else {
-        let bits = if me == uid { perm >> 6 } else if my_gid == gid { perm >> 3 } else { perm } & 7;
+        let bits = if me == uid { perm >> 6 } else if my_gid == gid || crate::proc::in_group(gid) { perm >> 3 } else { perm } & 7;
         mode as u32 & !bits == 0
     };
     if ok { Ok(0) } else { Err(EACCES) }
@@ -3196,7 +3243,7 @@ pub fn mkdirat(dirfd: u64, path: u64, mode: u64) -> R {
         let up = fs.writable(&c, false)?;
         fs::create_dir(&up).map_err(errno)?;
         if fs.keeps_meta(&c) {
-            let _ = set_meta(&up, new_meta(mode));
+            let _ = set_meta(&up, new_meta_in(&up, mode, true));
         }
         if was_hidden {
             // Recreated over a deleted image dir: it must not show the old contents (overlayfs: opaque).

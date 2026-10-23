@@ -1536,6 +1536,7 @@ pub fn sys_epoll_wait(epfd: u64, out: u64, max: u64, timeout_ms: i64) -> R {
     if max == 0 || max > 1 << 16 {
         return Err(EINVAL);
     }
+    crate::syscall::check_guest(out, max as usize * 12, true)?; // struct epoll_event is 12 bytes, packed
     let start = std::time::Instant::now();
     loop {
         let mut n = 0u64;

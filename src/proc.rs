@@ -19,6 +19,9 @@ struct Kid {
     process: OwnedHandle,
     /// SIGCHLD already raised for its exit.
     notified: bool,
+    /// Its process group as last seen (inherited from us at fork): an exited child's mailbox is gone,
+    /// and waitpid(0) / waitpid(-pgid) must still find it.
+    pgid: u32,
 }
 static CHILDREN: Mutex<Vec<Kid>> = Mutex::new(Vec::new());
 static PARENT: AtomicU32 = AtomicU32::new(0);
@@ -39,16 +42,62 @@ pub fn set_id(id: &AtomicU32, v: u64) -> R {
 /// uid, gid and umask go to every later lx process of this one (fork and exec start new ones) in the
 /// host environment, which the guest never sees: `su postgres -c pg_ctl` must exec pg_ctl as postgres.
 pub fn save_ids() {
-    let v = format!("{} {} {}", UID.load(Relaxed), GID.load(Relaxed), fs::UMASK.load(Relaxed));
+    let groups: Vec<String> = GROUPS.lock().unwrap().iter().map(u32::to_string).collect();
+    let v = format!("{} {} {} {}", UID.load(Relaxed), GID.load(Relaxed), fs::UMASK.load(Relaxed), groups.join(","));
     unsafe { std::env::set_var("LX_IDS", v) };
 }
 
 pub fn load_ids() {
     let Ok(v) = std::env::var("LX_IDS") else { return };
-    let n: Vec<u32> = v.split(' ').filter_map(|x| x.parse().ok()).collect();
+    let mut f = v.split(' ');
+    let n: Vec<u32> = f.by_ref().take(3).filter_map(|x| x.parse().ok()).collect();
     if let [uid, gid, mask] = n[..] {
         (UID.store(uid, Relaxed), GID.store(gid, Relaxed), fs::UMASK.store(mask, Relaxed));
     }
+    *GROUPS.lock().unwrap() = f.next().unwrap_or("").split(',').filter_map(|g| g.parse().ok()).collect();
+}
+
+/// Supplementary groups (setgroups; su, login and initgroups set them), inherited like the ids.
+/// ponytail: they ride in LX_IDS, and a Windows environment variable holds at most 32767 characters, so
+/// some 5000 groups or more would make the next fork or exec fail; no real system has that many.
+static GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// getgroups(size, list): with size 0 only the count; a list too short is EINVAL.
+pub fn getgroups(size: u64, list: u64) -> R {
+    let g = GROUPS.lock().unwrap().clone();
+    if size as i32 == 0 {
+        return Ok(g.len() as i64);
+    }
+    if (size as i32) < g.len() as i32 {
+        return Err(syscall::EINVAL);
+    }
+    let bytes: Vec<u8> = g.iter().flat_map(|x| x.to_le_bytes()).collect();
+    syscall::put_guest(list, &bytes)?;
+    Ok(g.len() as i64)
+}
+
+/// setgroups(size, list): at most NGROUPS_MAX (65536).
+/// ponytail: capabilities aren't modeled, so it isn't refused for lacking CAP_SETGID: setpriv and gosu
+/// keep it across their uid switch (PR_SET_KEEPCAPS) and call setgroups after, as redis's entrypoint does.
+pub fn setgroups(size: u64, list: u64) -> R {
+    if size as i32 > 65536 || (size as i32) < 0 {
+        return Err(syscall::EINVAL);
+    }
+    syscall::check_guest(list, size as usize * 4, false)?;
+    let g: Vec<u32> = (0..size as usize).map(|i| unsafe { *(list as *const u32).add(i) }).collect();
+    *GROUPS.lock().unwrap() = g;
+    save_ids();
+    Ok(0)
+}
+
+/// Our supplementary groups (for /proc/self/status).
+pub fn groups() -> Vec<u32> {
+    GROUPS.lock().unwrap().clone()
+}
+
+/// Whether the caller is in group `gid` (its own or a supplementary one), for permission checks.
+pub fn in_group(gid: u32) -> bool {
+    GID.load(Relaxed) == gid || GROUPS.lock().unwrap().contains(&gid)
 }
 
 pub fn get_res(id: &AtomicU32, out: [u64; 3]) -> R {
@@ -220,7 +269,8 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
         return Err(fail("child failed to rebuild the guest".into()));
     }
     let pid = child.id();
-    CHILDREN.lock().unwrap().push(Kid { pid, process: OwnedHandle::from(child), notified: false });
+    let pgid = signal::ids(None).map_or(self::pid(), |(g, _)| g);
+    CHILDREN.lock().unwrap().push(Kid { pid, process: OwnedHandle::from(child), notified: false, pgid });
     // A parent blocked in epoll_wait/poll/read hears of the exit at once, not at its next syscall return
     // (postgres's postmaster sleeps up to 60 s waiting for its startup process to exit).
     std::thread::spawn(move || {
@@ -358,18 +408,23 @@ pub fn waitid(idtype: u64, id: u64, info: u64, options: u64) -> R {
 /// Wait for a child matching `sel` to exit: (its pid, its lx exit code), None under !blocking when none
 /// has. `keep`: leave it waitable (WNOWAIT).
 fn wait_child(sel: Which, blocking: bool, keep: bool) -> Result<Option<(u32, u32)>, i64> {
-    let matches = |k: &Kid| match sel {
+    let matches = |k: &mut Kid| match sel {
         Which::Any => true,
         Which::Pid(p) => k.pid == p,
-        Which::Group(g) => signal::ids(Some(k.pid)).is_some_and(|(kg, _)| kg == g),
+        Which::Group(g) => {
+            if let Some((kg, _)) = signal::ids(Some(k.pid)) {
+                k.pgid = kg; // it may have moved (setpgid); once it has exited, the last one seen counts
+            }
+            k.pgid == g
+        }
     };
     loop {
         // Wait on our own duplicates with the lock released: other threads keep making syscalls,
         // and one of them may reap (and close) a child meanwhile.
         let waits: Vec<(u32, OwnedHandle)> = {
-            let kids = CHILDREN.lock().unwrap();
-            kids.iter().filter(|k| matches(k)).take(63)
-                .filter_map(|k| k.process.try_clone().ok().map(|h| (k.pid, h))).collect()
+            let mut kids = CHILDREN.lock().unwrap();
+            kids.iter_mut().filter_map(|k| if matches(k) { k.process.try_clone().ok().map(|h| (k.pid, h)) } else { None })
+                .take(63).collect()
         };
         if waits.is_empty() {
             return Err(ECHILD);
@@ -396,6 +451,7 @@ fn wait_child(sel: Which, blocking: bool, keep: bool) -> Result<Option<(u32, u32
         let pid = kids[i].pid;
         if !keep {
             kids.remove(i);
+            crate::ptable::reap(guest_pid(pid)); // its zombie leaves /proc
         }
         return Ok(Some((pid, code)));
     }
