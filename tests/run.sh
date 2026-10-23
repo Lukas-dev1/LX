@@ -343,6 +343,7 @@ for _ in $(seq 40); do
 done
 $LX stop "lxipA-$$" > /dev/null 2>&1; $LX stop "lxipB-$$" > /dev/null 2>&1
 if [ "$got" = "AB" ]; then ok "two containers on the same port"; else bad "two containers on the same port: got '$got'"; fi
+expect "netlink: ip addr lists lo (Go's net.Interfaces, getifaddrs)" 0 "inet 127.0.0.1/8 scope host lo" -- run alpine ip addr
 
 # Another container's published port is reached at its container port (web:80 of a -p 8098:80 service).
 $LX run -d --name "lxpp-$$" --ip 127.77.0.1 -p 8098:8088 busybox sh -c "mkdir /w; echo pp > /w/i; httpd -f -p 8088 -h /w" < /dev/null > /dev/null 2>&1
