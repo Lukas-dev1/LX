@@ -853,7 +853,9 @@ impl Fs {
         }
         let mut lower = self.root.clone();
         lower.extend(comps.iter().map(|c| enc(c)));
-        self.upper.is_some() && !self.hidden(comps) && exists(&lower)
+        // The image's listing first (cached, and most entries a container removes are its own): only an
+        // entry the image has needs the whiteout walk.
+        self.upper.is_some() && lower_attrs(&lower).is_some() && !self.hidden(comps)
     }
 
     /// The upper-layer path for changing `comps`: parent directories are created in the upper layer, a
@@ -909,8 +911,9 @@ impl Fs {
         if let Some(up) = &self.upper {
             let mut upper = up.clone();
             upper.extend(comps.iter().map(|c| enc(c)));
-            if exists(&upper) {
-                if dir { fs::remove_dir_all(&upper) } else { fs::remove_file(&upper) }.map_err(errno)?;
+            match if dir { fs::remove_dir_all(&upper) } else { fs::remove_file(&upper) } {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {} // only the image has it
+                r => r.map_err(errno)?,
             }
             if lower {
                 let parent = upper.parent().unwrap_or(up);
@@ -3352,9 +3355,9 @@ pub fn mkdirat(dirfd: u64, path: u64, mode: u64) -> R {
 
 pub fn unlinkat(dirfd: u64, path: u64, flags: u64) -> R {
     with(|fs| {
-        let (guest, host) = fs.at(dirfd, path, false)?;
+        let (guest, _, meta) = fs.at_attrs(dirfd, path, false)?;
         let c = comps_of(&guest);
-        let is_dir = fs::symlink_metadata(&host).map_err(errno)?.is_dir();
+        let is_dir = meta.ok_or(ENOENT)?.dir;
         match (flags & AT_REMOVEDIR != 0, is_dir) {
             (true, true) if !fs.list(&c)?.is_empty() => Err(ENOTEMPTY),
             (true, true) => fs.remove(&c, true).map(|_| 0),
