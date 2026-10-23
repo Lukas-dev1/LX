@@ -57,7 +57,10 @@ Pss: {:>16} kB
 
 /// /proc/<pid>/{cmdline,comm,stat,status} from the container's process table (ps, pgrep, pidof).
 fn table_file(pid: u32, rest: &str) -> Option<String> {
-    let p = crate::ptable::get(pid)?;
+    let mut p = crate::ptable::get(pid)?;
+    if crate::proc::host_pid(pid) == crate::proc::pid() {
+        p.state = 'R'; // the reader itself is running, however long its own read has taken
+    }
     Some(match rest {
         "cmdline" => String::from_utf8_lossy(&p.cmdline).into_owned(),
         "comm" => format!("{}\n", p.comm),
