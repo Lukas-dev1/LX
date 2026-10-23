@@ -157,21 +157,7 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
                 syscall::fine_timer();
             }
             if syscall::in_shared_view(uaddr) {
-                // In MAP_SHARED memory the waker may be another process, and WaitOnAddress only hears wakes
-                // from this one: wait in 1 ms slices and re-check the value (same-process wakes stay instant).
-                let start = std::time::Instant::now();
-                loop {
-                    unsafe { WaitOnAddress(uaddr as *const _, &expect as *const u32 as *const _, 4, 1) };
-                    if cur() != expect {
-                        return Ok(0);
-                    }
-                    if ms != u32::MAX && start.elapsed().as_millis() >= ms as u128 {
-                        return Err(ETIMEDOUT);
-                    }
-                    if crate::signal::deliverable() {
-                        return Err(crate::syscall::EINTR);
-                    }
-                }
+                return shared_wait(uaddr, expect, ms);
             }
             // A signal for this thread (tkill) wakes us through futex_addr: publish it, then re-check.
             let t = syscall::ts();
@@ -192,6 +178,9 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
         }
         1 | 10 => {
             // FUTEX_WAKE, FUTEX_WAKE_BITSET. Waking more than asked is a spurious wakeup, which is allowed.
+            if syscall::in_shared_view(uaddr) {
+                return Ok(shared_wake(uaddr, val as u32) as i64);
+            }
             if val == 1 {
                 unsafe { WakeByAddressSingle(uaddr as *const _) };
             } else if val > 1 {
@@ -204,11 +193,119 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
             if cmd == 4 && cur() != val3 as u32 {
                 return Err(EAGAIN);
             }
+            if syscall::in_shared_view(uaddr) {
+                return Ok(shared_wake(uaddr, u32::MAX) as i64);
+            }
             unsafe { WakeByAddressAll(uaddr as *const _) };
             Ok(0)
         }
         _ => Err(ENOSYS),
     }
+}
+
+// ---- futexes in MAP_SHARED memory ----
+//
+// The waker may be another process, and WaitOnAddress only hears wakes from this one. Waiters and wakers
+// meet at named objects for (container, address) instead: a semaphore to wake on and a count of waiters,
+// so FUTEX_WAKE wakes and reports as many as Linux would (LTP's checkpoints wake without changing the
+// value and loop until the count is right). Fork keeps shared views at the same address.
+// ponytail: the same file mapped at different addresses (after exec) doesn't meet here; such waiters still
+// see a changed value through the 1 ms re-check.
+
+unsafe extern "system" {
+    fn CreateSemaphoreW(attr: *mut std::ffi::c_void, initial: i32, max: i32, name: *const u16) -> isize;
+    fn OpenSemaphoreW(access: u32, inherit: i32, name: *const u16) -> isize;
+    fn ReleaseSemaphore(sem: isize, n: i32, prev: *mut i32) -> i32;
+}
+
+struct SharedFutex {
+    sem: isize,
+    map: isize,
+    waiters: *const AtomicU32,
+}
+
+impl SharedFutex {
+    fn open(uaddr: u64, create: bool) -> Option<SharedFutex> {
+        let root = std::env::var("LX_IN_JOB").unwrap_or_default();
+        let name = |k: &str| format!("Local\\lx-fx{k}-{root}-{uaddr:x}").encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let (sn, mn) = (name("s"), name("n"));
+        unsafe {
+            let (sem, map) = if create {
+                (CreateSemaphoreW(std::ptr::null_mut(), 0, i32::MAX, sn.as_ptr()),
+                 CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, 0, 4, mn.as_ptr()))
+            } else {
+                (OpenSemaphoreW(0x0010_0002, 0, sn.as_ptr()), OpenFileMappingW(FILE_MAP_WRITE, 0, mn.as_ptr())) // SYNCHRONIZE | MODIFY_STATE
+            };
+            let view = if map != 0 { MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 4) } else { std::ptr::null_mut() };
+            let f = SharedFutex { sem, map, waiters: view as *const AtomicU32 };
+            (sem != 0 && !view.is_null()).then_some(f)
+        }
+    }
+
+    fn waiters(&self) -> &AtomicU32 {
+        unsafe { &*self.waiters }
+    }
+
+    /// Take up to `n` waiters off the count: the ones this caller wakes (or, for a leaving waiter, itself).
+    fn take(&self, n: u32) -> u32 {
+        let mut took = 0;
+        let _ = self.waiters().try_update(Relaxed, Relaxed, |w| { took = w.min(n); Some(w - took) });
+        took
+    }
+}
+
+impl Drop for SharedFutex {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.waiters.is_null() {
+                UnmapViewOfFile(self.waiters as *mut _);
+            }
+            for h in [self.sem, self.map] {
+                if h != 0 {
+                    CloseHandle(h);
+                }
+            }
+        }
+    }
+}
+
+fn shared_wait(uaddr: u64, expect: u32, ms: u32) -> R {
+    let cur = || unsafe { std::ptr::read_volatile(uaddr as *const u32) };
+    let Some(f) = SharedFutex::open(uaddr, true) else { return Err(EAGAIN) };
+    f.waiters().fetch_add(1, Relaxed);
+    let start = std::time::Instant::now();
+    let r = loop {
+        if cur() != expect {
+            break Err(EAGAIN);
+        }
+        if crate::signal::deliverable() {
+            break Err(crate::syscall::EINTR);
+        }
+        if ms != u32::MAX && start.elapsed().as_millis() >= ms as u128 {
+            break Err(ETIMEDOUT);
+        }
+        let hs = [f.sem, crate::signal::intr_event()];
+        let n = if hs[1] != 0 { 2 } else { 1 };
+        if unsafe { WaitForMultipleObjects(n, hs.as_ptr(), 0, 1) } == 0 {
+            return Ok(0); // woken; the waker took us off the count
+        }
+    };
+    if f.take(1) == 0 {
+        // A waker counted us between our last look and now: its release is ours to consume.
+        unsafe { WaitForMultipleObjects(1, &f.sem, 0, 1000) };
+        return Ok(0);
+    }
+    // A changed value is a wakeup (EAGAIN is only for a mismatch before sleeping).
+    if r == Err(EAGAIN) { Ok(0) } else { r }
+}
+
+fn shared_wake(uaddr: u64, n: u32) -> u32 {
+    let Some(f) = SharedFutex::open(uaddr, false) else { return 0 };
+    let took = f.take(n);
+    if took > 0 {
+        unsafe { ReleaseSemaphore(f.sem, took as i32, std::ptr::null_mut()) };
+    }
+    took
 }
 
 /// membarrier: FlushProcessWriteBuffers is exactly "a memory barrier on every thread of this process".
