@@ -163,6 +163,14 @@ expect "ftruncate shrinks a mapped file (shared and private views)" 0 "shrunk 40
 expect "chown drops setuid/setgid; chmod g+s outside the group is dropped" 0 "chown:755 sgid:777" -- run alpine sh -c 'cd /tmp && touch f && chmod 6755 f && chown 0:0 f && mkdir d && chown 65534:0 d && chmod 777 d && su -s /bin/sh nobody -c "chmod 2777 d"; echo "chown:$(stat -c %a f) sgid:$(stat -c %a d)"'
 expect "a 300-byte name is ENAMETOOLONG" 0 "too long" -- run alpine sh -c 'cd $(printf "%0300d" 0) 2>&1; true'
 expect "procps ps, vmstat (/proc/stat, /proc/vmstat)" 0 "ps ok vmstat ok" -- run python:3.12 sh -c 'ps aux > /dev/null && p="ps ok"; vmstat > /dev/null && echo "$p vmstat ok"'
+expect "an exited child is a zombie until reaped (none when SIGCHLD is ignored)" 0 "default: Z then gone; SIG_IGN: gone" -- run python:3.12-alpine python3 -c 'import os,time,signal
+st=lambda p: (lambda f: f.read().split()[2])(open("/proc/%d/stat" % p)) if os.path.exists("/proc/%d" % p) else "gone"
+c=os.fork()
+if c == 0: os._exit(3)
+time.sleep(0.5); a=st(c); os.waitpid(c,0); b=st(c)
+signal.signal(signal.SIGCHLD, signal.SIG_IGN); d=os.fork()
+if d == 0: os._exit(0)
+time.sleep(0.5); print("default: %s then %s; SIG_IGN: %s" % (a, b, st(d)))'
 expect "/proc/<pid>/stat: S for a process blocked in a syscall, R for one running" 0 "sleep:S busy:R self:R" -- run alpine sh -c 'sleep 5 & s=$!; (while :; do :; done) & b=$!; sleep 1; echo "sleep:$(cut -d" " -f3 /proc/$s/stat) busy:$(cut -d" " -f3 /proc/$b/stat) self:$(cut -d" " -f3 /proc/self/stat)"; kill $b'
 expect "access(X_OK) as root needs an x bit; nobody needs its own bits" 0 "x:no w:no r:yes" -- run alpine sh -c 'touch /tmp/f; chmod 604 /tmp/f; [ -x /tmp/f ] && x=yes || x=no; su -s /bin/sh nobody -c "[ -w /tmp/f ] && w=yes || w=no; [ -r /tmp/f ] && r=yes || r=no; echo x:$x w:\$w r:\$r"'
 expect "/proc/self/maps lists mapped code" 0 "maps ok" -- run alpine sh -c 'grep -q " r-xp " /proc/self/maps && echo maps ok'

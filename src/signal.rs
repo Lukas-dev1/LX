@@ -90,6 +90,10 @@ pub fn sigaction(sig: u64, act: u64, old: u64) -> R {
         }
         let [handler, flags, restorer, mask] = unsafe { *(act as *const [u64; 4]) };
         s.actions[sig as usize] = Action { handler, flags, restorer, mask };
+        if sig == SIGCHLD {
+            const SA_NOCLDWAIT: u64 = 2;
+            crate::ptable::set_nocldwait(handler == 1 || flags & SA_NOCLDWAIT != 0); // SIG_IGN: no zombies
+        }
     }
     Ok(0)
 }

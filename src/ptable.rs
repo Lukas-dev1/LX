@@ -13,7 +13,7 @@ const SLOTS: usize = 1024;
 const SLOT: usize = 512;
 const COMM: usize = 16;
 const EXE: usize = 128;
-const CMDLINE: usize = SLOT - 32 - COMM - EXE;
+const CMDLINE: usize = SLOT - 40 - COMM - EXE;
 
 #[repr(C)]
 struct Slot {
@@ -26,6 +26,9 @@ struct Slot {
     gid: u32,
     /// While its main thread is in a syscall, the tick (ms, | 1) it entered at; 0 in guest code.
     sys_ms: AtomicU32,
+    /// 1: it ignores SIGCHLD (or set SA_NOCLDWAIT), so its children leave no zombies.
+    nocldwait: AtomicU32,
+    _pad: u32,
     start_ms: u64, // GetTickCount64 at its start
     comm: [u8; COMM],
     exe: [u8; EXE],
@@ -36,8 +39,11 @@ const _: () = assert!(size_of::<Slot>() == SLOT);
 
 /// One process, as /proc shows it.
 pub struct Info {
-    /// State S: its main thread has been in one syscall for a while (blocked); else R.
-    pub sleeping: bool,
+    /// R running; S its main thread has been in one syscall for a while (blocked); Z exited, not yet
+    /// reaped by its parent.
+    pub state: char,
+    /// Its children are reaped as they exit (SIGCHLD ignored, SA_NOCLDWAIT).
+    pub nocldwait: bool,
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
@@ -147,6 +153,7 @@ pub fn fork_child() {
     let pid = crate::proc::getpid().unwrap_or(0) as u32;
     let Some(s) = claim(pid) else { return };
     s.sys_ms.store(0, Relaxed);
+    s.nocldwait.store(parent.nocldwait as u32, Relaxed); // dispositions survive fork
     OWN.store(s as *mut Slot, Relaxed);
     s.win.store(std::process::id(), SeqCst);
     s.ppid = parent.pid;
@@ -156,12 +163,36 @@ pub fn fork_child() {
     put(&mut s.cmdline, &parent.cmdline);
 }
 
-/// At exit: free our slot (an exec proxy's was taken over by its successor).
+/// At exit: our slot stays as a zombie for our parent to reap (wait4 frees it, see reap), as on Linux;
+/// with no parent in the container to do that, it's freed now. An exec proxy's slot was taken over by
+/// its successor.
 pub fn unregister() {
     let me = std::process::id();
     let mine = table().and_then(|mut t| t.find(|&p| unsafe { (*p).win.load(SeqCst) == me && (*p).pid.load(SeqCst) != 0 }));
     if let Some(p) = mine {
-        free(unsafe { &*p }, me);
+        let s = unsafe { &*p };
+        if get(s.ppid).is_none_or(|parent| parent.state == 'Z' || parent.nocldwait) {
+            free(s, me);
+        }
+    }
+}
+
+/// Our SIGCHLD disposition changed: whether our children are reaped at once (no zombies).
+pub fn set_nocldwait(on: bool) {
+    let p = OWN.load(Relaxed);
+    if !p.is_null() {
+        unsafe { (*p).nocldwait.store(on as u32, Relaxed) };
+    }
+}
+
+/// wait4 collected child `pid`: its zombie slot goes.
+pub fn reap(pid: u32) {
+    let Some(t) = table() else { return };
+    for p in t {
+        let s = unsafe { &*p };
+        if s.pid.load(SeqCst) == pid {
+            free(s, s.win.load(SeqCst));
+        }
     }
 }
 
@@ -174,24 +205,29 @@ fn info(s: &Slot) -> Info {
     // In one syscall for 16 ms or more (a tick or two): blocked there, as far as a reader can tell.
     let sys = s.sys_ms.load(Relaxed);
     let sleeping = sys != 0 && (unsafe { crate::win::GetTickCount64() } as u32).wrapping_sub(sys) >= 16;
-    Info { sleeping, pid: s.pid.load(SeqCst), ppid: s.ppid, uid: s.uid, gid: s.gid, start_ms: s.start_ms,
+    Info { state: if sleeping { 'S' } else { 'R' }, nocldwait: s.nocldwait.load(Relaxed) != 0, pid: s.pid.load(SeqCst), ppid: s.ppid, uid: s.uid, gid: s.gid, start_ms: s.start_ms,
            comm: text(&s.comm), exe: text(&s.exe), cmdline: s.cmdline[..end].to_vec() }
 }
 
-/// The container's live processes.
+/// The container's processes: the live ones, and the zombies of live parents.
 pub fn all() -> Vec<Info> {
     let Some(t) = table() else { return Vec::new() };
-    t.filter_map(|p| {
+    let slots: Vec<(*mut Slot, bool)> = t
+        .filter(|&p| unsafe { (*p).pid.load(SeqCst) != 0 && (*p).win.load(SeqCst) != 0 }) // else free, or being claimed or freed
+        .map(|p| (p, alive(unsafe { (*p).win.load(SeqCst) })))
+        .collect();
+    // A live parent that will reap: its exited children are zombies until then.
+    let reaper = |pid: u32| slots.iter().any(|&(p, a)| a && unsafe { (*p).pid.load(SeqCst) == pid && (*p).nocldwait.load(Relaxed) == 0 });
+    slots.iter().filter_map(|&(p, a)| {
         let s = unsafe { &*p };
-        let (pid, win) = (s.pid.load(SeqCst), s.win.load(SeqCst));
-        if pid == 0 || win == 0 {
-            return None; // free, or being claimed or freed
+        if a {
+            return Some(info(s));
         }
-        if !alive(win) {
-            free(s, win); // died without freeing it
-            return None;
+        if reaper(s.ppid) {
+            return Some(Info { state: 'Z', ..info(s) }); // exited (or was killed); its parent hasn't reaped it
         }
-        Some(info(s))
+        free(s, s.win.load(SeqCst)); // nobody left to reap it
+        None
     }).collect()
 }
 

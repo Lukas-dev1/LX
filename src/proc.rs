@@ -396,6 +396,7 @@ fn wait_child(sel: Which, blocking: bool, keep: bool) -> Result<Option<(u32, u32
         let pid = kids[i].pid;
         if !keep {
             kids.remove(i);
+            crate::ptable::reap(guest_pid(pid)); // its zombie leaves /proc
         }
         return Ok(Some((pid, code)));
     }
