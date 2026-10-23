@@ -5,7 +5,7 @@
 //! Windows: creating NTFS symlinks needs admin/Developer Mode, and resolving ourselves means `..` and
 //! absolute targets can't leave the rootfs.
 use crate::syscall::{R, cstr, guest_mut, read_handle, write_handle};
-use crate::syscall::{EROFS, EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ERANGE, ESPIPE, ENOTEMPTY, EACCES, EBUSY, EIO};
+use crate::syscall::{EROFS, EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ERANGE, ESPIPE, ENOTEMPTY, EACCES, EBUSY, EIO, ENAMETOOLONG};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -618,6 +618,7 @@ fn errno(e: io::Error) -> i64 {
         Some(267) => ENOTDIR,
         Some(17) => 18, // ERROR_NOT_SAME_DEVICE -> EXDEV: rename across a volume boundary
         Some(123 | 87) => EINVAL,
+        Some(206) => ENAMETOOLONG, // ERROR_FILENAME_EXCED_RANGE
         // ERROR_OPERATION_ABORTED: a signal's CancelSynchronousIo cut a blocking read/write short.
         // Callers retry EINTR (and the signal is delivered as the syscall returns).
         Some(995) => crate::syscall::EINTR,
@@ -903,6 +904,9 @@ impl Fs {
     pub fn resolve(&self, dir: &str, path: &str, follow: bool) -> Result<(String, PathBuf), i64> {
         if path.is_empty() {
             return Err(ENOENT);
+        }
+        if path.len() >= 4096 || path.split('/').any(|c| c.len() > 255) {
+            return Err(ENAMETOOLONG); // PATH_MAX, NAME_MAX
         }
         let mut todo = split(path);
         let mut comps: Vec<String> = if path.starts_with('/') { vec![] } else { split(dir).into() };
