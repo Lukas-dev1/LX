@@ -1021,6 +1021,11 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         37 => Ok(signal::set_alarm(a[0] * 1000, 0).0.div_ceil(1000) as i64), // alarm: the seconds left of the old one
         38 => setitimer(a[0], a[1], a[2]),
         36 => getitimer(a[0], a[1]),
+        222 => signal::timer_create(a[0], a[1], a[2]),
+        223 => signal::timer_settime(a[0], a[1], a[2], a[3]),
+        224 => signal::timer_gettime(a[0], a[1]),
+        225 => signal::timer_getoverrun(a[0]),
+        226 => signal::timer_delete(a[0]),
         90 => fs::chmeta_at(CWD, a[0], true, Some(a[1]), None),                     // chmod
         91 => fs::fchmeta(a[0], Some(a[1]), None),                                  // fchmod
         268 => fs::chmeta_at(a[0], a[1], true, Some(a[2]), None),                   // fchmodat (no flags)
@@ -1250,6 +1255,21 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
     }
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
     Ok(0)
+}
+
+/// Read `N` bytes of guest memory at `addr`, or EFAULT unless every page is committed and readable.
+pub fn get_guest<const N: usize>(addr: u64) -> Result<[u8; N], i64> {
+    let end = addr.checked_add(N as u64).ok_or(EFAULT)?;
+    let mut p = addr;
+    while p < end {
+        let mut m = MemoryBasicInformation::default();
+        if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0
+            || m.state != MEM_COMMIT || m.protect & 0x101 != 0 || m.protect & 0xff == 0x10 {
+            return Err(EFAULT); // PAGE_NOACCESS, PAGE_GUARD, execute-only
+        }
+        p = (m.base + m.region_size) as u64;
+    }
+    Ok(unsafe { std::ptr::read_unaligned(addr as *const [u8; N]) })
 }
 
 /// u64s as the guest's little-endian bytes, for put_guest.

@@ -592,6 +592,132 @@ pub fn set_alarm(value_ms: u64, interval_ms: u64) -> (u64, u64) {
     old
 }
 
+// ---- POSIX timers (timer_create & co.) ----
+//
+// Each armed timer is a thread sleeping until its expiry, like alarm's. SIGEV_SIGNAL goes to the process,
+// SIGEV_THREAD_ID (what glibc's and musl's SIGEV_THREAD use) to one thread, SIGEV_NONE only counts.
+// ponytail: the signal carries no si_value (no siginfo payload), and CPU-time clocks run as MONOTONIC.
+
+struct PosixTimer {
+    epoch: u64,
+    signo: u64,
+    notify: u32,
+    tid: u64,
+    clock: u64,
+    /// When it fires next, and its interval (zero: once).
+    next: Option<std::time::Instant>,
+    interval: std::time::Duration,
+    overrun: u32,
+}
+
+static PTIMERS: Mutex<Vec<Option<PosixTimer>>> = Mutex::new(Vec::new());
+
+/// timer_create(clock, sevp, timerid).
+pub fn timer_create(clock: u64, sevp: u64, out: u64) -> R {
+    if !matches!(clock, 0..=7 | 11) {
+        return Err(EINVAL);
+    }
+    let (signo, notify, tid) = if sevp == 0 {
+        (14, 0, 0) // NULL: SIGEV_SIGNAL with SIGALRM
+    } else {
+        let e = unsafe { std::slice::from_raw_parts(sevp as *const u8, 20) };
+        let word = |o: usize| u32::from_le_bytes(e[o..o + 4].try_into().unwrap());
+        (word(8) as u64, word(12), word(16) as u64)
+    };
+    match notify {
+        0 | 4 if signo == 0 || signo > 64 => return Err(EINVAL),
+        0 | 1 | 4 => {}
+        _ => return Err(EINVAL), // SIGEV_THREAD is libc's, made of SIGEV_THREAD_ID
+    }
+    let mut ts = PTIMERS.lock().unwrap();
+    let id = ts.iter().position(Option::is_none).unwrap_or_else(|| { ts.push(None); ts.len() - 1 });
+    ts[id] = Some(PosixTimer { epoch: 0, signo, notify, tid, clock, next: None, interval: Default::default(), overrun: 0 });
+    crate::syscall::put_guest(out, &(id as u32).to_le_bytes())?;
+    Ok(0)
+}
+
+fn itimerspec_out(t: &PosixTimer, out: u64) -> R {
+    let left = t.next.map_or(Default::default(), |at| at.saturating_duration_since(std::time::Instant::now()));
+    let v = [t.interval.as_secs(), t.interval.subsec_nanos() as u64, left.as_secs(), left.subsec_nanos() as u64];
+    crate::syscall::put_guest(out, &crate::syscall::as_bytes(&v))
+}
+
+/// timer_settime(id, flags, new, old).
+pub fn timer_settime(id: u64, flags: u64, new: u64, old: u64) -> R {
+    const TIMER_ABSTIME: u64 = 1;
+    let mut ts = PTIMERS.lock().unwrap();
+    let t = ts.get_mut(id as usize).and_then(Option::as_mut).ok_or(EINVAL)?;
+    if new == 0 {
+        return Err(EINVAL);
+    }
+    let raw = crate::syscall::get_guest::<32>(new)?;
+    let [is, ins, vs, vns]: [i64; 4] = std::array::from_fn(|i| i64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap()));
+    if [ins, vns].iter().any(|n| !(0..1_000_000_000).contains(n)) || is < 0 || vs < 0 {
+        return Err(EINVAL);
+    }
+    if old != 0 {
+        itimerspec_out(t, old)?;
+    }
+    let (interval, mut value) = (std::time::Duration::new(is as u64, ins as u32), std::time::Duration::new(vs as u64, vns as u32));
+    if flags & TIMER_ABSTIME != 0 && !value.is_zero() {
+        let (s, ns) = crate::syscall::now(t.clock);
+        value = value.saturating_sub(std::time::Duration::new(s, ns as u32)).max(std::time::Duration::from_nanos(1));
+    }
+    t.epoch += 1;
+    t.overrun = 0;
+    t.interval = interval;
+    t.next = (!value.is_zero()).then(|| std::time::Instant::now() + value);
+    let Some(first) = t.next else { return Ok(0) }; // disarmed
+    let epoch = t.epoch;
+    std::thread::spawn(move || {
+        let mut at = first;
+        loop {
+            std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+            let (signo, notify, tid) = {
+                let mut ts = PTIMERS.lock().unwrap();
+                let Some(t) = ts.get_mut(id as usize).and_then(Option::as_mut).filter(|t| t.epoch == epoch) else { return };
+                if t.interval.is_zero() {
+                    t.next = None;
+                } else {
+                    // Periods that went by while we weren't scheduled count as overruns.
+                    let late = std::time::Instant::now().saturating_duration_since(at);
+                    let missed = (late.as_nanos() / t.interval.as_nanos()) as u32;
+                    t.overrun = missed;
+                    at += t.interval * (missed + 1);
+                    t.next = Some(at);
+                }
+                (t.signo, t.notify, t.tid)
+            };
+            match notify {
+                0 => arrive(signo),
+                4 => { let _ = send_thread(tid, signo); }
+                _ => {}
+            }
+            if PTIMERS.lock().unwrap().get(id as usize).and_then(Option::as_ref).is_none_or(|t| t.epoch != epoch || t.next.is_none()) {
+                return;
+            }
+        }
+    });
+    Ok(0)
+}
+
+pub fn timer_gettime(id: u64, out: u64) -> R {
+    let ts = PTIMERS.lock().unwrap();
+    itimerspec_out(ts.get(id as usize).and_then(Option::as_ref).ok_or(EINVAL)?, out).map(|_| 0)
+}
+
+pub fn timer_getoverrun(id: u64) -> R {
+    let ts = PTIMERS.lock().unwrap();
+    Ok(ts.get(id as usize).and_then(Option::as_ref).ok_or(EINVAL)?.overrun as i64)
+}
+
+pub fn timer_delete(id: u64) -> R {
+    let mut ts = PTIMERS.lock().unwrap();
+    let slot = ts.get_mut(id as usize).filter(|t| t.is_some()).ok_or(EINVAL)?;
+    *slot = None; // its thread sees the slot gone and ends
+    Ok(0)
+}
+
 /// `TERM`, `SIGTERM`, `15` -> 15.
 pub fn parse(name: &str) -> Option<u64> {
     const NAMES: [&str; 31] = ["HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2",

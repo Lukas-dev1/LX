@@ -52,6 +52,7 @@ cc_static 2 rootfs/stacktest guest/stacktest.c
 cc_static 2 rootfs/sigfdtest guest/sigfdtest.c
 cc_static 2 rootfs/sigfutex guest/sigfutex.c
 cc_static 2 rootfs/restarttest guest/restarttest.c
+cc_static 2 rootfs/ptimer guest/ptimer.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
 cc_static 2 rootfs/shfutex guest/shfutex.c
 cc_static 2 rootfs/sysbench guest/sysbench.c
@@ -97,6 +98,7 @@ expect "crash -> SIGSEGV" 139 "guest fault"              -- rootfs /stress crash
 expect "signalfd in epoll, woken by a child's signal" 0 "OK" -- rootfs /sigfdtest
 expect "SIGTERM reaches threads parked in futexes (Go idle)" 0 "sigfutex OK" -- rootfs /sigfutex
 expect "SA_RESTART: an interrupted read continues" 0 "read=1" -- rootfs /restarttest
+expect "POSIX timers: a periodic timer_create timer keeps firing" 0 "ticks=3 armed=1" -- rootfs /ptimer
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
 expect "a shared futex wakes another process (FUTEX_WAKE counts it)" 0 "woke=1 child=0" -- rootfs /shfutex
 expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regress.sh
