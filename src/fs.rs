@@ -2913,12 +2913,28 @@ pub fn statx(dirfd: u64, path: u64, flags: u64, buf: u64) -> R {
 }
 
 
-pub fn faccessat(dirfd: u64, path: u64) -> R {
+/// access/faccessat: R_OK 4, W_OK 2, X_OK 1 against the file's mode and owner, as the caller.
+/// Root may read and write anything, and execute what has any x bit (or is a directory).
+/// ponytail: checked only where lx keeps a mode and owner (not volumes, whose files are the host's);
+/// supplementary groups and AT_EACCESS aren't considered.
+pub fn faccessat(dirfd: u64, path: u64, mode: u64) -> R {
+    if mode & !7 != 0 {
+        return Err(EINVAL);
+    }
     let (guest, host) = with(|fs| fs.at(dirfd, path, true))?;
     if Dev::of(&guest).is_some() || fd_alias(&guest).is_some() || proc_dir(&guest).is_some() || crate::procfs::file(&guest).is_some() {
         return Ok(0);
     }
-    fs::symlink_metadata(host).map(|_| 0).map_err(errno)
+    let m = fs::symlink_metadata(&host).map_err(errno)?;
+    let Some([perm, uid, gid]) = (mode != 0).then(|| get_meta(&host)).flatten() else { return Ok(0) };
+    let (me, my_gid) = (crate::proc::UID.load(std::sync::atomic::Ordering::Relaxed), crate::proc::GID.load(std::sync::atomic::Ordering::Relaxed));
+    let ok = if me == 0 {
+        mode & 1 == 0 || m.is_dir() || perm & 0o111 != 0
+    } else {
+        let bits = if me == uid { perm >> 6 } else if my_gid == gid { perm >> 3 } else { perm } & 7;
+        mode as u32 & !bits == 0
+    };
+    if ok { Ok(0) } else { Err(EACCES) }
 }
 
 /// The guest path of the running ELF, for /proc/self/exe (ld.so resolves $ORIGIN with it).
