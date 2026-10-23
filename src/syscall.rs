@@ -2290,3 +2290,33 @@ fn mmap_cow(addr: u64, len: u64, prot: u64, fixed: bool, fd: u64, off: u64, hole
     COW_VIEWS.lock().unwrap().push(CowView { base, len: flen, section, off, fsize: size, code: Vec::new(), written: prot & 2 != 0 });
     Some(base)
 }
+
+/// /proc/self/maps: the guest's allocations and views as NT sees them now, one line per run of pages
+/// with the same state and protection. ponytail: no file names, offsets or [heap]/[stack] labels.
+pub fn maps() -> String {
+    let mut ranges: Vec<(u64, u64, bool)> = ALLOCS.lock().unwrap().iter().map(|&(b, l)| (b, l, false)).collect();
+    ranges.extend(VIEWS.lock().unwrap().iter().map(|v| (v.base, v.len, true)));
+    ranges.extend(COW_VIEWS.lock().unwrap().iter().map(|v| (v.base, v.len, false)));
+    ranges.extend(SHM_AT.lock().unwrap().iter().map(|&(b, l)| (b, l, true)));
+    ranges.sort();
+    let (mut out, mut done) = (String::new(), 0u64);
+    for (base, len, shared) in ranges {
+        let mut p = base.max(done);
+        while p < base + len {
+            let mut m = MemoryBasicInformation::default();
+            if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 {
+                break;
+            }
+            let end = ((m.base + m.region_size) as u64).min(base + len);
+            if m.state != MEM_FREE {
+                let perms = match if m.state == MEM_COMMIT { m.protect & 0xff } else { 1 } {
+                    0x02 => "r--", 0x04 | 0x08 => "rw-", 0x10 => "--x", 0x20 => "r-x", 0x40 | 0x80 => "rwx", _ => "---",
+                };
+                out += &format!("{p:08x}-{end:08x} {perms}{} 00000000 00:00 0\n", if shared { 's' } else { 'p' });
+            }
+            p = end;
+        }
+        done = done.max(base + len);
+    }
+    out
+}
