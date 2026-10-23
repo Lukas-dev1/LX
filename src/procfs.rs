@@ -38,6 +38,9 @@ Pss: {:>16} kB
         "/proc/loadavg" => format!("0.00 0.00 0.00 1/1 {}\n", crate::proc::getpid().unwrap_or(0)),
         "/proc/version" => "Linux version 6.6.0-lx (lx) #1 SMP lx\n".into(),
         "/proc/sys/kernel/hostname" => "lx\n".into(),
+        "/proc/cmdline" => "BOOT_IMAGE=/boot/vmlinuz-6.6.0-lx root=/dev/sda1 ro quiet\n".into(),
+        "/proc/sys/kernel/tainted" => "0\n".into(), // nothing has tainted this kernel
+        "/proc/sys/fs/pipe-max-size" => "1048576\n".into(),
         "/proc/sys/kernel/osrelease" => "6.6.0-lx\n".into(),
         "/proc/sys/kernel/pid_max" => "4194304\n".into(),
         "/proc/sys/kernel/threads-max" => "1000000\n".into(),
