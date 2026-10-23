@@ -2360,9 +2360,11 @@ fn nt_name(addr: Option<u64>, h: isize) -> String {
 
 /// ftruncate shrinking a file this process has mapped: NT refuses while any view of it exists
 /// (ERROR_USER_MAPPED_FILE), Linux allows it. Copy-on-write views of the file become private copies,
-/// shared ones are unmapped, `set` truncates, and the shared views come back at their addresses,
-/// cut to the new end (the rest faults, where Linux raises SIGBUS).
-/// ponytail: other processes' views still refuse it (EIO), and re-mapped views lose their mprotect.
+/// shared ones are unmapped, `set` truncates, and the shared views come back at their addresses in a
+/// placeholder of their old length: cut to the new end, the rest held (it faults, where Linux raises
+/// SIGBUS) and grown into again if the file grows (grow_view).
+/// ponytail: other processes' views still refuse it (EIO); re-mapped views lose their mprotect; between
+/// the unmap and the placeholder the range is briefly free.
 pub fn truncate_mapped(h: isize, size: u64, set: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
     let file = nt_name(None, h);
     let me = unsafe { GetCurrentProcess() };
@@ -2402,28 +2404,44 @@ pub fn truncate_mapped(h: isize, size: u64, set: impl FnOnce() -> std::io::Resul
                 CloseHandle(v.file);
             }
         }
-        gone.push((v.base, v.len, v.off, v.access));
+        gone.push((v.base, v.len.max(v.full).next_multiple_of(PAGE), v.off, v.access));
         false
     });
     let r = set();
-    for (base, len, off, access) in gone {
-        let len = len.min(size.saturating_sub(off));
-        if len == 0 {
+    for (base, full, off, access) in gone {
+        // The whole old range stays ours, as a placeholder, before anything else can take it.
+        if unsafe { VirtualAlloc2(0, base as *mut _, full as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0) } as u64 != base {
             continue;
         }
+        let len = full.min(size.saturating_sub(off));
         let sprot = match (access & FILE_MAP_WRITE != 0, access & FILE_MAP_EXECUTE != 0) {
             (true, true) => 0x40,
             (true, false) => PAGE_READWRITE,
             (false, true) => 0x20,
             (false, false) => 0x02,
         };
-        let section = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) };
-        let got = unsafe { MapViewOfFileEx(section, access, (off >> 32) as u32, off as u32, len as usize, base as *mut _) } as u64;
-        if got == base {
-            views.push(View { base, len, section, off, access, full: len, file: 0, prot: (0, 0) });
-        } else if section != 0 {
-            unsafe { CloseHandle(section) };
+        let section = if len == 0 { 0 } else { unsafe { CreateFileMappingW(h, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) } };
+        let head = len.next_multiple_of(PAGE).min(full);
+        if head > 0 {
+            carve(base, head);
         }
+        let mapped = section != 0
+            && unsafe { MapViewOfFile3(section, me, base as *mut _, off, len as usize, MEM_REPLACE_PLACEHOLDER, sprot, std::ptr::null_mut(), 0) } as u64 == base;
+        if !mapped {
+            // Nothing of the file left there (or it wouldn't map): plain reserved memory that faults.
+            if section != 0 {
+                unsafe { CloseHandle(section) };
+            }
+            for (a, n) in [(base, head), (base + head, full - head)] {
+                if n > 0 {
+                    place_plain(a, n, false);
+                }
+            }
+            continue;
+        }
+        let mut file = 0isize;
+        unsafe { crate::win::DuplicateHandle(me, h, me, &mut file, 0, 0, 2) }; // DUPLICATE_SAME_ACCESS, for grow_view
+        views.push(View { base, len, section, off, access, full, file, prot: (sprot, sprot) });
     }
     r
 }
