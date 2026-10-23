@@ -113,11 +113,18 @@ fn simple(i: &Instruction) -> bool {
     i.flow_control() == FlowControl::Next && !i.is_invalid() && i.mnemonic() != Mnemonic::Syscall
 }
 
+/// A direct near jmp (not through a register or memory): the stub can carry it, re-encoded for its new
+/// place, as the last instruction it displaces.
+fn near_jmp(i: &Instruction) -> bool {
+    i.flow_control() == FlowControl::UnconditionalBranch && matches!(i.op0_kind(), OpKind::NearBranch64 | OpKind::NearBranch32 | OpKind::NearBranch16)
+}
+
 /// The instructions [j, m] to displace for the site at `k` (j <= k <= m), if a rewrite is safe: at least
 /// 5 bytes, all straight-line, and no known branch target at any boundary after the first (the first
 /// carries the jmp). Instructions before the site are taken first. Taking ones after it (forward) is
 /// only needed when a branch or a jump target sits right before the site, as with glibc's errno stores
-/// and its syscall wrappers.
+/// and its syscall wrappers. Forward, the last one may be a direct jmp (glibc's `mov rcx,fs:[r9]; jmp
+/// short`): nothing falls through it, so it ends the run, unless it jumps back inside what's displaced.
 fn displace(instrs: &[Instruction], k: usize, targets: &Targets) -> Option<(usize, usize)> {
     let mut bytes = instrs[k].len();
     let mut j = k;
@@ -128,7 +135,17 @@ fn displace(instrs: &[Instruction], k: usize, targets: &Targets) -> Option<(usiz
     let mut m = k;
     while bytes < 5 {
         m += 1;
-        if m >= instrs.len() || m - k > 4 || !simple(&instrs[m]) || targets.contains(&instrs[m].ip()) {
+        if m >= instrs.len() || m - k > 4 || targets.contains(&instrs[m].ip()) {
+            return None;
+        }
+        if near_jmp(&instrs[m]) {
+            let (start, end) = (instrs[j].ip(), instrs[m].ip() + instrs[m].len() as u64);
+            let to = instrs[m].near_branch_target();
+            bytes += instrs[m].len();
+            // Into the displaced bytes (but their start, now the jmp to the stub) it would land mid-site.
+            return (bytes >= 5 && !(start < to && to < end)).then_some((j, m));
+        }
+        if !simple(&instrs[m]) {
             return None;
         }
         bytes += instrs[m].len();
@@ -433,6 +450,24 @@ fn rex_before_a_prefix_is_a_misdecode() {
     assert!(!misdecoded(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0, 0, 0])); // mov rax,fs:[0x28]
     assert!(!misdecoded(&[0xf3, 0x48, 0x0f, 0xb8, 0xc0])); // popcnt rax,rax: prefix, then REX
     assert!(!misdecoded(&[0x0f, 0x05]));
+}
+
+#[test]
+fn a_trailing_jmp_is_displaced_too() {
+    use iced_x86::{Decoder, DecoderOptions};
+    // test al,al ; je +6 (past the jmp) ; mov rcx,fs:[r9] ; jmp short +0x10 ; nops
+    let mut code = vec![0x84, 0xc0, 0x74, 0x06, 0x64, 0x49, 0x8b, 0x09, 0xeb, 0x10];
+    code.extend([0x90; 32]);
+    let instrs: Vec<Instruction> = Decoder::with_ip(64, &code, 0x1000, DecoderOptions::NONE).into_iter().collect();
+    let targets = branch_targets(instrs.iter().copied(), 0x1000, 0x1000 + code.len() as u64);
+    assert!(is_fs_access(&instrs[2]));
+    assert_eq!(displace(&instrs, 2, &targets), Some((2, 3))); // the 4-byte fs load and the 2-byte jmp
+    // A jmp back into what would be displaced can't go along.
+    let mut back = code.clone();
+    back[9] = 0xfb; // jmp short -5: to 0x1005, inside the fs load
+    let instrs: Vec<Instruction> = Decoder::with_ip(64, &back, 0x1000, DecoderOptions::NONE).into_iter().collect();
+    let targets = branch_targets(instrs.iter().copied(), 0x1000, 0x1000 + back.len() as u64);
+    assert_eq!(displace(&instrs, 2, &targets), None);
 }
 
 #[test]
