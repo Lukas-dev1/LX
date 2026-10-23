@@ -579,7 +579,7 @@ pub fn restore<'a>(f: &'a [String], parent: isize) -> Result<((u64, u64), &'a [S
             return Err(format!("shared mapping {base:#x}+{len:#x} can't be placed in the child ({})", unsafe { GetLastError() }));
         }
         unsafe { SetHandleInformation(section, 1, 0) };
-        VIEWS.lock().unwrap().push(View { base, len, section, off, access });
+        VIEWS.lock().unwrap().push(View { base, len, section, off, access, full: len, file: 0, prot: (0, 0) });
     }
     let used = f.len() - it.len();
     Ok((stack, &f[used..]))
@@ -874,6 +874,7 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
             (c.rax, c.rcx, c.r11, c.rip) = (ret as u64, next, c.eflags as u64, next); // kernel ABI: rcx=rip, r11=rflags
             resume_with_signals(c)
         }
+        STATUS_ACCESS_VIOLATION if grow_view(rec.info[1] as u64, rec.info[0] == 1) => resume(c, c.rip),
         STATUS_ACCESS_VIOLATION if ts().fs != 0 && lost_fs_base(c, rec.info[1] as u64, end) => {
             FS_FAULTS.fetch_add(1, Relaxed);
             if patchlog() { dlog(format_args!("FS-base fault at rip {:#x} rsp {:#x}", c.rip, c.rsp)); }
@@ -1382,6 +1383,10 @@ fn set_view_code(base: u64, ranges: Vec<(u64, u64)>) {
 // address instead (`snapshot` / `restore`). Views must start on NT's 64K granularity, so an offset that
 // isn't 64K-aligned maps from the aligned offset below it and returns a pointer into the view.
 // ponytail: munmap of part of a view unmaps all of it; mremap of a view makes a private copy.
+//
+// A file mapping longer than the file (bbolt maps ahead, then writes the file longer) can't be one
+// view: NT views end at the file's end. The rest stays a placeholder (`full`), and a fault there after
+// the file grew maps a longer view into it (`grow_view`). ponytail: a forked child's copy doesn't grow.
 
 struct View {
     base: u64,
@@ -1389,6 +1394,11 @@ struct View {
     section: isize,
     off: u64,
     access: u32,
+    /// Address space held for the view, past `len` as a placeholder (== len when it can't grow).
+    full: u64,
+    /// For growing: the file (a duplicate handle, 0 if none) and the section and view protections.
+    file: isize,
+    prot: (u32, u32),
 }
 static VIEWS: Mutex<Vec<View>> = Mutex::new(Vec::new());
 
@@ -1401,6 +1411,7 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
     let delta = off % 0x10000;
     let aoff = off - delta;
     let mut vlen = delta + len;
+    let mut sprot = PAGE_READWRITE;
     let section = match file {
         None => unsafe { CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null()) },
         Some(fd) => {
@@ -1412,10 +1423,12 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
             vlen = vlen.min(size - aoff);
             let exec = prot & 4 != 0;
             let rw = if exec { 0x40 } else { PAGE_READWRITE }; // PAGE_EXECUTE_READWRITE
+            sprot = rw;
             let mut s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), rw, 0, 0, std::ptr::null()) };
             if s == 0 && !write {
                 // A file opened read-only can still be mapped for reading.
-                s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), if exec { 0x20 } else { 0x02 }, 0, 0, std::ptr::null()) };
+                sprot = if exec { 0x20 } else { 0x02 };
+                s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) };
             }
             if s == 0 {
                 return Err(EACCES);
@@ -1427,6 +1440,10 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
         return Err(ENOMEM);
     }
     let access = if write { FILE_MAP_WRITE } else { FILE_MAP_READ } | if prot & 4 != 0 { FILE_MAP_EXECUTE } else { 0 };
+    let full = (delta + len).next_multiple_of(PAGE);
+    if let Some(fd) = file.filter(|_| !fixed && full > vlen.next_multiple_of(PAGE)) {
+        return mmap_growable(section, sprot, access, fd, aoff, vlen, full, prot).map(|base| (base + delta) as i64);
+    }
     let view_at = |base: u64| unsafe { MapViewOfFileEx(section, access, (aoff >> 32) as u32, aoff as u32, vlen as usize, base as *mut _) } as u64;
     let base = if fixed {
         if delta != 0 {
@@ -1470,8 +1487,91 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
         let mut old = 0;
         unsafe { VirtualProtect(base as *mut _, vlen as usize, 0x01, &mut old) }; // PROT_NONE
     }
-    VIEWS.lock().unwrap().push(View { base, len: vlen, section, off: aoff, access });
+    VIEWS.lock().unwrap().push(View { base, len: vlen, section, off: aoff, access, full: vlen, file: 0, prot: (0, 0) });
     Ok((base + delta) as i64)
+}
+
+/// A shared file mapping of `full` bytes whose file holds only `vlen` of them from `off`: the view in
+/// a placeholder of the whole length, the rest left a placeholder for `grow_view`.
+fn mmap_growable(section: isize, sprot: u32, access: u32, fd: u64, off: u64, vlen: u64, full: u64, prot: u64) -> Result<u64, i64> {
+    let vprot = match (access & FILE_MAP_WRITE != 0, prot & 4 != 0) {
+        (true, true) => 0x40,
+        (true, false) => PAGE_READWRITE,
+        (false, true) => 0x20,
+        (false, false) => 0x02,
+    };
+    let fail = |e| {
+        unsafe { CloseHandle(section) };
+        Err(e)
+    };
+    let base = loop {
+        let a = NEXT.fetch_add(full.next_multiple_of(0x10000), Relaxed);
+        if a + full > WINDOW.1 {
+            return fail(ENOMEM);
+        }
+        if unsafe { VirtualAlloc2(0, a as *mut _, full as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0) } as u64 == a {
+            break a;
+        }
+    };
+    carve(base, vlen.next_multiple_of(PAGE));
+    let me = unsafe { GetCurrentProcess() };
+    if unsafe { MapViewOfFile3(section, me, base as *mut _, off, vlen as usize, MEM_REPLACE_PLACEHOLDER, vprot, std::ptr::null_mut(), 0) } as u64 != base {
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        return fail(ENOMEM);
+    }
+    if prot == 0 {
+        let mut old = 0;
+        unsafe { VirtualProtect(base as *mut _, vlen as usize, 0x01, &mut old) }; // PROT_NONE
+    }
+    let (h, _) = fs::file_handle(fd)?;
+    let mut file = 0isize;
+    unsafe { crate::win::DuplicateHandle(me, h, me, &mut file, 0, 0, 2) }; // DUPLICATE_SAME_ACCESS
+    VIEWS.lock().unwrap().push(View { base, len: vlen, section, off, access, full, file, prot: (sprot, vprot) });
+    Ok(base)
+}
+
+/// A fault at `addr` past the end of a growable view: if its file has grown since, map the longer view
+/// (in the same placeholder, so the address range stays ours) and have the guest retry. Also true when
+/// another thread just did that and the page is there now.
+fn grow_view(addr: u64, write: bool) -> bool {
+    let mut views = VIEWS.lock().unwrap();
+    let Some(v) = views.iter_mut().find(|v| v.full > v.len && (v.base..v.base + v.full).contains(&addr)) else {
+        return false;
+    };
+    if addr < v.base + v.len.next_multiple_of(PAGE) {
+        // Mapped already: retry if it allows this access (it was being re-mapped), else a real fault.
+        let mut m = MemoryBasicInformation::default();
+        unsafe { VirtualQuery(addr as *const _, &mut m, size_of::<MemoryBasicInformation>()) };
+        return m.state == 0x1000 && if write { matches!(m.protect, 0x04 | 0x40) } else { m.protect & 0xfe != 0 };
+    }
+    let file = std::mem::ManuallyDrop::new(unsafe { <std::fs::File as std::os::windows::io::FromRawHandle>::from_raw_handle(v.file as _) });
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let new = size.saturating_sub(v.off).min(v.full);
+    if v.base + new <= addr {
+        return false; // still past the end: Linux would raise SIGBUS
+    }
+    let section = unsafe { CreateFileMappingW(v.file, std::ptr::null_mut(), v.prot.0, 0, 0, std::ptr::null()) };
+    if section == 0 {
+        return false;
+    }
+    let me = unsafe { GetCurrentProcess() };
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+    let ok = unsafe {
+        UnmapViewOfFile2(me, v.base as *mut _, MEM_PRESERVE_PLACEHOLDER);
+        VirtualFree(v.base as *mut _, v.full as usize, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+        carve(v.base, new.next_multiple_of(PAGE));
+        MapViewOfFile3(section, me, v.base as *mut _, v.off, new as usize, MEM_REPLACE_PLACEHOLDER, v.prot.1, std::ptr::null_mut(), 0) as u64 == v.base
+    };
+    if debug() {
+        dlog(format_args!("shared view {:#x}: grown {:#x} -> {new:#x} for {addr:#x}: {ok}", v.base, v.len));
+    }
+    if !ok {
+        unsafe { CloseHandle(section) };
+        return false;
+    }
+    unsafe { CloseHandle(v.section) };
+    (v.section, v.len) = (section, new);
+    true
 }
 
 /// Unmap every shared view overlapping [addr, addr+len). Returns whether there was one.
@@ -1479,10 +1579,14 @@ fn unmap_views(addr: u64, len: u64) -> bool {
     let mut views = VIEWS.lock().unwrap();
     let before = views.len();
     views.retain(|v| {
-        if v.base < addr + len && addr < v.base + v.len {
+        if v.base < addr + len && addr < v.base + v.full {
             unsafe {
                 UnmapViewOfFile(v.base as *mut _);
                 CloseHandle(v.section);
+                if v.full > v.len {
+                    VirtualFree((v.base + v.len.next_multiple_of(PAGE)) as *mut _, 0, MEM_RELEASE); // the placeholder
+                    CloseHandle(v.file);
+                }
             }
             false
         } else {
