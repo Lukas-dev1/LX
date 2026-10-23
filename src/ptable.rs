@@ -7,7 +7,7 @@
 //! a process killed between claiming a slot and storing its Windows pid leaks that slot.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering::{Relaxed, SeqCst}};
 
 const SLOTS: usize = 1024;
 const SLOT: usize = 512;
@@ -24,7 +24,8 @@ struct Slot {
     ppid: u32,
     uid: u32,
     gid: u32,
-    _pad: u32,
+    /// While its main thread is in a syscall, the tick (ms, | 1) it entered at; 0 in guest code.
+    sys_ms: AtomicU32,
     start_ms: u64, // GetTickCount64 at its start
     comm: [u8; COMM],
     exe: [u8; EXE],
@@ -35,6 +36,8 @@ const _: () = assert!(size_of::<Slot>() == SLOT);
 
 /// One process, as /proc shows it.
 pub struct Info {
+    /// State S: its main thread has been in one syscall for a while (blocked); else R.
+    pub sleeping: bool,
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
@@ -107,10 +110,25 @@ fn free(s: &Slot, win: u32) {
     }
 }
 
+/// This process's slot, for syscall_state.
+static OWN: AtomicPtr<Slot> = AtomicPtr::new(std::ptr::null_mut());
+
+/// The main thread enters (true) or leaves (false) a syscall: what /proc/<pid>/stat's state is made of
+/// (LTP waits for a child to show S before it signals it, so S must mean blocked, not just in lx).
+pub fn syscall_state(entering: bool) {
+    let p = OWN.load(Relaxed);
+    if !p.is_null() {
+        let v = if entering { (unsafe { crate::win::GetTickCount64() } as u32) | 1 } else { 0 };
+        unsafe { (*p).sys_ms.store(v, Relaxed) };
+    }
+}
+
 /// This process starts a program (run, exec): record it.
 pub fn register(exe: &str, argv: &[String]) {
     let pid = crate::proc::getpid().unwrap_or(0) as u32;
     let Some(s) = claim(pid) else { return };
+    s.sys_ms.store(0, Relaxed);
+    OWN.store(s as *mut Slot, Relaxed);
     s.win.store(std::process::id(), SeqCst);
     s.ppid = crate::proc::getppid().unwrap_or(0) as u32;
     s.uid = crate::proc::UID.load(SeqCst);
@@ -128,6 +146,8 @@ pub fn fork_child() {
     let Some(parent) = get(crate::proc::getppid().unwrap_or(0) as u32) else { return };
     let pid = crate::proc::getpid().unwrap_or(0) as u32;
     let Some(s) = claim(pid) else { return };
+    s.sys_ms.store(0, Relaxed);
+    OWN.store(s as *mut Slot, Relaxed);
     s.win.store(std::process::id(), SeqCst);
     s.ppid = parent.pid;
     (s.uid, s.gid) = (crate::proc::UID.load(SeqCst), crate::proc::GID.load(SeqCst));
@@ -151,7 +171,10 @@ fn text(b: &[u8]) -> String {
 
 fn info(s: &Slot) -> Info {
     let end = s.cmdline.windows(2).position(|w| w == [0, 0]).map_or(s.cmdline.len(), |i| i + 1);
-    Info { pid: s.pid.load(SeqCst), ppid: s.ppid, uid: s.uid, gid: s.gid, start_ms: s.start_ms,
+    // In one syscall for 16 ms or more (a tick or two): blocked there, as far as a reader can tell.
+    let sys = s.sys_ms.load(Relaxed);
+    let sleeping = sys != 0 && (unsafe { crate::win::GetTickCount64() } as u32).wrapping_sub(sys) >= 16;
+    Info { sleeping, pid: s.pid.load(SeqCst), ppid: s.ppid, uid: s.uid, gid: s.gid, start_ms: s.start_ms,
            comm: text(&s.comm), exe: text(&s.exe), cmdline: s.cmdline[..end].to_vec() }
 }
 

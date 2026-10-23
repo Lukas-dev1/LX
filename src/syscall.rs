@@ -1000,10 +1000,17 @@ fn dispatch(c: &mut Context) -> i64 {
     for (slot, v) in IN_SYSCALL.iter().zip([c.rax + 1, a[0], a[1], a[2]]) {
         slot.store(v, Relaxed);
     }
+    let main = unsafe { GetCurrentThreadId() } == crate::thread::MAIN_TID.load(Relaxed);
+    if main {
+        crate::ptable::syscall_state(true);
+    }
     let r = match crate::seccomp::check(c.rax, &a, c.rip) {
         Some(r) => r.unwrap_or_else(|e| -e),
         None => dispatch_nr(c, a),
     };
+    if main {
+        crate::ptable::syscall_state(false);
+    }
     IN_SYSCALL[0].store(0, Relaxed);
     r
 }
