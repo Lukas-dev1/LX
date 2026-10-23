@@ -1566,6 +1566,15 @@ pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
             s.set_nonblocking(unsafe { *(arg as *const i32) } != 0);
             Ok(0)
         }
+        // Python's os.set_blocking uses FIONBIO, not F_SETFL: pipes and eventfds take it the same way.
+        (FIONBIO, Io::Pipe(p)) => {
+            p.nonblock.store(unsafe { *(arg as *const i32) } != 0, std::sync::atomic::Ordering::Relaxed);
+            Ok(0)
+        }
+        (FIONBIO, Io::Event(e)) => {
+            e.nonblock.store(unsafe { *(arg as *const i32) } != 0, std::sync::atomic::Ordering::Relaxed);
+            Ok(0)
+        }
         (FIONBIO, _) => Ok(0),
         (FIONREAD, Io::Sock(s)) => {
             unsafe { *(arg as *mut i32) = s.available() as i32 };
@@ -2823,9 +2832,14 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             Fd::Pipe(p) => { p.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
             _ => Ok(0),
         }),
+        // F_GETFL: the access mode (and O_APPEND) a file or pipe end was opened with, plus O_NONBLOCK.
         3 => with(|fs| match fs.fd(fd)? {
-            Fd::Socket(s) if s.nonblocking() => Ok(2 | O_NONBLOCK as i64),
-            Fd::Pipe(p) if p.nonblocking() => Ok(2 | O_NONBLOCK as i64),
+            Fd::Socket(s) => Ok(2 | if s.nonblocking() { O_NONBLOCK as i64 } else { 0 }),
+            Fd::Pipe(p) if p.pty.is_some() => Ok(2 | if p.nonblocking() { O_NONBLOCK as i64 } else { 0 }),
+            Fd::Pipe(p) => Ok(access_flags(p.raw()) | if p.nonblocking() { O_NONBLOCK as i64 } else { 0 }),
+            Fd::File { f, .. } => Ok(access_flags(f.as_raw_handle() as isize)),
+            Fd::Handle(h) => Ok(access_flags(h.as_raw_handle() as isize)),
+            Fd::Dir { .. } => Ok(0o200000), // O_RDONLY | O_DIRECTORY
             _ => Ok(2), // O_RDWR
         }),
         _ => Err(EINVAL),
@@ -3474,15 +3488,30 @@ pub fn fallocate(fd: u64, mode: u64, off: u64, len: u64) -> R {
 
 /// Whether an open file allows writing (FILE_WRITE_DATA or, for O_APPEND, FILE_APPEND_DATA).
 fn writable_handle(f: &File) -> bool {
-    #[repr(C)]
-    struct AccessInfo { granted: u32 }
+    // FILE_WRITE_DATA or FILE_APPEND_DATA (O_APPEND); unknown: let the write decide
+    granted_access(f.as_raw_handle() as isize).is_none_or(|g| g & 0x6 != 0)
+}
+
+/// The access a handle was opened with (FileAccessInformation), if NT says.
+fn granted_access(h: isize) -> Option<u32> {
     unsafe extern "system" {
-        fn NtQueryInformationFile(h: isize, iosb: *mut [usize; 2], info: *mut AccessInfo, len: u32, class: u32) -> i32;
+        fn NtQueryInformationFile(h: isize, iosb: *mut [usize; 2], info: *mut u32, len: u32, class: u32) -> i32;
     }
-    let (mut iosb, mut info) = ([0usize; 2], AccessInfo { granted: 0 });
-    // FileAccessInformation (8)
-    let st = unsafe { NtQueryInformationFile(f.as_raw_handle() as isize, &mut iosb, &mut info, 4, 8) };
-    st != 0 || info.granted & 0x6 != 0 // FILE_WRITE_DATA or FILE_APPEND_DATA (O_APPEND); unknown: let the write decide
+    let (mut iosb, mut granted) = ([0usize; 2], 0u32);
+    (unsafe { NtQueryInformationFile(h, &mut iosb, &mut granted, 4, 8) } == 0).then_some(granted)
+}
+
+/// F_GETFL's access mode and O_APPEND, from what the handle may do: FILE_READ_DATA 1, FILE_WRITE_DATA 2,
+/// FILE_APPEND_DATA 4 (std's append(true) asks for that without FILE_WRITE_DATA).
+fn access_flags(h: isize) -> i64 {
+    let Some(g) = granted_access(h) else { return 2 }; // O_RDWR if NT won't say
+    let (read, write, append) = (g & 1 != 0, g & 2 != 0, g & 4 != 0 && g & 2 == 0);
+    let mode = match (read, write || append) {
+        (true, true) => 2,  // O_RDWR
+        (false, true) => 1, // O_WRONLY
+        _ => 0,             // O_RDONLY
+    };
+    mode | if append { O_APPEND as i64 } else { 0 }
 }
 
 /// posix_fadvise: only advice, but its arguments are checked as Linux does.
