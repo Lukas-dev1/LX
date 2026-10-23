@@ -2914,8 +2914,9 @@ fn stat_of_attrs(host: &Path, m: Attrs) -> Result<[u64; 18], i64> {
     for i in [9, 11, 13] {
         (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
     }
-    if link.is_none() {
-        with_meta(&mut s, host);
+    with_meta(&mut s, host);
+    if link.is_some() {
+        s[3] = (s[3] & !0o7777) | 0o777; // a symlink's own owner (lchown) counts; its mode is always 0777
     }
     Ok(s)
 }
