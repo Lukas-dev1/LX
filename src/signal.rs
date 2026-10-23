@@ -165,7 +165,75 @@ pub fn send_thread(tid: u64, sig: u64) -> R {
     if wtid == main {
         unsafe { crate::win::SetEvent(INTR.load(SeqCst)) }; // the main thread's sleeps and waits use it
     }
+    // A thread spinning in guest code makes no syscall to take it at: stop it there.
+    let handled = S.lock().unwrap().actions[sig as usize].handler > 1;
+    if handled && t.sigmask & bit(sig) == 0 && wtid != unsafe { crate::win::GetCurrentThreadId() } {
+        let h = if wtid == main { GUEST_THREAD.load(SeqCst) } else { crate::thread::handle_of(wtid) };
+        kick(h, t);
+    }
     Ok(0)
+}
+
+/// Make a thread that is running guest code take its pending signal now, as Linux interrupts a running
+/// thread. It's suspended, and if it's in guest code (not in lx or a Windows DLL, where it takes the
+/// signal as its syscall returns or its wait wakes) it is sent to lx_kick_entry: in by the direct syscall
+/// path, which moves to the thread's lx stack before touching memory, saves every register and the vector
+/// state, delivers, and returns where it was. Nothing is written below the guest's rsp but the signal
+/// frame (Go's goroutine stacks are a few KB, packed together). Spinning loops (`while (!flag)`), Go's
+/// preemption and GC suspension signals need it.
+#[repr(C, align(16))]
+struct Ctx([u8; 1232]); // CONTEXT: ContextFlags 0x30, Rcx 0x80, R11 0xd0, Rip 0xf8
+
+fn kick(h: isize, t: &crate::syscall::ThreadState) {
+    if h == 0 || t.kicked.load(SeqCst) {
+        return; // not a guest thread, or a kick on its way already
+    }
+    let q = |c: &Ctx, o: usize| u64::from_le_bytes(c.0[o..o + 8].try_into().unwrap());
+    // Inside a stub the thread leaves it within a few instructions: let it run a moment, then look again.
+    for _ in 0..20 {
+        let mut c = Ctx([0; 1232]);
+        c.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes()); // CONTEXT_AMD64 | CONTROL | INTEGER
+        if !unsafe { kick_once(h, t, &mut c, q) } {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// One try of kick: false when done (kicked, or nothing to do), true to try again (it was in a stub).
+unsafe fn kick_once(h: isize, t: &crate::syscall::ThreadState, c: &mut Ctx, q: impl Fn(&Ctx, usize) -> u64) -> bool {
+    unsafe extern "system" {
+        fn SuspendThread(h: isize) -> u32;
+        fn GetThreadContext(h: isize, c: *mut u8) -> i32;
+        fn SetThreadContext(h: isize, c: *const u8) -> i32;
+    }
+    let mut again = false;
+    unsafe {
+        if SuspendThread(h) == u32::MAX {
+            return false;
+        }
+        if GetThreadContext(h, c.0.as_mut_ptr()) != 0 {
+            let rip = q(c, 0xf8);
+            let mut m = crate::win::MemoryBasicInformation::default();
+            crate::win::VirtualQuery(rip as *const _, &mut m, std::mem::size_of::<crate::win::MemoryBasicInformation>());
+            const MEM_IMAGE: u32 = 0x100_0000;
+            let guest = m.state == 0x1000 && m.ty != MEM_IMAGE && !t.on_host();
+            again = guest && crate::jump::in_stub(rip);
+            if guest && !again {
+                for (i, o) in [0xf8, 0x80, 0xd0].into_iter().enumerate() {
+                    t.kick[i].store(q(c, o), SeqCst);
+                }
+                t.kicked.store(true, SeqCst);
+                c.0[0xf8..0x100].copy_from_slice(&crate::syscall::kick_entry_addr().to_le_bytes());
+                c.0[0x30..0x34].copy_from_slice(&0x0010_0001u32.to_le_bytes()); // set only CONTROL
+                if SetThreadContext(h, c.0.as_ptr()) == 0 {
+                    t.kicked.store(false, SeqCst);
+                }
+            }
+        }
+        crate::win::ResumeThread(h);
+    }
+    again
 }
 
 // ---- signalfd ----
@@ -225,8 +293,7 @@ impl SignalFd {
 //
 // Each lx process owns a mailbox: shared memory `Local\lx-sig-<pid>` holding a pending bitmask, plus
 // the event `Local\lx-sigev-<pid>`. Senders OR their bit in and set the event. A watcher thread turns
-// arrivals into raise() + wake(). ponytail: a handler can't run while the guest spins without making
-// syscalls; that needs thread hijack (SuspendThread/SetThreadContext). Default "terminate" still works.
+// arrivals into raise() + wake(), and kick() stops a thread that is spinning in guest code for it.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicIsize, Ordering::SeqCst};
 
@@ -434,6 +501,11 @@ fn arrive(sig: u64) {
     }
     crate::syscall::wake_futex_waiters();
     cancel_io();
+    if S.lock().unwrap().actions[sig as usize].handler > 1 && MAIN_MASK.load(Relaxed) & bit(sig) == 0 {
+        if let Some(t) = crate::syscall::ts_of(crate::thread::MAIN_TID.load(Relaxed)) {
+            kick(GUEST_THREAD.load(SeqCst), t); // in case it's spinning in guest code
+        }
+    }
 }
 
 /// Break a blocking wait for a signal raised from another thread of ours, if the guest has a handler for

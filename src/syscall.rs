@@ -85,12 +85,17 @@ pub struct ThreadState {
     xsave: Xsave,
     /// Inside lx_direct: the guest's FP state is in `xsave`, not in an exception CONTEXT.
     in_direct: bool,
+    /// signal::kick sent this thread from guest code into lx_kick_entry for a pending signal: where it
+    /// was, and the rcx and r11 that lx_sys_entry treats as clobbered. Written while it's suspended.
+    pub kick: [std::sync::atomic::AtomicU64; 3],
+    pub kicked: std::sync::atomic::AtomicBool,
 }
 
 const TS_RESUME: usize = std::mem::offset_of!(ThreadState, resume);
 const TS_FRAME_LEN: usize = std::mem::offset_of!(ThreadState, frame_len);
 const TS_FRAME: usize = std::mem::offset_of!(ThreadState, frame);
 const TS_GUEST_RSP: usize = std::mem::offset_of!(ThreadState, guest_rsp);
+const TS_KICK_RIP: usize = std::mem::offset_of!(ThreadState, kick);
 const TS_HOST_STACK: usize = std::mem::offset_of!(ThreadState, host_stack);
 const TS_XSAVE: usize = std::mem::offset_of!(ThreadState, xsave);
 
@@ -115,6 +120,13 @@ pub fn tls_slot_offsets() -> (u32, u32) {
 /// Every guest thread's ThreadState by Windows tid, for signals sent to one thread (they're leaked, so
 /// the pointers stay valid; an exiting thread takes itself out).
 static THREAD_TS: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+
+impl ThreadState {
+    /// In lx's own code (a syscall, an exception): not to be interrupted by signal::kick.
+    pub fn on_host(&self) -> bool {
+        unsafe { std::ptr::read_volatile(&self.on_host) }
+    }
+}
 
 pub fn ts_of(tid: u32) -> Option<&'static ThreadState> {
     THREAD_TS.lock().unwrap().iter().find(|e| e.0 == tid).map(|e| unsafe { &*(e.1 as *const ThreadState) })
@@ -151,6 +163,7 @@ pub fn ts() -> &'static mut ThreadState {
         frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None, restart: 0,
         tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
         on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]), in_direct: false,
+        kick: Default::default(), kicked: Default::default(),
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
     THREAD_TS.lock().unwrap().push((unsafe { GetCurrentThreadId() }, st as *const ThreadState as usize));
@@ -225,9 +238,18 @@ std::arch::global_asm!(
 // lx_direct, and the way back is an iretq frame on the lx stack too.
 std::arch::global_asm!(
     ".globl lx_sys_entry",
+    // signal::kick's way in: like a syscall from where the thread was (r11 = that rip), only movs before
+    // the pushfq so its flags stay as they were; lx_direct restores the rcx and r11 that kick saved.
+    ".globl lx_kick_entry",
+    "lx_kick_entry:",
+    "mov rcx, qword ptr [rip + LX_TLS_OFF]",
+    "mov rcx, qword ptr gs:[rcx]",
+    "mov r11, qword ptr [rcx + {kick_rip}]",
+    "jmp 2f",
     "lx_sys_entry:",
     "mov rcx, qword ptr [rip + LX_TLS_OFF]",
     "mov rcx, qword ptr gs:[rcx]",        // ThreadState*
+    "2:",
     "mov qword ptr [rcx + {guest_rsp}], rsp",
     "mov rsp, qword ptr [rcx + {host_stack}]",
     "pushfq",                             // DirectFrame.flags (offset 0x108)
@@ -300,11 +322,17 @@ std::arch::global_asm!(
     guest_rsp = const TS_GUEST_RSP,
     host_stack = const TS_HOST_STACK,
     xsave = const TS_XSAVE,
+    kick_rip = const TS_KICK_RIP,
 );
 unsafe extern "C" {
     fn lx_fs_tramp();
     fn lx_resume(regs: *const [u64; 18]) -> !;
     fn lx_sys_entry();
+    fn lx_kick_entry();
+}
+
+pub fn kick_entry_addr() -> u64 {
+    lx_kick_entry as *const () as u64
 }
 
 /// lx_sys_entry's frame: a Context (so dispatch and signals work unchanged) plus the 64-bit rflags.
@@ -349,7 +377,11 @@ unsafe extern "system" fn lx_direct(f: *mut DirectFrame) {
         std::arch::asm!("mov {b}, qword ptr gs:[0x08]", "mov {l}, qword ptr gs:[0x10]", b = out(reg) base, l = out(reg) limit);
         std::arch::asm!("mov qword ptr gs:[0x08], {b}", "mov qword ptr gs:[0x10], {l}", b = in(reg) top, l = in(reg) top - HOST_STACK as u64);
     }
-    if c.rax == 15 {
+    if t.kicked.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        // Not a syscall: signal::kick stopped the thread in guest code. Every register is as it was.
+        c.rcx = t.kick[1].load(std::sync::atomic::Ordering::SeqCst);
+        c.r11 = t.kick[2].load(std::sync::atomic::Ordering::SeqCst);
+    } else if c.rax == 15 {
         signal::sigreturn(c); // rt_sigreturn: everything comes from the ucontext
     } else {
         let next = c.rip;
