@@ -3229,8 +3229,8 @@ pub fn fallocate(fd: u64, mode: u64, off: u64, len: u64) -> R {
         return Err(27); // EFBIG: past the largest file size
     }
     with(|fs| {
-        let f = match fs.fd(fd)? {
-            Fd::File { f, .. } => f,
+        let (f, host) = match fs.fd(fd)? {
+            Fd::File { f, host } => (f, host),
             Fd::Pipe(_) | Fd::Socket(_) => return Err(ESPIPE),
             Fd::Dir { .. } => return Err(EISDIR),
             _ => return Err(crate::syscall::ENODEV),
@@ -3242,7 +3242,8 @@ pub fn fallocate(fd: u64, mode: u64, off: u64, len: u64) -> R {
             0 => {
                 let end = off.checked_add(len).ok_or(EINVAL)?;
                 if f.metadata().map_err(errno)?.len() < end {
-                    f.set_len(end).map_err(errno)?;
+                    // An O_APPEND fd may only append (FILE_APPEND_DATA): size the file through a new handle.
+                    f.set_len(end).or_else(|_| OpenOptions::new().write(true).open(&*host).and_then(|w| w.set_len(end))).map_err(errno)?;
                 }
                 Ok(0)
             }
@@ -3252,7 +3253,7 @@ pub fn fallocate(fd: u64, mode: u64, off: u64, len: u64) -> R {
     })
 }
 
-/// Whether an open file allows writing (FILE_WRITE_DATA in its granted access).
+/// Whether an open file allows writing (FILE_WRITE_DATA or, for O_APPEND, FILE_APPEND_DATA).
 fn writable_handle(f: &File) -> bool {
     #[repr(C)]
     struct AccessInfo { granted: u32 }
@@ -3262,7 +3263,7 @@ fn writable_handle(f: &File) -> bool {
     let (mut iosb, mut info) = ([0usize; 2], AccessInfo { granted: 0 });
     // FileAccessInformation (8)
     let st = unsafe { NtQueryInformationFile(f.as_raw_handle() as isize, &mut iosb, &mut info, 4, 8) };
-    st != 0 || info.granted & 0x2 != 0 // FILE_WRITE_DATA; if we can't tell, let the write path decide
+    st != 0 || info.granted & 0x6 != 0 // FILE_WRITE_DATA or FILE_APPEND_DATA (O_APPEND); unknown: let the write decide
 }
 
 /// posix_fadvise: only advice, but its arguments are checked as Linux does.
