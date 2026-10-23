@@ -184,6 +184,9 @@ impl EventFd {
 
 pub fn eventfd(init: u64, flags: u64) -> R {
     const EFD_CLOEXEC: u64 = 0o2000000;
+    if flags & !(EFD_CLOEXEC | 0o4000 | 1) != 0 {
+        return Err(EINVAL); // EFD_NONBLOCK, EFD_SEMAPHORE
+    }
     Ok(add_fd(Fd::Event(Arc::new(EventFd::new(init, flags))), flags & EFD_CLOEXEC != 0))
 }
 
@@ -1316,6 +1319,7 @@ enum Io {
     Sock(Arc<Sock>),
     Event(Arc<EventFd>),
     Signal(Arc<crate::signal::SignalFd>),
+    Epoll(Arc<Mutex<crate::net::Epoll>>),
 }
 
 fn io_target(fd: u64) -> Result<Io, i64> {
@@ -1325,6 +1329,7 @@ fn io_target(fd: u64) -> Result<Io, i64> {
         Fd::Event(e) => Ok(Io::Event(e.clone())),
         Fd::Signal(s) => Ok(Io::Signal(s.clone())),
         Fd::Pipe(p) => Ok(Io::Pipe(p.clone())),
+        Fd::Epoll(e) => Ok(Io::Epoll(e.clone())),
         other => handle(other).map(Io::Handle),
     })
 }
@@ -1346,6 +1351,7 @@ pub fn read(fd: u64, buf: u64, len: u64) -> R {
             Ok(len as i64)
         }
         Io::Dev(Dev::Random) => crate::syscall::getrandom(buf, len),
+        Io::Epoll(_) => Err(EINVAL),
     }
 }
 
@@ -1357,7 +1363,7 @@ pub fn write(fd: u64, buf: u64, len: u64) -> R {
         Io::Sock(s) => s.send(buf, len, 0),
         Io::Dev(_) => Ok(len as i64), // devices swallow writes
         Io::Event(e) => e.write(buf, len),
-        Io::Signal(_) => Err(EINVAL),
+        Io::Signal(_) | Io::Epoll(_) => Err(EINVAL),
     }
 }
 
@@ -1373,6 +1379,11 @@ pub fn epoll(fd: u64) -> Result<Arc<Mutex<Epoll>>, i64> {
         Fd::Epoll(e) => Ok(e.clone()),
         _ => Err(EINVAL),
     })
+}
+
+/// Whether fd is a regular file or directory (never "not ready", so epoll refuses it).
+pub fn is_file(fd: u64) -> bool {
+    with(|fs| matches!(fs.fd(fd), Ok(Fd::File { .. } | Fd::Dir { .. })))
 }
 
 pub fn add_fd(fd: Fd, cloexec: bool) -> i64 {
@@ -1403,6 +1414,7 @@ pub fn readiness(fd: i32, events: i16) -> i16 {
         Ok(Io::Sock(s)) => s.ready(events),
         Ok(Io::Event(e)) => e.ready(events),
         Ok(Io::Signal(s)) => s.ready(events),
+        Ok(Io::Epoll(e)) => if crate::net::epoll_ready(&e) { events & POLLIN } else { 0 },
         Ok(Io::Pipe(p)) => p.ready(events),
         Ok(Io::Handle(h)) => match unsafe { crate::win::GetFileType(h) } {
             3 => {
@@ -2169,8 +2181,9 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
 
 /// close_range(first, last, flags): close every fd in the range, or with CLOSE_RANGE_CLOEXEC just mark them.
 pub fn close_range(first: u64, last: u64, flags: u64) -> R {
+    const CLOSE_RANGE_UNSHARE: u64 = 2;
     const CLOSE_RANGE_CLOEXEC: u64 = 4;
-    if first > last {
+    if first > last || flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
         return Err(EINVAL); // an empty range is an error, not "close `first`" (Python passes these)
     }
     with(|fs| {
