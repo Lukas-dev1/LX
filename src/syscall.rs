@@ -89,6 +89,10 @@ pub struct ThreadState {
     /// was, and the rcx and r11 that lx_sys_entry treats as clobbered. Written while it's suspended.
     pub kick: [std::sync::atomic::AtomicU64; 3],
     pub kicked: std::sync::atomic::AtomicBool,
+    /// Set by lx_kick_entry itself: this entry into lx_direct really came from a kick. `kicked` alone
+    /// can't say so: a redirect may be lost (the thread was mid exception dispatch, and NtContinue put
+    /// its old context back), and its next real syscall must not be taken for the kick.
+    via_kick: u8,
 }
 
 const TS_RESUME: usize = std::mem::offset_of!(ThreadState, resume);
@@ -96,6 +100,7 @@ const TS_FRAME_LEN: usize = std::mem::offset_of!(ThreadState, frame_len);
 const TS_FRAME: usize = std::mem::offset_of!(ThreadState, frame);
 const TS_GUEST_RSP: usize = std::mem::offset_of!(ThreadState, guest_rsp);
 const TS_KICK_RIP: usize = std::mem::offset_of!(ThreadState, kick);
+const TS_VIA_KICK: usize = std::mem::offset_of!(ThreadState, via_kick);
 const TS_HOST_STACK: usize = std::mem::offset_of!(ThreadState, host_stack);
 const TS_XSAVE: usize = std::mem::offset_of!(ThreadState, xsave);
 
@@ -163,7 +168,7 @@ pub fn ts() -> &'static mut ThreadState {
         frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None, restart: 0,
         tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
         on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]), in_direct: false,
-        kick: Default::default(), kicked: Default::default(),
+        kick: Default::default(), kicked: Default::default(), via_kick: 0,
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
     THREAD_TS.lock().unwrap().push((unsafe { GetCurrentThreadId() }, st as *const ThreadState as usize));
@@ -245,6 +250,7 @@ std::arch::global_asm!(
     "mov rcx, qword ptr [rip + LX_TLS_OFF]",
     "mov rcx, qword ptr gs:[rcx]",
     "mov r11, qword ptr [rcx + {kick_rip}]",
+    "mov byte ptr [rcx + {via_kick}], 1",  // only this entry sets it (a mov: the flags are untouched)
     "jmp 2f",
     "lx_sys_entry:",
     "mov rcx, qword ptr [rip + LX_TLS_OFF]",
@@ -323,6 +329,7 @@ std::arch::global_asm!(
     host_stack = const TS_HOST_STACK,
     xsave = const TS_XSAVE,
     kick_rip = const TS_KICK_RIP,
+    via_kick = const TS_VIA_KICK,
 );
 unsafe extern "C" {
     fn lx_fs_tramp();
@@ -377,7 +384,10 @@ unsafe extern "system" fn lx_direct(f: *mut DirectFrame) {
         std::arch::asm!("mov {b}, qword ptr gs:[0x08]", "mov {l}, qword ptr gs:[0x10]", b = out(reg) base, l = out(reg) limit);
         std::arch::asm!("mov qword ptr gs:[0x08], {b}", "mov qword ptr gs:[0x10], {l}", b = in(reg) top, l = in(reg) top - HOST_STACK as u64);
     }
-    if t.kicked.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    // A kick's flag is cleared on any entry: if this isn't the kick's (its redirect was lost), the next
+    // kick may go ahead.
+    t.kicked.store(false, std::sync::atomic::Ordering::SeqCst);
+    if std::mem::take(&mut t.via_kick) != 0 {
         // Not a syscall: signal::kick stopped the thread in guest code. Every register is as it was.
         c.rcx = t.kick[1].load(std::sync::atomic::Ordering::SeqCst);
         c.r11 = t.kick[2].load(std::sync::atomic::Ordering::SeqCst);
