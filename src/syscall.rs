@@ -1042,6 +1042,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         54 => net::sys_setsockopt(a[0], a[1], a[2], a[3], a[4]),
         55 => net::sys_getsockopt(a[0], a[1], a[2], a[3], a[4]),
         288 => net::sys_accept(a[0], a[1], a[2], a[3]),
+        213 if (a[0] as i32) <= 0 => Err(EINVAL), // epoll_create: size must be positive (and is ignored)
         213 => net::sys_epoll_create(0),
         291 => net::sys_epoll_create(a[0]),
         233 => net::sys_epoll_ctl(a[0], a[1], a[2], a[3]),
@@ -1161,6 +1162,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         // tkill, tgkill. ponytail: signals are process-wide; whichever thread returns from a syscall next runs it.
         200 => signal::send_thread(a[0], a[1]),        // tkill
         234 => if crate::proc::host_pid(a[0] as u32) == crate::proc::pid() { signal::send_thread(a[1], a[2]) } else { proc::kill(a[0] as i32 as i64, a[2]) }, // tgkill
+        292 if a[2] & !0o2000000 != 0 || a[0] == a[1] => Err(EINVAL), // dup3: only O_CLOEXEC, and old != new
         292 => fs::dup3(a[0], a[1], a[2]),
         293 => fs::pipe2(a[0], a[1]),
         253 => crate::inotify::init(0),

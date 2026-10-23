@@ -1255,6 +1255,37 @@ pub struct Epoll {
     entries: Vec<Entry>,
 }
 
+/// Adding epoll `inner` to `epfd`: ELOOP if `epfd` is inside it (a cycle), EINVAL past Linux's 4 levels.
+fn nests(inner: &Mutex<Epoll>, epfd: i32, depth: u32) -> Result<(), i64> {
+    if depth > 4 {
+        return Err(EINVAL);
+    }
+    let fds: Vec<i32> = inner.lock().unwrap().entries.iter().map(|x| x.fd).collect();
+    for fd in fds {
+        if fd == epfd {
+            return Err(40); // ELOOP
+        }
+        if let Ok(e) = fs::epoll(fd as u64) {
+            nests(&e, epfd, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+/// An epoll fd in poll, select or another epoll: readable when one of its entries is ready (level).
+/// ponytail: nesting is followed 4 deep at most; Linux refuses deeper or looping nests (ELOOP) instead.
+pub fn epoll_ready(ep: &Mutex<Epoll>) -> bool {
+    thread_local!(static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+    if DEPTH.get() >= 4 {
+        return false;
+    }
+    let fds: Vec<(i32, i16)> = ep.lock().unwrap().entries.iter().filter(|x| !x.disabled).map(|x| (x.fd, (x.events & 0xffff) as i16)).collect();
+    DEPTH.set(DEPTH.get() + 1);
+    let r = fds.iter().any(|&(fd, ev)| fs::readiness(fd, ev) & !0x20 != 0);
+    DEPTH.set(DEPTH.get() - 1);
+    r
+}
+
 /// An epoll's registrations for a fork/exec child: "fd:events:data:disabled" joined by ';'. Linux shares
 /// the instance across fork; the child gets an equal one over the same fd numbers (php-fpm's workers use
 /// the master's). ponytail: edge state starts fresh, and later changes on either side aren't shared.
@@ -1272,6 +1303,9 @@ pub fn epoll_import(s: &str) -> Epoll {
 }
 
 pub fn sys_epoll_create(flags: u64) -> R {
+    if flags & !0o2000000 != 0 {
+        return Err(EINVAL); // only EPOLL_CLOEXEC
+    }
     Ok(fs::add_fd(Fd::Epoll(Arc::new(Mutex::new(Epoll::default()))), flags & 0o2000000 != 0))
 }
 
@@ -1284,8 +1318,20 @@ pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, ev: u64) -> R {
         (0, 0)
     };
     let fd = fd as i32;
-    if fs::readiness(fd, 0) & 0x20 != 0 {
+    if fs::is_file(fd as u64) {
+        return Err(crate::syscall::EPERM); // regular files and directories are always ready: not pollable
+    }
+    if fd < 0 || fs::readiness(fd, 0) & 0x20 != 0 {
         return Err(9); // EBADF
+    }
+    if fd as u64 == epfd {
+        return Err(EINVAL);
+    }
+    if ev == 0 && op != 2 {
+        return Err(crate::syscall::EFAULT);
+    }
+    if op == 1 && let Ok(inner) = fs::epoll(fd as u64) {
+        nests(&inner, epfd as i32, 1)?;
     }
     let mut e = ep.lock().unwrap();
     let pos = e.entries.iter().position(|x| x.fd == fd);

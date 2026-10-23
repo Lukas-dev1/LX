@@ -184,6 +184,9 @@ impl EventFd {
 
 pub fn eventfd(init: u64, flags: u64) -> R {
     const EFD_CLOEXEC: u64 = 0o2000000;
+    if flags & !(EFD_CLOEXEC | 0o4000 | 1) != 0 {
+        return Err(EINVAL); // EFD_NONBLOCK, EFD_SEMAPHORE
+    }
     Ok(add_fd(Fd::Event(Arc::new(EventFd::new(init, flags))), flags & EFD_CLOEXEC != 0))
 }
 
@@ -1371,6 +1374,11 @@ pub fn epoll(fd: u64) -> Result<Arc<Mutex<Epoll>>, i64> {
     })
 }
 
+/// Whether fd is a regular file or directory (never "not ready", so epoll refuses it).
+pub fn is_file(fd: u64) -> bool {
+    with(|fs| matches!(fs.fd(fd), Ok(Fd::File { .. } | Fd::Dir { .. })))
+}
+
 pub fn add_fd(fd: Fd, cloexec: bool) -> i64 {
     with(|fs| fs.add(fd, 0, cloexec))
 }
@@ -1392,6 +1400,9 @@ const POLLNVAL: i16 = 0x20;
 pub fn readiness(fd: i32, events: i16) -> i16 {
     if fd < 0 {
         return 0;
+    }
+    if let Ok(ep) = epoll(fd as u64) {
+        return if crate::net::epoll_ready(&ep) { events & POLLIN } else { 0 };
     }
     match io_target(fd as u64) {
         Err(_) => POLLNVAL,
@@ -2164,8 +2175,9 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
 
 /// close_range(first, last, flags): close every fd in the range, or with CLOSE_RANGE_CLOEXEC just mark them.
 pub fn close_range(first: u64, last: u64, flags: u64) -> R {
+    const CLOSE_RANGE_UNSHARE: u64 = 2;
     const CLOSE_RANGE_CLOEXEC: u64 = 4;
-    if first > last {
+    if first > last || flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
         return Err(EINVAL); // an empty range is an error, not "close `first`" (Python passes these)
     }
     with(|fs| {
