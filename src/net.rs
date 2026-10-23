@@ -389,6 +389,62 @@ fn netlink_reply(req: &[u8], pid: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The ifreq ioctls (SIOCGIF*) for lo, the container's one interface, as the netlink dumps show it.
+/// struct ifreq { char name[16]; union { sockaddr, short flags, int index/mtu/qlen, ... } }.
+pub fn if_ioctl(req: u64, arg: u64) -> R {
+    const ENODEV: i64 = 19;
+    let ifr = unsafe { std::slice::from_raw_parts_mut(arg as *mut u8, 40) };
+    let put_i32 = |ifr: &mut [u8], v: i32| ifr[16..20].copy_from_slice(&v.to_le_bytes());
+    let put_in = |ifr: &mut [u8], ip: [u8; 4]| {
+        ifr[16..32].fill(0);
+        ifr[16] = AF_INET as u8;
+        ifr[20..24].copy_from_slice(&ip);
+    };
+    match req {
+        0x8912 => {
+            // SIOCGIFCONF: struct ifconf { int len; char *buf } gets one ifreq, lo's.
+            let conf = unsafe { &mut *(arg as *mut [u64; 2]) };
+            if conf[1] != 0 && conf[0] as u32 >= 40 {
+                let r = unsafe { std::slice::from_raw_parts_mut(conf[1] as *mut u8, 40) };
+                r.fill(0);
+                r[..2].copy_from_slice(b"lo");
+                put_in(r, [127, 0, 0, 1]);
+            }
+            conf[0] = conf[0] & !0xffff_ffff | 40;
+            return Ok(0);
+        }
+        0x8910 => {
+            // SIOCGIFNAME: index -> name
+            if i32::from_le_bytes(ifr[16..20].try_into().unwrap()) != 1 {
+                return Err(ENODEV);
+            }
+            ifr[..16].fill(0);
+            ifr[..2].copy_from_slice(b"lo");
+            return Ok(0);
+        }
+        _ => {}
+    }
+    if &ifr[..3] != b"lo\0" {
+        return Err(ENODEV);
+    }
+    match req {
+        0x8913 => ifr[16..18].copy_from_slice(&0x49u16.to_le_bytes()), // SIOCGIFFLAGS: UP|LOOPBACK|RUNNING
+        0x8915 => put_in(ifr, [127, 0, 0, 1]),                       // SIOCGIFADDR
+        0x891b => put_in(ifr, [255, 0, 0, 0]),                       // SIOCGIFNETMASK
+        0x8921 => put_i32(ifr, 65536),                               // SIOCGIFMTU
+        0x8927 => {
+            // SIOCGIFHWADDR: ARPHRD_LOOPBACK, all zeros
+            ifr[16..32].fill(0);
+            ifr[16..18].copy_from_slice(&772u16.to_le_bytes());
+        }
+        0x8933 => put_i32(ifr, 1),    // SIOCGIFINDEX
+        0x8942 => put_i32(ifr, 1000), // SIOCGIFTXQLEN
+        0x8914 | 0x8916 | 0x891c | 0x8922 | 0x8924 | 0x8943 => return Err(crate::syscall::EPERM), // the SIOCSIF* sets
+        _ => return Err(crate::syscall::ENOTTY),
+    }
+    Ok(0)
+}
+
 // ---- published ports (`lx run -p`) ----
 //
 // Containers share the host's network stack, so publishing is done by rewriting addresses at the

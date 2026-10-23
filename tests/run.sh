@@ -344,6 +344,7 @@ done
 $LX stop "lxipA-$$" > /dev/null 2>&1; $LX stop "lxipB-$$" > /dev/null 2>&1
 if [ "$got" = "AB" ]; then ok "two containers on the same port"; else bad "two containers on the same port: got '$got'"; fi
 expect "netlink: ip addr lists lo (Go's net.Interfaces, getifaddrs)" 0 "inet 127.0.0.1/8 scope host lo" -- run alpine ip addr
+expect "SIOCGIFINDEX / SIOCGIFNAME (musl's if_nametoindex)" 0 "lo is 1 lo" -- run python:3.12-alpine python3 -c 'import socket; print("lo is", socket.if_nametoindex("lo"), socket.if_indextoname(1))'
 
 # Another container's published port is reached at its container port (web:80 of a -p 8098:80 service).
 $LX run -d --name "lxpp-$$" --ip 127.77.0.1 -p 8098:8088 busybox sh -c "mkdir /w; echo pp > /w/i; httpd -f -p 8088 -h /w" < /dev/null > /dev/null 2>&1
