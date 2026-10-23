@@ -287,6 +287,17 @@ pub fn send(pid: u32, sig: u64) -> R {
     Ok(0)
 }
 
+/// A forked child's mailbox exists before its handlers are restored: signals wait there until then, rather
+/// than meeting default dispositions (a SIGINT for Python's handler would kill the child).
+pub static HELD: AtomicBool = AtomicBool::new(false);
+static OWN_EV: AtomicIsize = AtomicIsize::new(0);
+
+/// Deliver what arrived while HELD.
+pub fn release() {
+    HELD.store(false, SeqCst);
+    unsafe { crate::win::SetEvent(OWN_EV.load(SeqCst)) };
+}
+
 /// Our own mailbox (set by listen).
 static OWN: std::sync::atomic::AtomicPtr<Mailbox> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
@@ -365,8 +376,12 @@ pub fn listen() {
     if let Some(b) = own {
         OWN.store(b as *const Mailbox as *mut Mailbox, SeqCst);
     }
+    OWN_EV.store(ev, SeqCst);
     std::thread::spawn(move || loop {
         unsafe { WaitForMultipleObjects(1, &ev, 0, u32::MAX) };
+        if HELD.load(SeqCst) {
+            continue; // stays in the mailbox until release()
+        }
         let mut b = mb[0].swap(0, SeqCst);
         while b != 0 {
             let sig = b.trailing_zeros() as u64 + 1;
