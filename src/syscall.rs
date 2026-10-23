@@ -669,7 +669,8 @@ pub fn install() {
 /// Rewrite every `syscall` in writable guest code at [addr, addr+len) to `ud2` and register the range.
 pub fn patch_code(addr: u64, len: usize) -> usize {
     let code = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len) };
-    let all = find_syscalls(code, addr).len();
+    // Counting the sites takes a whole decode of its own: only for the debug report.
+    let all = if debug() || patchlog() { find_syscalls(code, addr).len() } else { 0 };
     let raw = code.windows(2).filter(|w| w == b"\x0f\x05").count();
     if raw != all && debug() {
         eprintln!("[lx] {addr:#x}: {} of {raw} 0F05 byte pairs are not instructions, left alone", raw - all);
