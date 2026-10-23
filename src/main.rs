@@ -646,10 +646,30 @@ fn exec(args: &[String]) -> Result<(), String> {
 }
 
 /// Load `cmd` (and its ELF interpreter, or its #! interpreter) and jump into it. Never returns on success.
-fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), String> {
+fn start(cmd: &str, argv: Vec<String>, env: Vec<String>) -> Result<(), String> {
     fs::console_vt();
-    let not_found = |e: i64| format!("{cmd}: {}", if e == syscall::EACCES { "permission denied" } else { "not found in image" });
     let path = env.iter().find_map(|e| e.strip_prefix("PATH=")).unwrap_or(PATH).to_string();
+    let p = prepare(cmd, argv, &path).map_err(|(_, msg)| msg)?;
+    enter_job()?;
+    syscall::install();
+    Err(launch(p, env))
+}
+
+/// A program ready to start: found, its #! interpreters followed, its ELF interpreter found. Nothing is
+/// changed yet, so an execve can still fail cleanly (Linux checks all of this before the point of no
+/// return too).
+pub struct Prepared {
+    exe: String,
+    image: Vec<u8>,
+    argv: Vec<String>,
+    /// PT_INTERP (ld.so): its guest path and bytes.
+    ld: Option<(String, Vec<u8>)>,
+}
+
+/// Find `cmd` (on `path` for a bare name) and what it needs. Err: (errno, message for `lx run`).
+pub fn prepare(cmd: &str, mut argv: Vec<String>, path: &str) -> Result<Prepared, (i64, String)> {
+    let not_found = |e: i64| (e, format!("{cmd}: {}", if e == syscall::EACCES { "permission denied" } else { "not found in image" }));
+    let path = path.to_string();
     let (mut exe, mut image) = fs::find_exe(cmd, &path).map_err(not_found)?;
     // #! scripts (nested up to 4 deep, like Linux): argv becomes [interp, optional-arg, script, args...],
     // the script as it was called, not where its links lead (addgroup, a link to adduser, picks its mode
@@ -668,23 +688,38 @@ fn start(cmd: &str, mut argv: Vec<String>, env: Vec<String>) -> Result<(), Strin
         new.extend(argv.drain(..).skip(1));
         argv = new;
         script = interp.clone();
-        (exe, image) = fs::find_exe(&interp, &path).map_err(|_| format!("{exe}: bad interpreter {interp}"))?;
+        (exe, image) = fs::find_exe(&interp, &path).map_err(|_| (syscall::ENOENT, format!("{exe}: bad interpreter {interp}")))?;
     }
-    fs::set_exe(&exe);
+    if !image.starts_with(b"\x7fELF") {
+        return Err((syscall::ENOEXEC, format!("{exe}: not an executable")));
+    }
+    let ld = match elf::interp(&image).map_err(|e| (syscall::ENOEXEC, format!("{exe}: {e}")))? {
+        Some(ld) => Some(fs::find_exe(&ld, "/").map_err(|_| (syscall::ENOENT, format!("{exe}: interpreter {ld} not found")))?),
+        None => None,
+    };
+    Ok(Prepared { exe, image, argv, ld })
+}
 
-    enter_job()?;
-    syscall::install();
+/// Load a prepared program into this (empty) guest address space and run it. Returns only on failure.
+pub fn launch(p: Prepared, env: Vec<String>) -> String {
+    match launch_inner(p, env) {
+        Err(e) => e,
+    }
+}
+
+fn launch_inner(p: Prepared, env: Vec<String>) -> Result<std::convert::Infallible, String> {
+    let Prepared { exe, image, argv, ld } = p;
+    fs::set_exe(&exe);
     let img = elf::load(&image, fs::host_of(&exe).as_deref())?;
     drop(image); // its segments are copied in; the guest never returns here to free the file's bytes
     ptable::register(&exe, &argv); // for ps and /proc/<pid> in the container's other processes
     // Dynamically linked: the kernel's job is to map ld.so too and start there; ld.so maps the rest via mmap.
-    let (entry, interp_base) = match &img.interp {
-        Some(ld) => {
-            let (ld_guest, ld_bytes) = fs::find_exe(ld, "/").map_err(|_| format!("{exe}: interpreter {ld} not found"))?;
+    let (entry, interp_base) = match (&img.interp, ld) {
+        (Some(_), Some((ld_guest, ld_bytes))) => {
             let ld = elf::load(&ld_bytes, fs::host_of(&ld_guest).as_deref())?;
             (ld.entry, ld.base)
         }
-        None => (img.entry, 0),
+        _ => (img.entry, 0),
     };
     // argv[0] stays what the caller passed (busybox picks its applet from it); the image may live elsewhere.
     let argv: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
