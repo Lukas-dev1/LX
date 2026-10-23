@@ -417,7 +417,7 @@ impl Pipe {
                 if crate::syscall::debug() {
                     crate::syscall::dlog(format_args!("pipe {} on handle {:#x} failed: Windows error {e}", if write { "write" } else { "read" }, self.raw()));
                 }
-                Err(EIO)
+                Err(crate::syscall::io_errno(e))
             }
         }
     }
@@ -2070,8 +2070,15 @@ pub fn sendfile(out: u64, inp: u64, off: u64, count: u64) -> R {
 /// move it on synchronous handles, so put it back.
 pub fn pread(fd: u64, buf: u64, len: u64, off: u64, write: bool) -> R {
     use std::os::windows::fs::FileExt;
+    if (off as i64) < 0 {
+        return Err(EINVAL);
+    }
     with(|fs| {
-        let Fd::File { f, .. } = fs.fd(fd)? else { return Err(ESPIPE) };
+        let f = match fs.fd(fd)? {
+            Fd::File { f, .. } => f,
+            Fd::Dir { .. } => return Err(EISDIR),
+            _ => return Err(ESPIPE),
+        };
         let keep = f.stream_position().map_err(errno)?;
         let len = len.min(u32::MAX as u64) as usize;
         let r = if write {
@@ -2083,15 +2090,28 @@ pub fn pread(fd: u64, buf: u64, len: u64, off: u64, write: bool) -> R {
         match r {
             Ok(n) => Ok(n as i64),
             Err(e) if e.raw_os_error() == Some(38) => Ok(0), // ERROR_HANDLE_EOF: read past the end
+            // Wrong direction for the fd (EBADF), or an unmapped guest buffer (EFAULT): as read/write report them.
+            Err(e) if matches!(e.raw_os_error(), Some(5 | 998)) => Err(crate::syscall::io_errno(e.raw_os_error().unwrap() as u32)),
             Err(e) => Err(errno(e)),
         }
     })
 }
 
-pub fn readv(fd: u64, iov: u64, cnt: u64) -> R {
+/// An iovec array Linux accepts: at most IOV_MAX entries, and lengths that sum to no more than SSIZE_MAX.
+fn check_iov(iov: u64, cnt: u64) -> Result<(), i64> {
     if cnt > 1024 {
         return Err(EINVAL);
     }
+    let mut sum = 0u64;
+    for i in 0..cnt {
+        let [_, len] = unsafe { *((iov + i * 16) as *const [u64; 2]) };
+        sum = sum.checked_add(len).filter(|&s| s <= i64::MAX as u64).ok_or(EINVAL)?;
+    }
+    Ok(())
+}
+
+pub fn readv(fd: u64, iov: u64, cnt: u64) -> R {
+    check_iov(iov, cnt)?;
     let mut total = 0;
     for i in 0..cnt {
         let [base, len] = unsafe { *((iov + i * 16) as *const [u64; 2]) };
@@ -2112,7 +2132,8 @@ pub fn preadv(fd: u64, iov: u64, cnt: u64, off: u64, write: bool) -> R {
     if off == u64::MAX {
         return if write { writev(fd, iov, cnt) } else { readv(fd, iov, cnt) };
     }
-    if cnt > 1024 {
+    check_iov(iov, cnt)?;
+    if (off as i64) < 0 {
         return Err(EINVAL);
     }
     let mut total = 0;
@@ -2130,9 +2151,7 @@ pub fn preadv(fd: u64, iov: u64, cnt: u64, off: u64, write: bool) -> R {
 }
 
 pub fn writev(fd: u64, iov: u64, cnt: u64) -> R {
-    if cnt > 1024 {
-        return Err(EINVAL);
-    }
+    check_iov(iov, cnt)?;
     let mut total = 0;
     for i in 0..cnt {
         // ponytail: the iovec array is read directly; a bad pointer crashes us instead of returning EFAULT.
