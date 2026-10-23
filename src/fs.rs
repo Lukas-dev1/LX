@@ -3502,6 +3502,10 @@ fn layer_never_touches_the_image() {
     // A deep image path the upper layer has none of resolves through the image alone.
     assert_eq!(f.resolve("/", "/usr/lib/py/m.py", true).unwrap().1, lower.join("usr/lib/py/m.py"));
     assert_eq!(f.resolve("/usr/lib", "py/m.py", false).unwrap().1, lower.join("usr/lib/py/m.py"));
+    // The lookup's attributes (what stat and open use): there for image files, None below a missing dir.
+    let meta = |p: &str| f.resolve_attrs("/", p, true).unwrap().2;
+    assert!(meta("/usr/lib/py/m.py").is_some_and(|m| !m.dir && m.len == 1) && meta("/usr/lib").is_some_and(|m| m.dir));
+    assert!(meta("/usr/nope/m.py").is_none() && meta("/nope/a/b").is_none());
     let w = f.writable(&c("/etc/a.conf"), true).unwrap();
     fs::write(&w, "container").unwrap();
     assert_eq!(fs::read_to_string(f.host(&c("/etc/a.conf"))).unwrap(), "container");
@@ -3516,6 +3520,7 @@ fn layer_never_touches_the_image() {
     f.remove(&c("/etc/conf.d"), true).unwrap();
     assert!(!exists(&f.host(&c("/etc/conf.d/x"))));
     assert!(!exists(&f.resolve("/", "/etc/conf.d/x", true).unwrap().1));
+    assert!(meta("/etc/conf.d").is_none() && meta("/etc/conf.d/x").is_none());
     assert_eq!(names("/etc"), ["a.conf", "new"]);
     assert!(lower.join("etc/conf.d/x").exists());
 
@@ -3526,6 +3531,7 @@ fn layer_never_touches_the_image() {
     assert_eq!(names("/etc/conf.d"), Vec::<String>::new());
     assert!(!exists(&f.host(&c("/etc/conf.d/x"))));
     assert!(!exists(&f.resolve("/etc", "conf.d/x", false).unwrap().1));
+    assert!(meta("/etc/conf.d").is_some() && meta("/etc/conf.d/x").is_none());
 
     // A deleted image file opened for writing again (copy-up asked) is new, not the image's copy.
     f.remove(&c("/etc/a.conf"), false).unwrap();
