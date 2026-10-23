@@ -1,6 +1,6 @@
 //! Synthetic /proc and /proc/sys files: what images read at startup (cgroup, mounts, meminfo, cpuinfo,
 //! a few sysctls). Contents are made when the file is opened, like the kernel does.
-//! ponytail: a fixed list; /proc/<pid> of other processes, self/stat, self/status and maps aren't here.
+//! ponytail: a fixed list; /proc/<pid> of other processes, self/stat and self/status aren't here.
 
 /// The contents of synthetic file `guest`, if it is one.
 pub fn file(guest: &str) -> Option<String> {
@@ -15,6 +15,7 @@ Pss: {:>16} kB
 ", rss >> 10, rss >> 10) }),
             "mounts" => Some(mounts()),
             "mountinfo" => Some(MOUNTINFO.into()),
+            "maps" => Some(crate::syscall::maps()),
             _ => table_file(crate::proc::getpid().unwrap_or(0) as u32, rest),
         };
     }
