@@ -3084,6 +3084,11 @@ pub fn exe_name() -> String {
     EXE.lock().unwrap().rsplit('/').next().unwrap_or("").chars().take(15).collect()
 }
 
+/// The running program's guest path.
+pub fn exe() -> String {
+    EXE.lock().unwrap().clone()
+}
+
 pub fn set_exe(guest: &str) {
     *EXE.lock().unwrap() = guest.to_string();
 }

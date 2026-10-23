@@ -143,17 +143,26 @@ pub fn register(exe: &str, argv: &[String]) {
 
 /// A forked child: the parent's program, under its own pid.
 pub fn fork_child() {
-    let Some(parent) = get(crate::proc::getppid().unwrap_or(0) as u32) else { return };
+    let ppid = crate::proc::getppid().unwrap_or(0) as u32;
+    // The parent's names, or (a parent with no slot: its fork child must still show in /proc, or a
+    // grandchild of it would vanish too) our own program's.
+    let (comm, exe, cmdline) = match get(ppid) {
+        Some(p) => (p.comm, p.exe, p.cmdline),
+        None => {
+            let exe = crate::fs::exe();
+            (exe.rsplit('/').next().unwrap_or("").to_string(), exe.clone(), exe.into_bytes().into_iter().chain([0]).collect())
+        }
+    };
     let pid = crate::proc::getpid().unwrap_or(0) as u32;
     let Some(s) = claim(pid) else { return };
     s.sys_ms.store(0, Relaxed);
     OWN.store(s as *mut Slot, Relaxed);
     s.win.store(std::process::id(), SeqCst);
-    s.ppid = parent.pid;
+    s.ppid = ppid;
     (s.uid, s.gid) = (crate::proc::UID.load(SeqCst), crate::proc::GID.load(SeqCst));
-    put(&mut s.comm, parent.comm.as_bytes());
-    put(&mut s.exe, parent.exe.as_bytes());
-    put(&mut s.cmdline, &parent.cmdline);
+    put(&mut s.comm, comm.as_bytes());
+    put(&mut s.exe, exe.as_bytes());
+    put(&mut s.cmdline, &cmdline);
 }
 
 /// At exit: free our slot (an exec proxy's was taken over by its successor).
