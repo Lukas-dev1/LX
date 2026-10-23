@@ -1891,10 +1891,11 @@ fn nanosleep(ts: u64, rem: u64) -> R {
         return Err(EINVAL);
     }
     let start = Instant::now();
-    let r = signal::interruptible_sleep(timespec_ms(ts).clamp(0, u32::MAX as i64 - 1) as u32);
+    let [s, ns] = unsafe { *(ts as *const [u64; 2]) };
+    let want = std::time::Duration::new(s, ns as u32);
+    let r = signal::precise_sleep(want);
     if r == Err(EINTR) {
-        let [s, ns] = unsafe { *(ts as *const [u64; 2]) };
-        remaining(rem, std::time::Duration::new(s, ns as u32), start);
+        remaining(rem, want, start);
     }
     r
 }
@@ -1970,7 +1971,7 @@ fn clock_nanosleep(clock: u64, flags: u64, req: u64, rem: u64) -> R {
         return Ok(0);
     }
     // A signal cuts it short (EINTR), as for nanosleep: Python's and glibc's sleep() come here.
-    let r = signal::interruptible_sleep(((wait.as_nanos() + 999_999) / 1_000_000).min(u32::MAX as u128 - 1) as u32);
+    let r = signal::precise_sleep(wait);
     if r == Err(EINTR) && flags & TIMER_ABSTIME == 0 {
         remaining(rem, wait, start);
     }
@@ -2070,16 +2071,27 @@ fn mincore(addr: u64, len: u64, vec: u64) -> R {
 #[link(name = "winmm")]
 unsafe extern "system" {
     fn timeBeginPeriod(ms: u32) -> u32;
+    fn timeEndPeriod(ms: u32) -> u32;
 }
 
-/// Linux timers are ~1 ms; NT's default tick is 15.6 ms, so a 1 ms futex or condition wait took 16.
-/// Turned on by the first short timed wait (per-process on Windows 11) and left on: processes that only
-/// wait long, like an idle server, keep the coarse tick and its lower power use.
-pub fn fine_timer() {
-    static ON: std::sync::Once = std::sync::Once::new();
-    ON.call_once(|| unsafe {
-        timeBeginPeriod(1);
-    });
+/// Linux timers are ~1 ms; NT's default tick is 15.6 ms, so a 1 ms wait took 16. This raises the timer
+/// resolution for the length of one short wait (futex, poll, epoll_wait, sleeps), ended when the guard
+/// drops: a server whose event loop passes short timeouts doesn't keep the fast tick while idle.
+pub struct FineWait;
+
+impl FineWait {
+    pub fn for_ms(ms: i64) -> Option<FineWait> {
+        (1..16).contains(&ms).then(|| {
+            unsafe { timeBeginPeriod(1) };
+            FineWait
+        })
+    }
+}
+
+impl Drop for FineWait {
+    fn drop(&mut self) {
+        unsafe { timeEndPeriod(1) };
+    }
 }
 
 /// The interrupted guest's FP/vector state for a signal frame: on the direct path the XSAVE image

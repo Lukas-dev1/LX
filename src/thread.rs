@@ -153,9 +153,7 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
                 // Round up: a wait with 0.9 ms left must still sleep, not spin (WaitOnAddress(0) returns at once).
                 want.as_nanos().div_ceil(1_000_000).min(u32::MAX as u128 - 1) as u32
             };
-            if ms < 16 {
-                syscall::fine_timer();
-            }
+            let _fine = syscall::FineWait::for_ms(ms as i64);
             if syscall::in_shared_view(uaddr) {
                 return shared_wait(uaddr, expect, ms);
             }

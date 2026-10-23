@@ -1982,6 +1982,7 @@ pub fn poll(fds: u64, n: u64, timeout_ms: i64) -> R {
     if n > 1024 {
         return Err(EINVAL);
     }
+    let _fine = crate::syscall::FineWait::for_ms(timeout_ms);
     let start = std::time::Instant::now();
     loop {
         let mut ready = 0;

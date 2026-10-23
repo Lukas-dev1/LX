@@ -458,6 +458,7 @@ pub fn intr_event() -> isize {
 
 /// Sleep up to `ms` (u32::MAX = forever), cut short by a deliverable signal: then Err(EINTR).
 pub fn interruptible_sleep(ms: u32) -> R {
+    let _fine = crate::syscall::FineWait::for_ms(ms as i64); // else a 1 ms sleep takes NT's 15.6 ms tick
     let ev = intr_event();
     let start = std::time::Instant::now();
     loop {
@@ -473,6 +474,35 @@ pub fn interruptible_sleep(ms: u32) -> R {
         } else {
             unsafe { crate::win::WaitForMultipleObjects(1, &ev, 0, left) };
         }
+    }
+}
+
+/// nanosleep and clock_nanosleep: like interruptible_sleep, but on a high-resolution waitable timer, so
+/// a 1 ms sleep takes about 1 ms rather than whole timer ticks (a sleep loop's latency and throughput).
+pub fn precise_sleep(d: std::time::Duration) -> R {
+    unsafe extern "system" {
+        fn CreateWaitableTimerExW(attr: *mut std::ffi::c_void, name: *const u16, flags: u32, access: u32) -> isize;
+        fn SetWaitableTimer(t: isize, due: *const i64, period: i32, f: *mut std::ffi::c_void, a: *mut std::ffi::c_void, resume: i32) -> i32;
+    }
+    thread_local!(static TIMER: isize = unsafe { CreateWaitableTimerExW(std::ptr::null_mut(), std::ptr::null(), 2, 0x1F_0003) }); // HIGH_RESOLUTION, TIMER_ALL_ACCESS
+    let t = TIMER.with(|t| *t);
+    if t == 0 || d >= std::time::Duration::from_millis(50) {
+        // Long sleeps don't need it (nor older Windows, which lacks the flag).
+        return interruptible_sleep(d.as_nanos().div_ceil(1_000_000).min(u32::MAX as u128 - 1) as u32);
+    }
+    let start = std::time::Instant::now();
+    loop {
+        if deliverable() {
+            return Err(EINTR);
+        }
+        let left = d.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            return Ok(0);
+        }
+        let due = -((left.as_nanos() / 100).max(1) as i64); // relative, in 100 ns
+        unsafe { SetWaitableTimer(t, &due, 0, std::ptr::null_mut(), std::ptr::null_mut(), 0) };
+        let hs = [t, intr_event()];
+        unsafe { crate::win::WaitForMultipleObjects(if hs[1] != 0 { 2 } else { 1 }, hs.as_ptr(), 0, u32::MAX) };
     }
 }
 
