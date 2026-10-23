@@ -3220,7 +3220,13 @@ pub fn truncate(dirfd: u64, path: u64, fd: Option<u64>, len: u64) -> R {
         if f.metadata().is_ok_and(|m| len > m.len()) {
             set_sparse(f);
         }
-        f.set_len(len).map(|_| 0).map_err(errno)
+        match f.set_len(len) {
+            // Shrinking a file we have mapped: NT wants the views out of the way first.
+            Err(e) if e.raw_os_error() == Some(1224) => {
+                crate::syscall::truncate_mapped(f.as_raw_handle() as isize, len, || f.set_len(len)).map(|_| 0).map_err(errno)
+            }
+            r => r.map(|_| 0).map_err(errno),
+        }
     };
     with(|fs| {
         let f = match fd {
