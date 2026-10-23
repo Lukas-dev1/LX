@@ -2262,8 +2262,10 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
         if meta.is_none() && flags & O_CREAT == 0 {
             return Err(ENOENT); // the lookup just found nothing: no host open to fail
         }
-        // An existing entry opens only as its mode allows the caller (O_TRUNC needs write too).
-        if let Some(m) = &meta && fs.keeps_meta(&comps_of(&guest)) {
+        // An existing entry opens only as its mode allows the caller (O_TRUNC needs write too); O_PATH
+        // only names it and needs nothing (fchdir, AT_EMPTY_PATH, a dirfd: Go's os.Root, find -execdir).
+        const O_PATH: u64 = 0o10000000;
+        if let Some(m) = &meta && flags & O_PATH == 0 && fs.keeps_meta(&comps_of(&guest)) {
             let want = match flags & 3 { 0 => 4, 1 => 2, _ => 6 } | if flags & O_TRUNC != 0 { 2 } else { 0 };
             if !may_access(&host, m, want) {
                 return Err(EACCES);
