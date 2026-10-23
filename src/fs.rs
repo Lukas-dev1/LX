@@ -3124,11 +3124,17 @@ pub fn renameat(olddir: u64, old: u64, newdir: u64, new: u64) -> R {
         let is_dir = fs::symlink_metadata(&from).map_err(errno)?.is_dir();
         // Bring the source into the upper layer (whole tree for an image directory), then move it there.
         let src = fs.writable(&fc, true)?;
+        // Moved over a deleted image path, a directory must not show the image's old contents there,
+        // like one mkdir makes (lookups check only the last level for whiteouts: see resolve).
+        let opaque = is_dir && fs.upper.is_some() && fs.hidden(&tc);
         let dst = fs.writable(&tc, false)?;
         if exists(&dst) && !is_dir {
             let _ = fs::remove_file(&dst);
         }
         fs::rename(&src, &dst).map_err(errno)?;
+        if opaque {
+            fs::write(dst.join(OPAQUE), b"").map_err(errno)?;
+        }
         if fs.upper.is_some() && fs.in_lower(&fc) {
             fs.remove(&fc, is_dir)?; // the image's copy must stay hidden at the old name
         }
