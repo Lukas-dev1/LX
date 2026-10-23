@@ -212,7 +212,11 @@ repeat() { # repeat <name> <n> <lx args...>
   name=$1 n=$2; shift 2
   good=0 traps=0
   for i in $(seq "$n"); do
-    LX_PATCHLOG=1 timeout 120 $LX "$@" < /dev/null > "$OUT/rep" 2>&1 && grep -q " OK$" "$OUT/rep" && good=$((good + 1))
+    if LX_PATCHLOG=1 timeout 120 $LX "$@" < /dev/null > "$OUT/rep" 2>&1 && grep -q " OK$" "$OUT/rep"; then
+      good=$((good + 1))
+    else
+      echo "  run $i of $name failed (exit $?); its output:"; head -20 "$OUT/rep" | sed 's/^/    /' # rare failures need it
+    fi
     traps=$((traps + $(grep -o "[0-9]* fallback traps\|[0-9]* FS-base faults" "$OUT/rep" | awk '{s += $1} END {print s + 0}')))
   done
   if [ $good = "$n" ] && [ $traps = 0 ]; then ok "$name $good/$n"; else bad "$name $good/$n, $traps fallback traps/FS faults"; fi
