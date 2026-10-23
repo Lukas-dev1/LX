@@ -1246,7 +1246,9 @@ pub fn import_fd(kind: &str, h: usize, extra: &str, cloexec: bool) -> R {
 
 /// Rebuild the fd table from `proc_state` fields (in the new lx). Returns the unparsed rest.
 pub fn init_from(fields: &[String]) -> Result<&[String], String> {
-    let bad = || "malformed process state".to_string();
+    // Seen once and not again: say what was off, so a recurrence can be pinned down.
+    let total = fields.len();
+    let bad = || format!("malformed process state ({total} fields)");
     let [root, upper, mounts, cwd, n, rest @ ..] = fields else { return Err(bad()) };
     let mounts = mounts.split('\x1e').filter(|m| !m.is_empty()).map(|m| {
         let f: Vec<&str> = m.split('\x1f').collect();
@@ -1272,10 +1274,11 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
         unsafe { DuplicateHandle(GetCurrentProcess(), h as isize, GetCurrentProcess(), &mut d, 0, 0, 2) }; // SAME_ACCESS
         d as usize
     };
-    for _ in 0..n.parse::<usize>().map_err(|_| bad())? {
-        let [fd, kind, h, path, cloexec, more @ ..] = rest else { return Err(bad()) };
-        let fd: usize = fd.parse().map_err(|_| bad())?;
-        let h: usize = h.parse().map_err(|_| bad())?;
+    for _ in 0..n.parse::<usize>().map_err(|_| format!("{}: fd count {n:?}", bad()))? {
+        let at = total - rest.len();
+        let [fd, kind, h, path, cloexec, more @ ..] = rest else { return Err(format!("{}: fd entry at field {at} cut short", bad())) };
+        let fd: usize = fd.parse().map_err(|_| format!("{}: fd number {fd:?} at field {at}", bad()))?;
+        let h: usize = h.parse().map_err(|_| format!("{}: handle {h:?} at field {}", bad(), at + 2))?;
         let fd_ = match kind.as_str() {
             "h" => Fd::Handle(unsafe { OwnedHandle::from_raw_handle(own(h, &mut seen) as _) }),
             "p" => Fd::Pipe(pipes.entry(h).or_insert_with(|| Arc::new(Pipe::inherited(h, path))).clone()),
@@ -1287,7 +1290,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
             "e" => Fd::Epoll(Arc::new(Mutex::new(crate::net::epoll_import(path)))),
             "v" | "g" => import_counter(kind, path).ok_or_else(bad)?,
             "s" => Fd::Socket(socks.entry(h).or_insert_with(|| Arc::new(Sock::inherited(h, path))).clone()),
-            _ => return Err(bad()),
+            _ => return Err(format!("{}: fd kind {kind:?} at field {}", bad(), at + 1)),
         };
         while fds.len() <= fd {
             fds.push(None);
