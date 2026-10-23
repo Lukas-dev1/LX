@@ -114,6 +114,7 @@ expect "inotify: container dir and image dir" 0 "inotify OK etc delete motd" -- 
 expect "eventfd keeps its fd number in a forked child" 0 "eventfd fork OK" -- run -v "$GUEST" python:3.12-alpine python3 /t/eventfdfork.py
 expect "seccomp: a filter here and in an exec'd child" 0 "seccomp OK child filtered 2" -- run -v "$GUEST" python:3.12 python3 /t/seccomptest.py
 expect "debian: pty (openpty, pty.fork)" 0 "pty OK" -- run -v "$GUEST" python:3.12 python3 /t/ptytest.py
+expect "a MAP_SHARED mapping past EOF sees the file grow (bbolt)" 0 "grown b'a' b'b'" -- run -v "$GUEST" python:3.12 python3 /t/mmapgrow.py
 expect "FIFOs: mkfifo, open waits, ENXIO, poll" 0 "fifo OK 0o600 through the fifo" -- run -v "$GUEST" python:3.12 python3 /t/fifotest.py
 expect "exec with a 5000-byte argument (MAX_ARG_STRLEN, not PATH_MAX)" 0 "5001" -- run alpine sh -c 'a=$(printf "%05000d" 0); /bin/echo "$a" | wc -c'
 expect "FIFOs in a shell loop" 0 "got round 2" -- run alpine sh -c 'mkfifo /tmp/p; for i in 1 2; do (echo round $i > /tmp/p &); read line < /tmp/p; echo "got $line"; done'
