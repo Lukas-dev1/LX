@@ -986,6 +986,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
+        127 => signal::sigpending(a[0], a[1]),
         131 => signal::sigaltstack(a[0], a[1], c.rsp),
         7 => fs::poll(a[0], a[1], a[2] as i32 as i64),
         23 => fs::select(a[0], a[1], a[2], a[3], timeval_ms(a[4])),   // ponytail: the timeout isn't updated
@@ -1214,6 +1215,18 @@ pub fn cstr_max(addr: u64, max: usize) -> Result<String, i64> {
     let p = addr as *const u8;
     let len = (0..max).find(|&i| unsafe { *p.add(i) } == 0).ok_or(E2BIG)?;
     Ok(String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned())
+}
+
+/// Copy `bytes` to guest memory at `addr`, or EFAULT if it isn't mapped writable: through the kernel,
+/// which probes the address, so a bad pointer from the guest is an error rather than a fault in lx.
+/// For small results the guest may point anywhere (LTP's EFAULT checks); bulk copies don't need it.
+pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
+    unsafe extern "system" {
+        fn WriteProcessMemory(p: isize, addr: *mut std::ffi::c_void, buf: *const u8, n: usize, done: *mut usize) -> i32;
+    }
+    let mut done = 0usize;
+    let ok = unsafe { WriteProcessMemory(GetCurrentProcess(), addr as *mut _, bytes.as_ptr(), bytes.len(), &mut done) };
+    if ok != 0 && done == bytes.len() { Ok(0) } else { Err(EFAULT) }
 }
 
 // Guest buffers go straight to the NT kernel, which probes them: a bad pointer is an error, not a crash.

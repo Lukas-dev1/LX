@@ -127,6 +127,16 @@ pub fn raise(sig: u64) -> R {
     Ok(0)
 }
 
+/// rt_sigpending: the signals pending for this thread or the process that its mask blocks.
+pub fn sigpending(set: u64, size: u64) -> R {
+    if size > 8 {
+        return Err(EINVAL);
+    }
+    let s = S.lock().unwrap();
+    let pending = (s.pending | crate::syscall::ts().tpending.load(SeqCst)) & mask();
+    crate::syscall::put_guest(set, &pending.to_le_bytes())
+}
+
 pub fn deliverable() -> bool {
     let s = S.lock().unwrap();
     (s.pending | crate::syscall::ts().tpending.load(SeqCst)) & !mask() != 0
