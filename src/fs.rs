@@ -1293,6 +1293,17 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
 
 /// Drop every fd (closing the handles). Used by a process that has exec'd and only waits now,
 /// so it doesn't hold pipe ends open.
+/// execve: fds marked FD_CLOEXEC go, the rest stay.
+pub fn close_cloexec() {
+    with(|fs| {
+        for slot in fs.fds.iter_mut() {
+            if slot.as_ref().is_some_and(|s| s.cloexec) {
+                *slot = None;
+            }
+        }
+    })
+}
+
 pub fn close_all() {
     // try_lock: after execve stopped the other threads, one of them may have died holding this lock.
     if let Ok(mut g) = FS.try_lock() && let Some(fs) = g.as_mut() {

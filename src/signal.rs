@@ -822,6 +822,19 @@ pub fn timer_delete(id: u64) -> R {
     Ok(0)
 }
 
+/// execve in place: handlers go back to the default (ignored signals stay ignored, the mask and pending
+/// signals stay), POSIX timers are deleted, the alternate stack is gone.
+pub fn reset_for_exec() {
+    for a in S.lock().unwrap().actions.iter_mut() {
+        if a.handler > 1 {
+            *a = DFL;
+        }
+    }
+    PTIMERS.lock().unwrap().clear(); // their threads see their slots gone and end
+    PTIMER_WAKE.notify_all();
+    crate::syscall::ts().altstack = None;
+}
+
 /// `TERM`, `SIGTERM`, `15` -> 15.
 pub fn parse(name: &str) -> Option<u64> {
     const NAMES: [&str; 31] = ["HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2",
