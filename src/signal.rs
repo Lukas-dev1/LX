@@ -169,43 +169,51 @@ pub fn send_thread(tid: u64, sig: u64) -> R {
     let handled = S.lock().unwrap().actions[sig as usize].handler > 1;
     if handled && t.sigmask & bit(sig) == 0 && wtid != unsafe { crate::win::GetCurrentThreadId() } {
         let h = if wtid == main { GUEST_THREAD.load(SeqCst) } else { crate::thread::handle_of(wtid) };
-        kick(h);
+        kick(h, t);
     }
     Ok(0)
 }
 
 /// Make a thread that is running guest code take its pending signal now, as Linux interrupts a running
-/// thread: suspended, and if it's in guest code (not in lx or a Windows DLL, where it'll take the signal
-/// as its syscall returns or its wait wakes), it gets the trap flag. After one more guest instruction it
-/// raises a single-step exception on itself, and the exception handler delivers the signal there with the
-/// thread's whole context (syscall::veh_body). Spinning loops (`while (!flag)`), Go's preemption and GC
-/// suspension signals need it.
-fn kick(h: isize) {
+/// thread. It's suspended, and if it's in guest code (not in lx or a Windows DLL, where it takes the
+/// signal as its syscall returns or its wait wakes) it is sent to lx_kick_entry: in by the direct syscall
+/// path, which moves to the thread's lx stack before touching memory, saves every register and the vector
+/// state, delivers, and returns where it was. Nothing is written below the guest's rsp but the signal
+/// frame (Go's goroutine stacks are a few KB, packed together). Spinning loops (`while (!flag)`), Go's
+/// preemption and GC suspension signals need it.
+fn kick(h: isize, t: &crate::syscall::ThreadState) {
     unsafe extern "system" {
         fn SuspendThread(h: isize) -> u32;
         fn GetThreadContext(h: isize, c: *mut u8) -> i32;
         fn SetThreadContext(h: isize, c: *const u8) -> i32;
     }
     #[repr(C, align(16))]
-    struct Ctx([u8; 1232]); // CONTEXT; ContextFlags at 0x30, EFlags at 0x44, Rip at 0xf8
-    if h == 0 {
-        return;
+    struct Ctx([u8; 1232]); // CONTEXT: ContextFlags 0x30, Rcx 0x80, R11 0xd0, Rip 0xf8
+    if h == 0 || t.kicked.load(SeqCst) {
+        return; // not a guest thread, or a kick on its way already
     }
     let mut c = Ctx([0; 1232]);
-    c.0[0x30..0x34].copy_from_slice(&0x0010_0001u32.to_le_bytes()); // CONTEXT_AMD64 | CONTEXT_CONTROL
+    c.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes()); // CONTEXT_AMD64 | CONTROL | INTEGER
+    let q = |c: &Ctx, o: usize| u64::from_le_bytes(c.0[o..o + 8].try_into().unwrap());
     unsafe {
         if SuspendThread(h) == u32::MAX {
             return;
         }
         if GetThreadContext(h, c.0.as_mut_ptr()) != 0 {
-            let rip = u64::from_le_bytes(c.0[0xf8..0x100].try_into().unwrap());
+            let rip = q(&c, 0xf8);
             let mut m = crate::win::MemoryBasicInformation::default();
             crate::win::VirtualQuery(rip as *const _, &mut m, std::mem::size_of::<crate::win::MemoryBasicInformation>());
             const MEM_IMAGE: u32 = 0x100_0000;
-            if m.state == 0x1000 && m.ty != MEM_IMAGE {
-                let fl = u32::from_le_bytes(c.0[0x44..0x48].try_into().unwrap()) | 0x100; // TF
-                c.0[0x44..0x48].copy_from_slice(&fl.to_le_bytes());
-                SetThreadContext(h, c.0.as_ptr());
+            if m.state == 0x1000 && m.ty != MEM_IMAGE && !t.on_host() {
+                for (i, o) in [0xf8, 0x80, 0xd0].into_iter().enumerate() {
+                    t.kick[i].store(q(&c, o), SeqCst);
+                }
+                t.kicked.store(true, SeqCst);
+                c.0[0xf8..0x100].copy_from_slice(&crate::syscall::kick_entry_addr().to_le_bytes());
+                c.0[0x30..0x34].copy_from_slice(&0x0010_0001u32.to_le_bytes()); // set only CONTROL
+                if SetThreadContext(h, c.0.as_ptr()) == 0 {
+                    t.kicked.store(false, SeqCst);
+                }
             }
         }
         crate::win::ResumeThread(h);
@@ -478,7 +486,9 @@ fn arrive(sig: u64) {
     crate::syscall::wake_futex_waiters();
     cancel_io();
     if S.lock().unwrap().actions[sig as usize].handler > 1 && MAIN_MASK.load(Relaxed) & bit(sig) == 0 {
-        kick(GUEST_THREAD.load(SeqCst)); // in case it's spinning in guest code
+        if let Some(t) = crate::syscall::ts_of(crate::thread::MAIN_TID.load(Relaxed)) {
+            kick(GUEST_THREAD.load(SeqCst), t); // in case it's spinning in guest code
+        }
     }
 }
 
