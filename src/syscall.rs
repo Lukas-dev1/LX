@@ -997,6 +997,11 @@ pub static IN_SYSCALL: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), A
 
 fn dispatch(c: &mut Context) -> i64 {
     let a = [c.rdi, c.rsi, c.rdx, c.r10, c.r8, c.r9];
+    // mmap, mprotect, munmap, mremap, brk, shmat/shmdt, truncate/ftruncate (views re-mapped): what a
+    // page that put_guest checked once may no longer be.
+    if matches!(c.rax, 9 | 10 | 11 | 12 | 25 | 30 | 67 | 76 | 77) {
+        MAP_GEN.fetch_add(1, Relaxed);
+    }
     for (slot, v) in IN_SYSCALL.iter().zip([c.rax + 1, a[0], a[1], a[2]]) {
         slot.store(v, Relaxed);
     }
@@ -1308,6 +1313,16 @@ pub fn cstr_max(addr: u64, max: usize) -> Result<String, i64> {
 /// may point anywhere (LTP's EFAULT checks); bulk copies go through ReadFile, which probes itself.
 pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
     let end = addr.checked_add(bytes.len() as u64).ok_or(EFAULT)?;
+    // The hot callers (clock_gettime, gettimeofday: lx has no vDSO) write the same page again and again:
+    // once checked, it stays writable until the map changes (MAP_GEN), so skip the VirtualQuery.
+    thread_local!(static CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) });
+    let page = addr & !(PAGE - 1);
+    let same_page = end > addr && (end - 1) & !(PAGE - 1) == page;
+    let epoch = MAP_GEN.load(Relaxed);
+    if same_page && CHECKED.get() == (page, epoch) {
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+        return Ok(0);
+    }
     let mut p = addr;
     while p < end {
         let mut m = MemoryBasicInformation::default();
@@ -1317,9 +1332,15 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
         }
         p = (m.base + m.region_size) as u64; // usually one query: the result fits one region
     }
+    if same_page {
+        CHECKED.set((page, epoch));
+    }
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
     Ok(0)
 }
+
+/// Bumped by every syscall that changes the address space (see dispatch): put_guest's page cache.
+static MAP_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// Read `N` bytes of guest memory at `addr`, or EFAULT unless every page is committed and readable.
 pub fn get_guest<const N: usize>(addr: u64) -> Result<[u8; N], i64> {
@@ -2046,7 +2067,10 @@ fn clock_gettime(clock: u64, ts: u64) -> R {
         return Err(EINVAL);
     }
     let (s, ns) = now(clock);
-    put_guest(ts, &as_bytes(&[s, ns]))
+    let mut b = [0u8; 16]; // no allocation: this is the most frequent syscall (no vDSO)
+    b[..8].copy_from_slice(&s.to_le_bytes());
+    b[8..].copy_from_slice(&ns.to_le_bytes());
+    put_guest(ts, &b)
 }
 
 fn gettimeofday(tv: u64, tz: u64) -> R {
