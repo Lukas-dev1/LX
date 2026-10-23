@@ -193,6 +193,7 @@ rm -rf rootfs/volumes/lxtest-named; mkdir -p rootfs/volumes/lxtest-named
 expect "named volume: modes kept" 0 "600 1:2" -- run -v "$ROOT/rootfs/volumes/lxtest-named:/data" alpine sh -c 'touch /data/f; chmod 600 /data/f; chown 1:2 /data/f; stat -c "%a %u:%g" /data/f'
 expect "container layer: changes stay in the run" 0 "done" -- run alpine sh -c 'rm -f /etc/motd; echo x > /etc/new; echo done'
 expect "container layer: next run starts pristine" 0 "pristine" -- run alpine sh -c '[ -f /etc/motd ] && [ ! -e /etc/new ] && echo pristine'
+expect "a dir moved over a deleted image tree doesn't show the image's old contents" 0 "hidden" -- run alpine sh -c 'mv /usr/share /tmp/gone && mkdir /usr/share && mkdir /tmp/d && mv /tmp/d /usr/share/apk && if [ -e /usr/share/apk/keys ]; then echo LEAK; else echo hidden; fi'
 [ "$before" = "$(img_sum)" ] && ok "image store unchanged by containers" || bad "image store unchanged by containers"
 
 # ---- repeated runs: every run must print OK; the trap fallback and FS faults must stay unused ----
