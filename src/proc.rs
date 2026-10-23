@@ -70,9 +70,6 @@ pub fn pid() -> u32 {
     }
 }
 
-/// The container's first process (whose lx is LX_IN_JOB). The guest sees it as pid 1, as in Docker:
-/// s6-overlay, tini and dumb-init insist on being pid 1. lx keeps the real pids inside (signal mailboxes
-/// are named by them); `guest_pid` and `host_pid` translate at the syscall boundary.
 /// Windows exit code of an lx process a signal killed: this tag | the signal, so wait4 reports
 /// WIFSIGNALED. The container's first process (what Windows and Docker see) exits 128 + signal instead.
 pub const SIGNALED: u32 = 0x4C58_0000;
@@ -82,6 +79,9 @@ pub fn die(sig: u64) -> ! {
     exit(SIGNALED as u64 | (sig & 0x7f))
 }
 
+/// The container's first process (whose lx is LX_IN_JOB). The guest sees it as pid 1, as in Docker:
+/// s6-overlay, tini and dumb-init insist on being pid 1. lx keeps the real pids inside (signal mailboxes
+/// are named by them); `guest_pid` and `host_pid` translate at the syscall boundary.
 fn root() -> u32 {
     static ROOT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *ROOT.get_or_init(|| std::env::var("LX_IN_JOB").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
