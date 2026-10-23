@@ -51,6 +51,13 @@ fn in_reach(a: u64, b: u64) -> bool {
 }
 
 /// A stub area within rel32 reach of [lo, hi) with `need` free bytes, creating one if necessary.
+/// Whether `rip` is in one of our stub areas (or we can't tell right now: another thread is rewriting).
+/// signal::kick doesn't stop a thread there: an FS stub parks rax in the thread's scratch slot, which a
+/// handler's own stubs would overwrite.
+pub fn in_stub(rip: u64) -> bool {
+    S.try_lock().map_or(true, |s| s.areas.iter().any(|a| (a.base..a.base + a.size).contains(&rip)))
+}
+
 fn area_near(s: &mut State, lo: u64, hi: u64, need: u64) -> Option<usize> {
     if let Some(i) = s.areas.iter().position(|a| in_reach(a.base, lo) && in_reach(a.base + a.size, hi) && a.size - a.used >= need) {
         return Some(i);

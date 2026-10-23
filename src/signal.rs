@@ -181,32 +181,47 @@ pub fn send_thread(tid: u64, sig: u64) -> R {
 /// state, delivers, and returns where it was. Nothing is written below the guest's rsp but the signal
 /// frame (Go's goroutine stacks are a few KB, packed together). Spinning loops (`while (!flag)`), Go's
 /// preemption and GC suspension signals need it.
+#[repr(C, align(16))]
+struct Ctx([u8; 1232]); // CONTEXT: ContextFlags 0x30, Rcx 0x80, R11 0xd0, Rip 0xf8
+
 fn kick(h: isize, t: &crate::syscall::ThreadState) {
+    if h == 0 || t.kicked.load(SeqCst) {
+        return; // not a guest thread, or a kick on its way already
+    }
+    let q = |c: &Ctx, o: usize| u64::from_le_bytes(c.0[o..o + 8].try_into().unwrap());
+    // Inside a stub the thread leaves it within a few instructions: let it run a moment, then look again.
+    for _ in 0..20 {
+        let mut c = Ctx([0; 1232]);
+        c.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes()); // CONTEXT_AMD64 | CONTROL | INTEGER
+        if !unsafe { kick_once(h, t, &mut c, q) } {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// One try of kick: false when done (kicked, or nothing to do), true to try again (it was in a stub).
+unsafe fn kick_once(h: isize, t: &crate::syscall::ThreadState, c: &mut Ctx, q: impl Fn(&Ctx, usize) -> u64) -> bool {
     unsafe extern "system" {
         fn SuspendThread(h: isize) -> u32;
         fn GetThreadContext(h: isize, c: *mut u8) -> i32;
         fn SetThreadContext(h: isize, c: *const u8) -> i32;
     }
-    #[repr(C, align(16))]
-    struct Ctx([u8; 1232]); // CONTEXT: ContextFlags 0x30, Rcx 0x80, R11 0xd0, Rip 0xf8
-    if h == 0 || t.kicked.load(SeqCst) {
-        return; // not a guest thread, or a kick on its way already
-    }
-    let mut c = Ctx([0; 1232]);
-    c.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes()); // CONTEXT_AMD64 | CONTROL | INTEGER
-    let q = |c: &Ctx, o: usize| u64::from_le_bytes(c.0[o..o + 8].try_into().unwrap());
+    let mut again = false;
     unsafe {
         if SuspendThread(h) == u32::MAX {
-            return;
+            return false;
         }
         if GetThreadContext(h, c.0.as_mut_ptr()) != 0 {
-            let rip = q(&c, 0xf8);
+            let rip = q(c, 0xf8);
             let mut m = crate::win::MemoryBasicInformation::default();
             crate::win::VirtualQuery(rip as *const _, &mut m, std::mem::size_of::<crate::win::MemoryBasicInformation>());
             const MEM_IMAGE: u32 = 0x100_0000;
-            if m.state == 0x1000 && m.ty != MEM_IMAGE && !t.on_host() {
+            let guest = m.state == 0x1000 && m.ty != MEM_IMAGE && !t.on_host();
+            again = guest && crate::jump::in_stub(rip);
+            if guest && !again {
                 for (i, o) in [0xf8, 0x80, 0xd0].into_iter().enumerate() {
-                    t.kick[i].store(q(&c, o), SeqCst);
+                    t.kick[i].store(q(c, o), SeqCst);
                 }
                 t.kicked.store(true, SeqCst);
                 c.0[0xf8..0x100].copy_from_slice(&crate::syscall::kick_entry_addr().to_le_bytes());
@@ -218,6 +233,7 @@ fn kick(h: isize, t: &crate::syscall::ThreadState) {
         }
         crate::win::ResumeThread(h);
     }
+    again
 }
 
 // ---- signalfd ----
