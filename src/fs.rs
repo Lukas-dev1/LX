@@ -1549,7 +1549,7 @@ fn tty_ioctl(h: isize, req: u64, arg: u64) -> R {
             Ok(0)
         }
         TIOCGPGRP => {
-            unsafe { *(arg as *mut i32) = crate::proc::getpid().unwrap_or(0) as i32 };
+            unsafe { *(arg as *mut i32) = crate::proc::getpgid(0).unwrap_or(0) as i32 };
             Ok(0)
         }
         TIOCSCTTY | TIOCSPGRP | TIOCSWINSZ => Ok(0),
@@ -1842,7 +1842,7 @@ fn pts_read(p: &Pipe, buf: u64, len: u64) -> R {
     let mut n = n as usize;
     let vintr = (t[4] >> 8) as u8; // c_cc[VINTR], after c_line
     if t[3] & ISIG != 0 && data.contains(&vintr) {
-        // ponytail: the signal goes to the reader, not the foreground process group lx doesn't track.
+        // ponytail: to the reader's process group, taken to be the foreground one (TIOCSPGRP isn't kept).
         n = 0;
         for i in 0..data.len() {
             if data[i] != vintr {
@@ -1850,7 +1850,7 @@ fn pts_read(p: &Pipe, buf: u64, len: u64) -> R {
                 n += 1;
             }
         }
-        let _ = crate::signal::raise(2);
+        let _ = crate::proc::kill(0, 2);
         if n == 0 {
             return Err(crate::syscall::EINTR); // not EOF: a handler (SA_RESTART) reads on
         }

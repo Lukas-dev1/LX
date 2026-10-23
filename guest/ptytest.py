@@ -49,4 +49,23 @@ os.write(fd, b"\x03")
 os.read(fd, 100)  # "INT "
 os.write(fd, b"ok\r")
 assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 3
+
+# ^C goes to the whole process group: a grandchild sleeping in it dies of SIGINT too.
+pid, fd = pty.fork()
+if pid == 0:
+    import signal, time
+    r, w = os.pipe()
+    g = os.fork()
+    if g == 0:
+        os.write(w, b"g")
+        time.sleep(30)
+        os._exit(0)
+    os.read(r, 1)  # the grandchild runs
+    signal.signal(signal.SIGINT, lambda *_: os._exit(100 + (os.waitpid(g, 0)[1] & 0x7f)))
+    os.write(1, b"ready ")
+    while True:
+        os.read(0, 10)
+os.read(fd, 100)
+os.write(fd, b"\x03")
+assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 102
 print("pty OK")
