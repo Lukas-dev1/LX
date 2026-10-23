@@ -2714,6 +2714,31 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
     })
 }
 
+/// F_GETPIPE_SZ / F_SETPIPE_SZ: a pipe's capacity as the guest set it (64 KB until then). Linux rounds a
+/// request up to a power-of-two number of pages; more than /proc/sys/fs/pipe-max-size (1 MB) is EPERM
+/// without CAP_SYS_RESOURCE.
+/// ponytail: only remembered (NT's own pipe buffer doesn't change), per pipe end rather than per pipe,
+/// keyed by the end's handle and never forgotten, so a reused handle value starts with the old size;
+/// no EBUSY for shrinking below the queued data.
+fn pipe_size(fd: u64, set: Option<u64>) -> R {
+    static SIZES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+    let key = with(|fs| match fs.fd(fd)? {
+        Fd::Pipe(p) if p.pty.is_none() => Ok(p.raw() as usize),
+        _ => Err(EBADF),
+    }).map_err(|_| EINVAL)?;
+    let mut sizes = SIZES.lock().unwrap();
+    let sizes = sizes.get_or_insert_with(HashMap::new);
+    match set {
+        None => Ok(*sizes.get(&key).unwrap_or(&65536) as i64),
+        Some(n) if n > 1 << 20 => Err(crate::syscall::EPERM),
+        Some(n) => {
+            let n = n.max(4096).next_power_of_two();
+            sizes.insert(key, n);
+            Ok(n as i64)
+        }
+    }
+}
+
 pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
     match cmd {
         5 | 6 | 7 | 36 | 37 | 38 => posix_lock(fd, cmd, arg), // F_GETLK/SETLK/SETLKW and the OFD variants
@@ -2730,6 +2755,10 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         }),
         // F_SETFL / F_GETFL: O_NONBLOCK matters for sockets. ponytail: ignored on pipes and files.
         8 => with(|fs| fs.fd(fd).map(|_| 0)), // F_SETOWN: only matters for SIGIO, which we don't send
+        // F_SETSIG / F_GETSIG: which signal SIGIO would be. ponytail: no SIGIO, so it's only checked.
+        10 => if arg > 64 { Err(EINVAL) } else { with(|fs| fs.fd(fd).map(|_| 0)) },
+        11 => with(|fs| fs.fd(fd).map(|_| 0)),
+        1031 | 1032 => pipe_size(fd, (cmd == 1031).then_some(arg)), // F_SETPIPE_SZ, F_GETPIPE_SZ
         4 => with(|fs| match fs.fd(fd)? {
             Fd::Socket(s) => { s.set_nonblocking(arg & O_NONBLOCK != 0); Ok(0) }
             Fd::Event(e) => { e.nonblock.store(arg & O_NONBLOCK != 0, std::sync::atomic::Ordering::Relaxed); Ok(0) }
