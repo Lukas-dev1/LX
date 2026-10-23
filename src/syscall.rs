@@ -1217,16 +1217,23 @@ pub fn cstr_max(addr: u64, max: usize) -> Result<String, i64> {
     Ok(String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned())
 }
 
-/// Copy `bytes` to guest memory at `addr`, or EFAULT if it isn't mapped writable: through the kernel,
-/// which probes the address, so a bad pointer from the guest is an error rather than a fault in lx.
-/// For small results the guest may point anywhere (LTP's EFAULT checks); bulk copies don't need it.
+/// Copy `bytes` to guest memory at `addr`, or EFAULT unless every page it covers is committed and
+/// writable: a bad pointer from the guest is an error rather than a fault inside lx, and read-only
+/// guest memory (text, .rodata, PROT_READ maps) isn't written, as on Linux. For small results the guest
+/// may point anywhere (LTP's EFAULT checks); bulk copies go through ReadFile, which probes itself.
 pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
-    unsafe extern "system" {
-        fn WriteProcessMemory(p: isize, addr: *mut std::ffi::c_void, buf: *const u8, n: usize, done: *mut usize) -> i32;
+    let end = addr.checked_add(bytes.len() as u64).ok_or(EFAULT)?;
+    let mut p = addr;
+    while p < end {
+        let mut m = MemoryBasicInformation::default();
+        if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0
+            || m.state != MEM_COMMIT || !matches!(m.protect, 0x04 | 0x08 | 0x40 | 0x80) {
+            return Err(EFAULT);
+        }
+        p = (m.base + m.region_size) as u64; // usually one query: the result fits one region
     }
-    let mut done = 0usize;
-    let ok = unsafe { WriteProcessMemory(GetCurrentProcess(), addr as *mut _, bytes.as_ptr(), bytes.len(), &mut done) };
-    if ok != 0 && done == bytes.len() { Ok(0) } else { Err(EFAULT) }
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+    Ok(0)
 }
 
 /// u64s as the guest's little-endian bytes, for put_guest.
