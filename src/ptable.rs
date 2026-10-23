@@ -106,7 +106,13 @@ fn claim(pid: u32) -> Option<&'static mut Slot> {
         }
         all(); // frees dead slots
     }
-    None
+    // Still full: zombies of a parent that never waits. The oldest one gives up its slot, rather than a
+    // new process going unseen in /proc (Linux would just list many Z).
+    let oldest = table()?.filter(|&p| unsafe { (*p).pid.load(SeqCst) != 0 && !alive((*p).win.load(SeqCst)) })
+        .min_by_key(|&p| unsafe { (*p).start_ms })?;
+    let s = unsafe { &*oldest };
+    free(s, s.win.load(SeqCst));
+    claim(pid)
 }
 
 /// Free slot `s` whose process ran as `win` (unless someone else freed or reclaimed it meanwhile).
