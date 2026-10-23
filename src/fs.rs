@@ -26,8 +26,8 @@ const SOCK_MAGIC: &[u8] = b"\0lxsock\0";
 const FIFO_MAGIC: &[u8] = b"\0lxfifo\0";
 const FIFO_LEN: u64 = 16;
 
-fn fifo_id(host: &Path) -> Option<u64> {
-    if !attrs(host).is_some_and(|m| !m.dir && m.len == FIFO_LEN && may_be_marker(host, &m)) {
+fn fifo_id(host: &Path, m: &Attrs) -> Option<u64> {
+    if m.dir || m.len != FIFO_LEN || !may_be_marker(host, m) {
         return None;
     }
     let d = fs::read(host).ok()?;
@@ -925,13 +925,18 @@ impl Fs {
     /// ponytail: an NTFS reparse point placed inside the rootfs by someone else would still be followed by
     /// Windows; the AppContainer boundary (DESIGN.md §7) covers that.
     pub fn resolve(&self, dir: &str, path: &str, follow: bool) -> Result<(String, PathBuf), i64> {
+        self.resolve_attrs(dir, path, follow).map(|(g, h, _)| (g, h))
+    }
+
+    /// resolve, also giving the result's attributes (None: it doesn't exist), as the lookup found them.
+    fn resolve_attrs(&self, dir: &str, path: &str, follow: bool) -> Result<(String, PathBuf, Option<Attrs>), i64> {
         if path.is_empty() {
             return Err(ENOENT);
         }
         let mut todo = split(path);
         let mut comps: Vec<String> = if path.starts_with('/') { vec![] } else { split(dir).into() };
         let mut hops = 0;
-        let mut last: Option<PathBuf> = None; // host(comps), when the loop already worked it out
+        let mut last: Option<(PathBuf, Option<Attrs>)> = None; // host_meta(comps), when the loop already worked it out
         // Whether the upper layer has no directory at comps (the parent of the next component): then it
         // holds nothing below it either, no entries and no whiteouts, and only the image needs asking.
         // Most lookups are of image files, and this saves ~3 of ~4 host calls per component.
@@ -964,12 +969,12 @@ impl Fs {
                     next.extend(todo.drain(..));
                     todo = next;
                 } else {
-                    last = Some(host);
+                    last = Some((host, meta));
                 }
             }
         }
-        let host = last.unwrap_or_else(|| self.host_meta_below(&comps, not_in_upper).0);
-        Ok((format!("/{}", comps.join("/")), host))
+        let (host, meta) = last.unwrap_or_else(|| self.host_meta_below(&comps, not_in_upper));
+        Ok((format!("/{}", comps.join("/")), host, meta))
     }
 
     /// host_meta(), knowing whether the upper layer lacks the parent directory: then only the image is
@@ -1015,10 +1020,14 @@ impl Fs {
     }
 
     fn at(&self, dirfd: u64, path: u64, follow: bool) -> Result<(String, PathBuf), i64> {
+        self.at_attrs(dirfd, path, follow).map(|(g, h, _)| (g, h))
+    }
+
+    fn at_attrs(&self, dirfd: u64, path: u64, follow: bool) -> Result<(String, PathBuf, Option<Attrs>), i64> {
         let path = cstr(path)?;
         // An absolute path ignores dirfd, even an invalid one (mariadb passes -1).
         let dir = if path.starts_with('/') { String::new() } else { self.dir_of(dirfd)? };
-        self.resolve(&dir, &path, follow)
+        self.resolve_attrs(&dir, &path, follow)
     }
 
     fn fd(&mut self, fd: u64) -> Result<&mut Fd, i64> {
@@ -2118,11 +2127,11 @@ fn scratch_file(fs: &Fs, bytes: &[u8]) -> io::Result<(File, PathBuf)> {
 
 pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
     let cloexec = flags & O_CLOEXEC != 0;
-    let (guest, host) = with(|fs| fs.at(dirfd, path, flags & O_NOFOLLOW == 0))?;
+    let (guest, host, meta) = with(|fs| fs.at_attrs(dirfd, path, flags & O_NOFOLLOW == 0))?;
     if let Some(n) = fd_alias(&guest) {
         return dup(n, 0, cloexec);
     }
-    if let Some(id) = fifo_id(&host) {
+    if let Some(id) = meta.and_then(|m| fifo_id(&host, &m)) {
         return open_fifo(id, flags); // outside the fs lock: it may wait for the other end
     }
     if guest == "/dev/tty" {
@@ -2143,24 +2152,27 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
             let (f, host) = scratch_file(fs, text.as_bytes()).map_err(errno)?;
             return Ok(fs.add(Fd::File { f, host }, 0, cloexec));
         }
-        let (guest, mut host) = fs.at(dirfd, path, flags & O_NOFOLLOW == 0)?;
+        let mut host = host;
         if proc_dir(&guest).is_some() {
             if flags & 3 != 0 { return Err(EISDIR) }
             return Ok(fs.add(Fd::Dir { guest, pos: 0 }, 0, cloexec));
         }
-        let meta = fs::metadata(&host);
+        if meta.is_none() && flags & O_CREAT == 0 {
+            return Err(ENOENT); // the lookup just found nothing: no host open to fail
+        }
+        let is_dir = meta.is_some_and(|m| m.dir);
         let acc = flags & 3;
         let changes = acc != 0 || flags & (O_CREAT | O_TRUNC) != 0;
-        if changes && !meta.as_ref().is_ok_and(|m| m.is_dir()) {
+        if changes && !is_dir {
             // Copy the image's file up unless it's about to be truncated anyway.
             host = fs.writable(&split(&guest).into_iter().collect::<Vec<_>>(), flags & O_TRUNC == 0)?;
         }
-        let fd = if meta.as_ref().is_ok_and(|m| m.is_dir()) {
+        let fd = if is_dir {
             if acc != 0 { return Err(EISDIR) }
             Fd::Dir { guest, pos: 0 }
         } else {
             if flags & O_DIRECTORY != 0 {
-                return Err(if meta.is_ok() { ENOTDIR } else { ENOENT });
+                return Err(if meta.is_some() { ENOTDIR } else { ENOENT });
             }
             let excl = flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL;
             if acc == 0 && flags & O_CREAT != 0 {
@@ -2177,7 +2189,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
                 .create_new(excl && acc != 0)
                 .open(&host)
                 .map_err(errno)?;
-            if flags & O_CREAT != 0 && meta.is_err() && fs.keeps_meta(&comps_of(&guest)) {
+            if flags & O_CREAT != 0 && meta.is_none() && fs.keeps_meta(&comps_of(&guest)) {
                 let _ = set_meta(&host, new_meta(mode));
             }
             Fd::File { f, host }
@@ -2778,13 +2790,17 @@ pub fn fchmeta(fd: u64, mode: Option<u64>, owner: Option<(u64, u64)>) -> R {
 }
 
 fn stat_of(host: &Path) -> Result<[u64; 18], i64> {
-    let m = attrs(host).ok_or(ENOENT)?;
+    stat_of_attrs(host, attrs(host).ok_or(ENOENT)?)
+}
+
+/// stat_of with the entry's attributes already looked up (by resolve).
+fn stat_of_attrs(host: &Path, m: Attrs) -> Result<[u64; 18], i64> {
     let link = link_target(host, &m);
     let sock = !m.dir && m.len == SOCK_MAGIC.len() as u64 && may_be_marker(host, &m) && fs::read(host).is_ok_and(|d| d == SOCK_MAGIC);
     let (mode, size, nlink) = match &link {
         _ if m.dir => (0o040755, 4096, 2),
         _ if sock => (0o140755, 0, 1), // S_IFSOCK
-        _ if fifo_id(host).is_some() => (0o010644, 0, 1), // S_IFIFO
+        _ if fifo_id(host, &m).is_some() => (0o010644, 0, 1), // S_IFIFO
         Some(t) => (0o120777, t.len() as u64, 1),
         None => (0o100755, m.len, 1),
     };
@@ -2863,7 +2879,7 @@ pub fn fstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> R {
     if flags & AT_EMPTY_PATH != 0 && cstr(path)?.is_empty() {
         return fstat(dirfd, buf);
     }
-    let (guest, host) = with(|fs| fs.at(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0))?;
+    let (guest, host, meta) = with(|fs| fs.at_attrs(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0))?;
     if let Some(d) = Dev::of(&guest) {
         return put_stat(buf, d.stat());
     }
@@ -2889,7 +2905,7 @@ pub fn fstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> R {
         (s[1], s[2], s[3], s[6], s[7]) = (ino(&host), 1, 0o120777, t.len() as u64, 4096); // a symlink
         return put_stat(buf, s);
     }
-    let mut s = stat_of(&host)?;
+    let mut s = stat_of_attrs(&host, meta.ok_or(ENOENT)?)?;
     if s[3] & 0o170000 == 0o100000 && with(|fs| fs.upper.as_ref().is_some_and(|u| host.starts_with(u)) || fs.mounts.iter().any(|m| host.starts_with(&m.host))) {
         s[2] = links(&host); // the guest's own hard links (shadow's lock checks for 2)
     }
