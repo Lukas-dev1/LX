@@ -723,6 +723,12 @@ fn write_link(host: &Path, target: &str) -> io::Result<()> {
 /// The container's layer roots (upper, then image), for ino().
 static LAYER_ROOTS: std::sync::RwLock<Vec<PathBuf>> = std::sync::RwLock::new(Vec::new());
 
+/// Is `host` in the image under a container layer (read-only, its files shared between image copies)?
+fn in_image(host: &Path) -> bool {
+    let roots = LAYER_ROOTS.read().unwrap();
+    roots.len() == 2 && host.starts_with(&roots[1])
+}
+
 /// An inode number for a host path: a hash of its path inside its layer, so copying an image entry up
 /// into the container's layer keeps its number (GNU tar compares a directory's dev/ino before and after
 /// extracting into it: "Directory renamed before its status could be extracted", wordpress).
@@ -2985,6 +2991,14 @@ pub fn fstat(fd: u64, buf: u64) -> R {
                 (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
             }
             with_meta(&mut s, host);
+            // The guest's own hard links, as fstatat counts them: not an image file's (hard-linked between
+            // image copies, which the guest must not see).
+            if !in_image(host) {
+                let mut info = [0u32; 13];
+                if unsafe { crate::win::GetFileInformationByHandle(f.as_raw_handle() as isize, &mut info) } != 0 {
+                    s[2] = info[10].max(1) as u64; // nNumberOfLinks
+                }
+            }
             Ok(s)
         }
         Fd::Dir { guest, .. } => {
