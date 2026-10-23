@@ -2623,6 +2623,119 @@ fn release(h: isize, start: u64, len: u64) -> Vec<(u64, u64, bool)> {
     removed
 }
 
+// ---- who holds a POSIX lock (F_GETLK) ----
+//
+// NT's byte-range locks don't say who holds them, and F_GETLK must report the holder's type, range and
+// pid (lslocks, "already running as pid N" checks, LTP fcntl11-21). Each process publishes its locks on
+// a file in a small shared table named after it, rewritten after each change; readers skip entries of
+// processes that have exited. ponytail: 64 entries per file (a lock past them goes unreported); keyed by
+// path, so hard links to one file get separate tables.
+
+const LOCK_SLOTS: usize = 64;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Published {
+    start: u64,
+    len: u64,
+    /// Windows pid (0: free slot), for "still alive"; and the pid the guest sees.
+    win: u32,
+    pid: u32,
+    excl: u32,
+    _pad: u32,
+}
+
+/// The shared table for the file at `host` and the mutex guarding it (both kept open for the process).
+fn lock_table(host: &Path) -> Option<(isize, &'static mut [Published; LOCK_SLOTS])> {
+    use crate::win::*;
+    unsafe extern "system" {
+        fn CreateMutexW(attr: *mut std::ffi::c_void, owner: i32, name: *const u16) -> isize;
+    }
+    static TABLES: Mutex<Vec<(PathBuf, isize, usize)>> = Mutex::new(Vec::new());
+    let mut tables = TABLES.lock().unwrap();
+    if let Some(&(_, m, view)) = tables.iter().find(|(p, ..)| p == host) {
+        return Some((m, unsafe { &mut *(view as *mut [Published; LOCK_SLOTS]) }));
+    }
+    let mut hasher = DefaultHasher::new();
+    host.to_string_lossy().to_lowercase().hash(&mut hasher);
+    let key = hasher.finish();
+    let name = |k: &str| format!("Local\\lx-locks{k}-{key:016x}").encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let size = (LOCK_SLOTS * std::mem::size_of::<Published>()) as u32;
+    unsafe {
+        let map = CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, 0, size, name("").as_ptr());
+        let mutex = CreateMutexW(std::ptr::null_mut(), 0, name("-m").as_ptr());
+        let view = if map != 0 { MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, size as usize) } else { std::ptr::null_mut() };
+        if view.is_null() || mutex == 0 {
+            return None;
+        }
+        tables.push((host.to_path_buf(), mutex, view as usize));
+        Some((mutex, &mut *(view as *mut [Published; LOCK_SLOTS])))
+    }
+}
+
+/// Run `f` on the file's table with its mutex held.
+fn with_lock_table<T>(host: &Path, f: impl FnOnce(&mut [Published; LOCK_SLOTS]) -> T) -> Option<T> {
+    unsafe extern "system" {
+        fn ReleaseMutex(m: isize) -> i32;
+    }
+    let (m, table) = lock_table(host)?;
+    let w = unsafe { crate::win::WaitForMultipleObjects(1, &m, 0, 2000) };
+    if w != 0 && w != 0x80 { // WAIT_OBJECT_0, or WAIT_ABANDONED: its last holder died, the table is still ours to use
+        return None;
+    }
+    let r = f(table);
+    unsafe { ReleaseMutex(m) };
+    Some(r)
+}
+
+/// Publish this process's current locks on the file at `host` (taken through lock handle `h`).
+fn publish_locks(host: &Path, h: isize) {
+    let me = std::process::id();
+    let pid = crate::proc::getpid().unwrap_or(0) as u32;
+    let mine: Vec<(u64, u64, bool)> = LOCKS.lock().unwrap().iter().filter(|l| l.0 == h).map(|&(_, s, l, x)| (s, l, x)).collect();
+    // A hot path (SQLite locks and unlocks several times per transaction): only our own entries are
+    // rewritten, with no kernel calls; dead processes' entries are swept only when the table is full.
+    with_lock_table(host, |t| {
+        for e in t.iter_mut().filter(|e| e.win == me) {
+            *e = Published::default();
+        }
+        if t.iter().filter(|e| e.win == 0).count() < mine.len() {
+            for e in t.iter_mut().filter(|e| e.win != 0 && !alive(e.win)) {
+                *e = Published::default();
+            }
+        }
+        let mut free = t.iter_mut().filter(|e| e.win == 0);
+        for (s, l, x) in mine {
+            let Some(e) = free.next() else { break };
+            *e = Published { start: s - SHADOW, len: l, win: me, pid, excl: x as u32, _pad: 0 };
+        }
+    });
+}
+
+/// Another live process's published lock on `host` that conflicts with [start, start+len) (`excl`: we
+/// want a write lock): (start, len, pid, its excl).
+fn lock_holder(host: &Path, start: u64, len: u64, excl: bool) -> Option<(u64, u64, u32, bool)> {
+    let me = std::process::id();
+    with_lock_table(host, |t| {
+        // The first conflicting one by start, as Linux reports it.
+        t.iter().filter(|e| e.win != 0 && e.win != me && e.start < start + len && start < e.start + e.len
+                && (excl || e.excl != 0) && alive(e.win))
+            .min_by_key(|e| e.start)
+            .map(|e| (e.start, e.len, e.pid, e.excl != 0))
+    }).flatten()
+}
+
+fn alive(win: u32) -> bool {
+    use crate::win::*;
+    let h = unsafe { OpenProcess(0x0010_0000, 0, win) }; // SYNCHRONIZE
+    if h == 0 {
+        return false;
+    }
+    let running = unsafe { WaitForMultipleObjects(1, &h, 0, 0) } != 0;
+    unsafe { CloseHandle(h) };
+    running
+}
+
 fn holds(h: isize, start: u64, len: u64) -> bool {
     LOCKS.lock().unwrap().iter().any(|&(lh, s, l, _)| lh == h && s < start + len && start < s + l)
 }
@@ -2633,11 +2746,11 @@ fn posix_lock(fd: u64, cmd: u64, arg: u64) -> R {
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
     crate::syscall::check_guest(arg, 32, true)?; // struct flock, before the fd, as Linux copies it in first
-    let (h, pos, size) = with(|fs| match fs.fd(fd)? {
+    let (h, pos, size, host) = with(|fs| match fs.fd(fd)? {
         Fd::File { f, host } => {
             let pos = f.stream_position().unwrap_or(0);
             let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-            Ok((lock_handle(host, f.as_raw_handle() as isize), pos, size))
+            Ok((lock_handle(host, f.as_raw_handle() as isize), pos, size, host.clone()))
         }
         _ => Err(EBADF),
     })?;
@@ -2672,8 +2785,15 @@ fn posix_lock(fd: u64, cmd: u64, arg: u64) -> R {
             unsafe {
                 if free {
                     *(p as *mut i16) = F_UNLCK;
+                } else if let Some((hs, hl, pid, hx)) = lock_holder(&host, start, len, ty == F_WRLCK) {
+                    // The holder as it published itself: its type, range (to the end of file: 0) and pid.
+                    *(p as *mut i16) = if hx { F_WRLCK } else { F_RDLCK };
+                    *(p.add(2) as *mut i16) = 0;
+                    *(p.add(8) as *mut i64) = hs as i64;
+                    *(p.add(16) as *mut i64) = if hs + hl >= SHADOW { 0 } else { hl as i64 };
+                    *(p.add(24) as *mut i32) = crate::proc::guest_pid(pid) as i32;
                 } else {
-                    *(p as *mut i16) = F_WRLCK; // ponytail: the holder's type and pid aren't known
+                    *(p as *mut i16) = F_WRLCK; // a holder that published nothing (yet): type and pid unknown
                     *(p.add(2) as *mut i16) = 0;
                     *(p.add(8) as *mut i64) = start as i64;
                     *(p.add(16) as *mut i64) = len as i64;
@@ -2685,6 +2805,7 @@ fn posix_lock(fd: u64, cmd: u64, arg: u64) -> R {
         _ => {
             let old = release(h, s, len);
             if ty == F_UNLCK {
+                publish_locks(&host, h);
                 return Ok(0);
             }
             let r = take_lock(h, s, len, ty == F_WRLCK, cmd == 7 || cmd == 38);
@@ -2693,6 +2814,7 @@ fn posix_lock(fd: u64, cmd: u64, arg: u64) -> R {
                     let _ = take_lock(h, os, ol, ox, false); // keep what we had, as POSIX does
                 }
             }
+            publish_locks(&host, h);
             r.map(|_| 0)
         }
     }
