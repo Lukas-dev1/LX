@@ -1001,8 +1001,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         295 | 327 => fs::preadv(a[0], a[1], a[2], a[3], false), // preadv, preadv2 (flags ignored)
         296 | 328 => fs::preadv(a[0], a[1], a[2], a[3], true),  // pwritev, pwritev2
         285 => fs::fallocate(a[0], a[1], a[2], a[3]),
-        37 => { signal::set_alarm(a[0] * 1000, 0); Ok(0) } // alarm
+        37 => Ok(signal::set_alarm(a[0] * 1000, 0).0.div_ceil(1000) as i64), // alarm: the seconds left of the old one
         38 => setitimer(a[0], a[1], a[2]),
+        36 => getitimer(a[0], a[1]),
         90 => fs::chmeta_at(CWD, a[0], true, Some(a[1]), None),                     // chmod
         91 => fs::fchmeta(a[0], Some(a[1]), None),                                  // fchmod
         268 => fs::chmeta_at(a[0], a[1], true, Some(a[2]), None),                   // fchmodat (no flags)
@@ -1902,13 +1903,20 @@ fn setitimer(which: u64, new: u64, old: u64) -> R {
     if which != 0 {
         return Err(EINVAL); // ITIMER_VIRTUAL / ITIMER_PROF
     }
+    let [is, ius, vs, vus] = if new != 0 { unsafe { *(new as *const [u64; 4]) } } else { [0; 4] }; // NULL disarms
+    let (left, iv) = signal::set_alarm(vs * 1000 + vus.div_ceil(1000), is * 1000 + ius.div_ceil(1000));
     if old != 0 {
-        unsafe { *(old as *mut [u64; 4]) = [0; 4] };
+        unsafe { *(old as *mut [u64; 4]) = [iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000] };
     }
-    if new != 0 {
-        let [is, ius, vs, vus] = unsafe { *(new as *const [u64; 4]) };
-        signal::set_alarm(vs * 1000 + vus / 1000, is * 1000 + ius / 1000);
+    Ok(0)
+}
+
+fn getitimer(which: u64, cur: u64) -> R {
+    if which != 0 {
+        return Err(EINVAL); // ITIMER_VIRTUAL / ITIMER_PROF
     }
+    let (left, iv) = signal::alarm_left();
+    unsafe { *(cur as *mut [u64; 4]) = [iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000] };
     Ok(0)
 }
 
