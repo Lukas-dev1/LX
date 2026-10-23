@@ -1031,6 +1031,14 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         10 => mprotect(a[0], a[1], a[2]),
         11 => munmap(a[0], a[1], c.rsp),
         29 => shmget(a[0], a[1], a[2]),
+        64 => crate::sysvipc::semget(a[0], a[1], a[2]),
+        65 => crate::sysvipc::semtimedop(a[0], a[1], a[2], 0), // semop
+        220 => crate::sysvipc::semtimedop(a[0], a[1], a[2], a[3]),
+        66 => crate::sysvipc::semctl(a[0], a[1], a[2], a[3]),
+        68 => crate::sysvipc::msgget(a[0], a[1]),
+        69 => crate::sysvipc::msgsnd(a[0], a[1], a[2], a[3]),
+        70 => crate::sysvipc::msgrcv(a[0], a[1], a[2], a[3], a[4]),
+        71 => crate::sysvipc::msgctl(a[0], a[1], a[2]),
         30 => shmat(a[0], a[1], a[2]),
         67 => shmdt(a[0], c.rsp),
         31 => shmctl(a[0], a[1], a[2]),
@@ -1299,17 +1307,30 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
 
 /// Read `N` bytes of guest memory at `addr`, or EFAULT unless every page is committed and readable.
 pub fn get_guest<const N: usize>(addr: u64) -> Result<[u8; N], i64> {
-    let end = addr.checked_add(N as u64).ok_or(EFAULT)?;
+    if !readable(addr, N) {
+        return Err(EFAULT);
+    }
+    Ok(unsafe { std::ptr::read_unaligned(addr as *const [u8; N]) })
+}
+
+/// get_guest for a length known at run time; None: EFAULT.
+pub fn get_guest_vec(addr: u64, n: usize) -> Option<Vec<u8>> {
+    readable(addr, n).then(|| unsafe { std::slice::from_raw_parts(addr as *const u8, n) }.to_vec())
+}
+
+/// Whether [addr, addr+n) is committed guest memory we may read.
+fn readable(addr: u64, n: usize) -> bool {
+    let Some(end) = addr.checked_add(n as u64) else { return false };
     let mut p = addr;
     while p < end {
         let mut m = MemoryBasicInformation::default();
         if unsafe { VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0
             || m.state != MEM_COMMIT || m.protect & 0x101 != 0 || m.protect & 0xff == 0x10 {
-            return Err(EFAULT); // PAGE_NOACCESS, PAGE_GUARD, execute-only
+            return false; // PAGE_NOACCESS, PAGE_GUARD, execute-only
         }
         p = (m.base + m.region_size) as u64;
     }
-    Ok(unsafe { std::ptr::read_unaligned(addr as *const [u8; N]) })
+    true
 }
 
 /// u64s as the guest's little-endian bytes, for put_guest.

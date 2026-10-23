@@ -53,6 +53,7 @@ cc_static 2 rootfs/sigfdtest guest/sigfdtest.c
 cc_static 2 rootfs/sigfutex guest/sigfutex.c
 cc_static 2 rootfs/restarttest guest/restarttest.c
 cc_static 2 rootfs/ptimer guest/ptimer.c
+cc_static 2 rootfs/sysvipc guest/sysvipc.c
 cc_static 1 rootfs/spinsig guest/spinsig.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
 cc_static 2 rootfs/waitidtest guest/waitidtest.c
@@ -101,6 +102,7 @@ expect "signalfd in epoll, woken by a child's signal" 0 "OK" -- rootfs /sigfdtes
 expect "SIGTERM reaches threads parked in futexes (Go idle)" 0 "sigfutex OK" -- rootfs /sigfutex
 expect "SA_RESTART: an interrupted read continues" 0 "read=1" -- rootfs /restarttest
 expect "POSIX timers: a periodic timer_create timer keeps firing" 0 "ticks=3 armed=1" -- rootfs /ptimer
+expect "SysV semaphores and message queues across fork" 0 "sysv waiting=1 got=hello n=16 child=0 nowait=EAGAIN/ENOMSG nsems=2 perm=1 info=1 key=1 gone=1" -- rootfs /sysvipc
 expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
 expect "waitid: P_PID, WNOWAIT, CLD_KILLED, WNOHANG" 0 "peek=1 reap=1 killed=1 none=1" -- rootfs /waitidtest
