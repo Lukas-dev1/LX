@@ -747,6 +747,12 @@ impl Fs {
     /// host(), plus the metadata of the entry there if it exists: resolve() needs both for every
     /// component, and stat-ing once instead of twice is most of a path lookup's cost.
     fn host_meta(&self, comps: &[String]) -> (PathBuf, Option<Attrs>) {
+        self.host_meta_seen(comps, None)
+    }
+
+    /// host_meta, knowing what resolve just found of the parent: Some(true) it's there, so only the last
+    /// level can hide this entry; Some(false) it isn't, so neither is this (outside a volume).
+    fn host_meta_seen(&self, comps: &[String], parent: Option<bool>) -> (PathBuf, Option<Attrs>) {
         if let Some((m, rest)) = self.mount_of(comps) {
             let mut p = m.host.clone();
             p.extend(rest.iter().map(|c| enc(c)));
@@ -761,10 +767,13 @@ impl Fs {
         };
         let mut upper = up.clone();
         upper.extend(comps.iter().map(|c| enc(c)));
+        if parent == Some(false) {
+            return (upper, None);
+        }
         if let Some(m) = attrs(&upper) {
             return (upper, Some(m));
         }
-        if self.hidden(comps) {
+        if if parent == Some(true) { self.hidden_here(comps) } else { self.hidden(comps) } {
             return (upper, None);
         }
         match lower_attrs(&lower) {
@@ -798,6 +807,14 @@ impl Fs {
             dir.push(enc(c));
         }
         false
+    }
+
+    /// hidden() for an entry whose parent is visible: a whiteout for it, or its parent made opaque.
+    fn hidden_here(&self, comps: &[String]) -> bool {
+        let (Some(up), Some((last, parent))) = (&self.upper, comps.split_last()) else { return false };
+        let mut dir = up.clone();
+        dir.extend(parent.iter().map(|c| enc(c)));
+        exists(&dir.join(format!("{WHITEOUT}{}", enc(last)))) || (!parent.is_empty() && exists(&dir.join(OPAQUE)))
     }
 
     fn in_lower(&self, comps: &[String]) -> bool {
@@ -941,18 +958,23 @@ impl Fs {
         // holds nothing below it either, no entries and no whiteouts, and only the image needs asking.
         // Most lookups are of image files, and this saves ~3 of ~4 host calls per component.
         let mut not_in_upper = false;
+        // Whether comps (the next component's parent) was just found: then only that last level can
+        // hide the next one, and hidden() needn't walk the whole path again (~3 host calls per level);
+        // and if it wasn't, nothing below it exists either.
+        let mut seen = true;
         while let Some(c) = todo.pop_front() {
             last = None;
             match c.as_str() {
                 "." => continue,
-                ".." => { comps.pop(); not_in_upper = false; continue }
+                ".." => { comps.pop(); not_in_upper = false; seen = true; continue }
                 _ if c.contains('\0') => return Err(ENOENT), // `:` and `\` are fine: enc() maps them
                 // Layer bookkeeping names are ours; the guest can't see or forge whiteouts.
                 _ if c.starts_with(WHITEOUT) && self.upper.is_some() => return Err(ENOENT),
                 _ => comps.push(c),
             }
             if !todo.is_empty() || follow {
-                let (host, meta) = self.host_meta_below(&comps, not_in_upper);
+                let (host, meta) = self.host_meta_below(&comps, not_in_upper, Some(seen));
+                seen = meta.is_some();
                 not_in_upper = self.upper.as_ref().is_some_and(|u| !host.starts_with(u)) && self.mount_of(&comps).is_none();
                 let target = self.proc_self_link(&comps).or_else(|| meta.and_then(|m| link_target(&host, &m)));
                 if let Some(target) = target {
@@ -965,6 +987,7 @@ impl Fs {
                         comps.clear();
                     }
                     not_in_upper = false; // the link's parent may well be in the upper layer
+                    seen = true; // and it was seen: it holds the link
                     let mut next = split(&target);
                     next.extend(todo.drain(..));
                     todo = next;
@@ -973,15 +996,15 @@ impl Fs {
                 }
             }
         }
-        let (host, meta) = last.unwrap_or_else(|| self.host_meta_below(&comps, not_in_upper));
+        let (host, meta) = last.unwrap_or_else(|| self.host_meta_below(&comps, not_in_upper, Some(seen)));
         Ok((format!("/{}", comps.join("/")), host, meta))
     }
 
     /// host_meta(), knowing whether the upper layer lacks the parent directory: then only the image is
     /// asked (and a path in neither still maps into the upper layer, for creating it).
-    fn host_meta_below(&self, comps: &[String], parent_not_in_upper: bool) -> (PathBuf, Option<Attrs>) {
+    fn host_meta_below(&self, comps: &[String], parent_not_in_upper: bool, parent: Option<bool>) -> (PathBuf, Option<Attrs>) {
         let Some(up) = self.upper.as_ref().filter(|_| parent_not_in_upper && self.mount_of(comps).is_none()) else {
-            return self.host_meta(comps);
+            return self.host_meta_seen(comps, parent);
         };
         let mut lower = self.root.clone();
         lower.extend(comps.iter().map(|c| enc(c)));
