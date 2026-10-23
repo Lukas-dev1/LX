@@ -54,7 +54,9 @@ cc_static 2 rootfs/sigfutex guest/sigfutex.c
 cc_static 2 rootfs/restarttest guest/restarttest.c
 cc_static 2 rootfs/ptimer guest/ptimer.c
 cc_static 2 rootfs/sysvipc guest/sysvipc.c
+cc_static 1 rootfs/spinsig guest/spinsig.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
+cc_static 2 rootfs/waitidtest guest/waitidtest.c
 cc_static 2 rootfs/shfutex guest/shfutex.c
 cc_static 2 rootfs/sysbench guest/sysbench.c
 cc_static 2 rootfs/xmmtest guest/xmmtest.c
@@ -101,7 +103,9 @@ expect "SIGTERM reaches threads parked in futexes (Go idle)" 0 "sigfutex OK" -- 
 expect "SA_RESTART: an interrupted read continues" 0 "read=1" -- rootfs /restarttest
 expect "POSIX timers: a periodic timer_create timer keeps firing" 0 "ticks=3 armed=1" -- rootfs /ptimer
 expect "SysV semaphores and message queues across fork" 0 "sysv waiting=1 got=hello n=16 child=0 nowait=EAGAIN/ENOMSG nsems=2 perm=1 info=1 key=1 gone=1" -- rootfs /sysvipc
+expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
+expect "waitid: P_PID, WNOWAIT, CLD_KILLED, WNOHANG" 0 "peek=1 reap=1 killed=1 none=1" -- rootfs /waitidtest
 expect "a shared futex wakes another process (FUTEX_WAKE counts it)" 0 "woke=1 child=0" -- rootfs /shfutex
 expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regress.sh
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
@@ -159,6 +163,7 @@ expect "ftruncate shrinks a mapped file (shared and private views)" 0 "shrunk 40
 expect "chown drops setuid/setgid; chmod g+s outside the group is dropped" 0 "chown:755 sgid:777" -- run alpine sh -c 'cd /tmp && touch f && chmod 6755 f && chown 0:0 f && mkdir d && chown 65534:0 d && chmod 777 d && su -s /bin/sh nobody -c "chmod 2777 d"; echo "chown:$(stat -c %a f) sgid:$(stat -c %a d)"'
 expect "a 300-byte name is ENAMETOOLONG" 0 "too long" -- run alpine sh -c 'cd $(printf "%0300d" 0) 2>&1; true'
 expect "procps ps, vmstat (/proc/stat, /proc/vmstat)" 0 "ps ok vmstat ok" -- run python:3.12 sh -c 'ps aux > /dev/null && p="ps ok"; vmstat > /dev/null && echo "$p vmstat ok"'
+expect "/proc/<pid>/stat: S for a process blocked in a syscall, R for one running" 0 "sleep:S busy:R self:R" -- run alpine sh -c 'sleep 5 & s=$!; (while :; do :; done) & b=$!; sleep 1; echo "sleep:$(cut -d" " -f3 /proc/$s/stat) busy:$(cut -d" " -f3 /proc/$b/stat) self:$(cut -d" " -f3 /proc/self/stat)"; kill $b'
 expect "access(X_OK) as root needs an x bit; nobody needs its own bits" 0 "x:no w:no r:yes" -- run alpine sh -c 'touch /tmp/f; chmod 604 /tmp/f; [ -x /tmp/f ] && x=yes || x=no; su -s /bin/sh nobody -c "[ -w /tmp/f ] && w=yes || w=no; [ -r /tmp/f ] && r=yes || r=no; echo x:$x w:\$w r:\$r"'
 expect "/proc/self/maps lists mapped code" 0 "maps ok" -- run alpine sh -c 'grep -q " r-xp " /proc/self/maps && echo maps ok'
 expect "pty: ttyname, slave opened twice" 0 "pts ok x" -- run python:3.12-alpine python3 -c 'import os,pty; m,s=pty.openpty(); n=os.ttyname(s); f=os.open(n, os.O_RDWR); os.write(f, b"x"); print("pts ok", os.read(m, 1).decode())'
@@ -209,7 +214,11 @@ repeat() { # repeat <name> <n> <lx args...>
   name=$1 n=$2; shift 2
   good=0 traps=0
   for i in $(seq "$n"); do
-    LX_PATCHLOG=1 timeout 120 $LX "$@" < /dev/null > "$OUT/rep" 2>&1 && grep -q " OK$" "$OUT/rep" && good=$((good + 1))
+    if LX_PATCHLOG=1 timeout 120 $LX "$@" < /dev/null > "$OUT/rep" 2>&1 && grep -q " OK$" "$OUT/rep"; then
+      good=$((good + 1))
+    else
+      echo "  run $i of $name failed (exit $?); its output:"; head -20 "$OUT/rep" | sed 's/^/    /' # rare failures need it
+    fi
     traps=$((traps + $(grep -o "[0-9]* fallback traps\|[0-9]* FS-base faults" "$OUT/rep" | awk '{s += $1} END {print s + 0}')))
   done
   if [ $good = "$n" ] && [ $traps = 0 ]; then ok "$name $good/$n"; else bad "$name $good/$n, $traps fallback traps/FS faults"; fi
