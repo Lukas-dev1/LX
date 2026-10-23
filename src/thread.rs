@@ -210,7 +210,7 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
 // so FUTEX_WAKE wakes and reports as many as Linux would (LTP's checkpoints wake without changing the
 // value and loop until the count is right). Fork keeps shared views at the same address.
 // ponytail: the same file mapped at different addresses (after exec) doesn't meet here; such waiters still
-// see a changed value through the 1 ms re-check.
+// see a changed value through the re-check every 100 ms.
 
 unsafe extern "system" {
     fn CreateSemaphoreW(attr: *mut std::ffi::c_void, initial: i32, max: i32, name: *const u16) -> isize;
@@ -286,7 +286,10 @@ fn shared_wait(uaddr: u64, expect: u32, ms: u32) -> R {
         }
         let hs = [f.sem, crate::signal::intr_event()];
         let n = if hs[1] != 0 { 2 } else { 1 };
-        if unsafe { WaitForMultipleObjects(n, hs.as_ptr(), 0, 1) } == 0 {
+        // Wakes and signals end the wait at once; the 100 ms cap only bounds how late a value change by
+        // an unmatched waker (see above) is noticed, without spinning idle waiters (postgres backends).
+        let left = if ms == u32::MAX { 100 } else { (ms as u128).saturating_sub(start.elapsed().as_millis()).min(100) as u32 };
+        if unsafe { WaitForMultipleObjects(n, hs.as_ptr(), 0, left.max(1)) } == 0 {
             return Ok(0); // woken; the waker took us off the count
         }
     };
