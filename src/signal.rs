@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 pub const SIGCHLD: u64 = 17;
 const SA_NODEFER: u64 = 0x4000_0000;
+const SA_RESTART: u64 = 0x1000_0000;
 const SA_RESETHAND: u64 = 0x8000_0000;
 const SA_ONSTACK: u64 = 0x0800_0000;
 const SS_ONSTACK: u64 = 1;
@@ -494,6 +495,7 @@ pub const FRAME_MAX: usize = (8 + 4096 + 64 + 64 + UC_SIZE + SI_SIZE + 32) as us
 /// unblocked, run its default action, or point `c` at its handler and return the signal frame bytes,
 /// which the caller places at the new `c.rsp` once it's safe to (see syscall::resume_with_signals).
 pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
+    let restart = std::mem::take(&mut crate::syscall::ts().restart);
     proc::notice_child_exits();
     let mut s = S.lock().unwrap();
     let mine = &crate::syscall::ts().tpending;
@@ -519,7 +521,9 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
             1 => continue, // SIG_IGN
             _ => {
                 let code = if sig == SIGCHLD { 1 } else { 0 }; // si_code: CLD_EXITED / SI_USER
-                return Some(frame(&mut s, c, sig, a, code, 0)); // one handler at a time; the rest go when it returns via rt_sigreturn
+                // SA_RESTART: the handler returns into the interrupted syscall, made again.
+                let again = (restart != 0 && a.flags & SA_RESTART != 0).then_some(restart - 1);
+                return Some(frame(&mut s, c, sig, a, code, 0, again)); // one handler at a time; the rest go when it returns via rt_sigreturn
             }
         }
     }
@@ -535,11 +539,11 @@ pub fn fault(c: &mut Context, sig: u64, code: u64, addr: u64) -> Option<Vec<u8>>
     if a.handler <= 1 || mask() & bit(sig) != 0 {
         return None;
     }
-    Some(frame(&mut s, c, sig, a, code, addr))
+    Some(frame(&mut s, c, sig, a, code, addr, None))
 }
 
 /// Point `c` at the handler for `sig` and build its signal frame (see `deliver`).
-fn frame(s: &mut State, c: &mut Context, sig: u64, a: Action, code: u64, addr: u64) -> Vec<u8> {
+fn frame(s: &mut State, c: &mut Context, sig: u64, a: Action, code: u64, addr: u64, restart: Option<u64>) -> Vec<u8> {
     let handler = a.handler;
     let restore_mask = crate::syscall::ts().suspended_mask.take().unwrap_or(mask());
     // Below the red zone: [return address = restorer][ucontext][siginfo].
@@ -570,6 +574,13 @@ fn frame(s: &mut State, c: &mut Context, sig: u64, a: Action, code: u64, addr: u
         put(uc + UC_MCONTEXT + 8 * i as u64, *r);
     }
     put(uc + UC_MCONTEXT + 8 * 17, flags);
+    if let Some(nr) = restart {
+        // Return into the syscall instead of past it: rax = its number, rip = the instruction (or, at a
+        // rewritten site, its copy in the stub).
+        let at = c.rip - 2;
+        put(uc + UC_MCONTEXT + 8 * 13, nr); // REG_RAX
+        put(uc + UC_MCONTEXT + 8 * 16, crate::jump::redirect(at).unwrap_or(at)); // REG_RIP
+    }
     put(uc + UC_SIGMASK, restore_mask);
     for (i, q) in fp.chunks_exact(8).enumerate() {
         put(fpa + 8 * i as u64, u64::from_le_bytes(q.try_into().unwrap()));
