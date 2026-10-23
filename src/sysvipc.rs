@@ -166,19 +166,38 @@ fn me() -> u32 {
     crate::proc::getpid().unwrap_or(0) as u32
 }
 
-/// An id is (seq << 7) | slot, so a removed and reused slot gets a new id.
+/// An id is ((seq + 1) << 7) | slot: a removed and reused slot gets a new id, and no id is a small
+/// number a program might pass as "surely invalid".
 fn slot_of(t: &Table, id: u64, kind: u32) -> Result<usize, i64> {
     let slot = id as usize % NSETS;
     let e = &t.entries[slot];
-    if (id as i64) < 0 || e.kind != kind || e.seq != (id >> 7) as u32 {
+    if (id as i64) < 0 || e.kind != kind || (e.seq as u64 + 1) != id >> 7 {
         return Err(EINVAL);
     }
     Ok(slot)
 }
 
 fn id_of(t: &Table, slot: usize) -> i64 {
-    ((t.entries[slot].seq as i64) << 7) | slot as i64
+    ((t.entries[slot].seq as i64 + 1) << 7) | slot as i64
 }
+
+/// ipcperms: may the caller have `want` (4 read, 2 write/alter) on `e`? Root may do anything.
+fn allowed(e: &Entry, want: u32) -> bool {
+    let (uid, gid) = (crate::proc::UID.load(Relaxed), crate::proc::GID.load(Relaxed));
+    if uid == 0 {
+        return true;
+    }
+    let granted = if uid == e.uid || uid == e.cuid { e.mode >> 6 } else if gid == e.gid || gid == e.cgid { e.mode >> 3 } else { e.mode } & 7;
+    want & !granted == 0
+}
+
+/// IPC_RMID / IPC_SET: the owner, the creator or root.
+fn owner(e: &Entry) -> Result<(), i64> {
+    let uid = crate::proc::UID.load(Relaxed);
+    if uid == 0 || uid == e.uid || uid == e.cuid { Ok(()) } else { Err(crate::syscall::EPERM) }
+}
+
+const EACCES: i64 = 13;
 
 /// semget / msgget: find the key (IPC_PRIVATE: always new), or create the set or queue.
 fn get(kind: u32, key: u64, flags: u64, nsems: u64) -> R {
@@ -187,6 +206,10 @@ fn get(kind: u32, key: u64, flags: u64, nsems: u64) -> R {
         if key != 0 && let Some(s) = (0..NSETS).find(|&s| t.entries[s].kind == kind && t.entries[s].key == key) {
             if flags & (IPC_CREAT | IPC_EXCL) == IPC_CREAT | IPC_EXCL {
                 return Err(EEXIST);
+            }
+            let ask = flags as u32 & 0o777;
+            if !allowed(&t.entries[s], (ask >> 6 | ask >> 3 | ask) & 7) {
+                return Err(EACCES);
             }
             if kind == 1 && nsems > t.entries[s].nsems as u64 {
                 return Err(EINVAL);
@@ -258,6 +281,9 @@ pub fn semtimedop(id: u64, sops: u64, nsops: u64, timeout: u64) -> R {
         let e = &mut t.entries[slot];
         if ops.iter().any(|o| o.0 >= e.nsems as usize) {
             return Some(Err(EFBIG_SEM));
+        }
+        if !allowed(e, if ops.iter().any(|o| o.1 != 0) { 2 } else { 4 }) {
+            return Some(Err(EACCES));
         }
         // Would all of them go through, applied in order?
         let mut vals: Vec<i32> = e.sems[..e.nsems as usize].iter().map(|s| s.val).collect();
@@ -350,9 +376,27 @@ pub fn semctl(id: u64, num: u64, cmd: u64, arg: u64) -> R {
     const SETALL: u64 = 17;
     let cmd = cmd & !0x100; // IPC_64
     locked(|t, i| {
+        if cmd == 3 || cmd == 19 {
+            // IPC_INFO, SEM_INFO: struct seminfo (semmap semmni semmns semmnu semmsl semopm semume semusz
+            // semvmx semaem); SEM_INFO counts sets in semusz and semaphores in semaem.
+            let used = (0..NSETS).filter(|&s| t.entries[s].kind == 1);
+            let (sets, sems) = (used.clone().count() as u32, used.clone().map(|s| t.entries[s].nsems).sum::<u32>());
+            let mut v = [NSETS as u32, NSETS as u32, (NSETS * NSEMS) as u32, NSETS as u32, NSEMS as u32, 500, 500, 20, SEMVMX as u32, 32767];
+            if cmd == 19 {
+                (v[7], v[9]) = (sets, sems);
+            }
+            crate::syscall::put_guest(arg, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+            return Ok(used.max().unwrap_or(0) as i64);
+        }
         let slot = slot_of(t, id, 1)?;
         let e = &mut t.entries[slot];
         let n = e.nsems as usize;
+        let need = match cmd {
+            IPC_RMID | IPC_SET => owner(e),
+            16 | 17 => if allowed(e, 2) { Ok(()) } else { Err(EACCES) }, // SETVAL, SETALL
+            _ => if allowed(e, 4) { Ok(()) } else { Err(EACCES) },
+        };
+        need?;
         let sem = |num: u64| if (num as usize) < n { Ok(num as usize) } else { Err(EINVAL) };
         match cmd {
             IPC_RMID => {
@@ -361,7 +405,7 @@ pub fn semctl(id: u64, num: u64, cmd: u64, arg: u64) -> R {
             }
             IPC_STAT => {
                 let mut b = perm_bytes(e);
-                for v in [e.otime as u64, e.ctime as u64, n as u64, 0, 0] {
+                for v in [e.otime as u64, 0, e.ctime as u64, 0, n as u64, 0, 0] {
                     b.extend(v.to_le_bytes());
                 }
                 crate::syscall::put_guest(arg, &b)
@@ -463,6 +507,9 @@ pub fn msgsnd(id: u64, msgp: u64, size: u64, flags: u64) -> R {
         };
         let seq = t.entries[slot].seq;
         seq0.set(Some(seq));
+        if !allowed(&t.entries[slot], 2) {
+            return Some(Err(EACCES));
+        }
         let e = &mut t.entries[slot];
         let need = rec_len(size as usize);
         if e.cbytes as u64 + size > e.qbytes as u64 || e.used as usize + need > QSIZE {
@@ -500,6 +547,9 @@ pub fn msgrcv(id: u64, msgp: u64, size: u64, mtype: u64, flags: u64) -> R {
         };
         let seq = t.entries[slot].seq;
         seq0.set(Some(seq));
+        if !allowed(&t.entries[slot], 4) {
+            return Some(Err(EACCES));
+        }
         let q = match queue(i, slot, seq) { Ok(q) => q, Err(err) => return Some(Err(err)) };
         let e = &mut t.entries[slot];
         // The record to take: the first (0), the first of the type (> 0; MSG_EXCEPT: of another type),
@@ -547,8 +597,29 @@ pub fn msgrcv(id: u64, msgp: u64, size: u64, mtype: u64, flags: u64) -> R {
 pub fn msgctl(id: u64, cmd: u64, buf: u64) -> R {
     let cmd = cmd & !0x100; // IPC_64
     locked(|t, i| {
+        if cmd == 3 || cmd == 12 {
+            // IPC_INFO, MSG_INFO: struct msginfo (msgpool msgmap msgmax msgmnb msgmni msgssz msgtql, msgseg);
+            // MSG_INFO counts queues in msgpool, messages in msgmap and bytes in msgtql.
+            let used = (0..NSETS).filter(|&s| t.entries[s].kind == 2);
+            let mut v = [(NSETS * QSIZE / 1024) as u32, 0, (QSIZE - 16) as u32, 16384, NSETS as u32, 16, 0];
+            if cmd == 12 {
+                v[0] = used.clone().count() as u32;
+                v[1] = used.clone().map(|s| t.entries[s].qnum).sum();
+                v[6] = used.clone().map(|s| t.entries[s].cbytes).sum();
+            }
+            let mut b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            b.extend(0xffffu16.to_le_bytes()); // msgseg
+            crate::syscall::put_guest(buf, &b)?;
+            return Ok(used.max().unwrap_or(0) as i64);
+        }
         let slot = slot_of(t, id, 2)?;
         let e = &mut t.entries[slot];
+        match cmd {
+            IPC_RMID | IPC_SET => owner(e)?,
+            IPC_STAT if !allowed(e, 4) => return Err(EACCES),
+            IPC_STAT => {}
+            _ => return Err(EINVAL),
+        }
         match cmd {
             IPC_RMID => {
                 remove(t, i, slot);
