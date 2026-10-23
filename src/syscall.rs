@@ -1099,7 +1099,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         126 => Ok(0), // capset: accepted. ponytail: capabilities aren't enforced
         // Callers fall back from these, so no "unimplemented" noise: io_uring (out of scope, DESIGN §5),
         // pidfd_open (Go, libuv), copy_file_range (Go's io.Copy), waitid (Go waits with wait4 then).
-        425..=427 | 434 | 326 | 247 => Err(ENOSYS),
+        247 => proc::waitid(a[0], a[1], a[2], a[3]),
+        425..=427 | 434 | 326 => Err(ENOSYS),
         62 => proc::kill(a[0] as i32 as i64, a[1]),
         63 => uname(a[0]),
         72 => fs::fcntl(a[0], a[1], a[2]),
