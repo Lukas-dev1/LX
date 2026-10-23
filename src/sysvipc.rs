@@ -191,6 +191,19 @@ fn allowed(e: &Entry, want: u32) -> bool {
     want & !granted == 0
 }
 
+/// SEM_STAT / MSG_STAT (and their _ANY forms, which skip the read check) name a set by its table index
+/// rather than its id (ipcs walks them so): the slot, and the command to run as.
+fn by_index(t: &Table, id: u64, cmd: u64, kind: u32, stat: u64, any: u64) -> Result<Option<(usize, bool)>, i64> {
+    if cmd != stat && cmd != any {
+        return Ok(None);
+    }
+    let s = id as usize;
+    if s >= NSETS || t.entries[s].kind != kind {
+        return Err(EINVAL);
+    }
+    Ok(Some((s, cmd == any)))
+}
+
 /// IPC_RMID / IPC_SET: the owner, the creator or root.
 fn owner(e: &Entry) -> Result<(), i64> {
     let uid = crate::proc::UID.load(Relaxed);
@@ -388,10 +401,13 @@ pub fn semctl(id: u64, num: u64, cmd: u64, arg: u64) -> R {
             crate::syscall::put_guest(arg, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
             return Ok(used.max().unwrap_or(0) as i64);
         }
-        let slot = slot_of(t, id, 1)?;
+        let indexed = by_index(t, id, cmd, 1, 18, 20)?; // SEM_STAT, SEM_STAT_ANY
+        let slot = match indexed { Some((s, _)) => s, None => slot_of(t, id, 1)? };
+        let (full_id, cmd) = (id_of(t, slot), if indexed.is_some() { IPC_STAT } else { cmd });
         let e = &mut t.entries[slot];
         let n = e.nsems as usize;
         let need = match cmd {
+            _ if indexed.is_some_and(|(_, any)| any) => Ok(()),
             IPC_RMID | IPC_SET => owner(e),
             16 | 17 => if allowed(e, 2) { Ok(()) } else { Err(EACCES) }, // SETVAL, SETALL
             _ => if allowed(e, 4) { Ok(()) } else { Err(EACCES) },
@@ -408,7 +424,8 @@ pub fn semctl(id: u64, num: u64, cmd: u64, arg: u64) -> R {
                 for v in [e.otime as u64, 0, e.ctime as u64, 0, n as u64, 0, 0] {
                     b.extend(v.to_le_bytes());
                 }
-                crate::syscall::put_guest(arg, &b)
+                crate::syscall::put_guest(arg, &b)?;
+                Ok(if indexed.is_some() { full_id } else { 0 })
             }
             IPC_SET => set_perm(e, arg).map(|_| 0),
             GETVAL => Ok(e.sems[sem(num)?].val as i64),
@@ -612,9 +629,12 @@ pub fn msgctl(id: u64, cmd: u64, buf: u64) -> R {
             crate::syscall::put_guest(buf, &b)?;
             return Ok(used.max().unwrap_or(0) as i64);
         }
-        let slot = slot_of(t, id, 2)?;
+        let indexed = by_index(t, id, cmd, 2, 11, 13)?; // MSG_STAT, MSG_STAT_ANY
+        let slot = match indexed { Some((s, _)) => s, None => slot_of(t, id, 2)? };
+        let (full_id, cmd) = (id_of(t, slot), if indexed.is_some() { IPC_STAT } else { cmd });
         let e = &mut t.entries[slot];
         match cmd {
+            _ if indexed.is_some_and(|(_, any)| any) => {}
             IPC_RMID | IPC_SET => owner(e)?,
             IPC_STAT if !allowed(e, 4) => return Err(EACCES),
             IPC_STAT => {}
@@ -634,7 +654,8 @@ pub fn msgctl(id: u64, cmd: u64, buf: u64) -> R {
                 b.extend(e.lspid.to_le_bytes());
                 b.extend(e.lrpid.to_le_bytes());
                 b.resize(120, 0);
-                crate::syscall::put_guest(buf, &b)
+                crate::syscall::put_guest(buf, &b)?;
+                Ok(if indexed.is_some() { full_id } else { 0 })
             }
             IPC_SET => {
                 set_perm(e, buf)?;
