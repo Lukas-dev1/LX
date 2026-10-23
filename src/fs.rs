@@ -2628,7 +2628,8 @@ fn release(h: isize, start: u64, len: u64) -> Vec<(u64, u64, bool)> {
 // NT's byte-range locks don't say who holds them, and F_GETLK must report the holder's type, range and
 // pid (lslocks, "already running as pid N" checks, LTP fcntl11-21). Each process publishes its locks on
 // a file in a small shared table named after it, rewritten after each change; readers skip entries of
-// processes that have exited. ponytail: 64 entries per file; a lock past them just goes unreported.
+// processes that have exited. ponytail: 64 entries per file (a lock past them goes unreported); keyed by
+// path, so hard links to one file get separate tables.
 
 const LOCK_SLOTS: usize = 64;
 
@@ -2692,9 +2693,16 @@ fn publish_locks(host: &Path, h: isize) {
     let me = std::process::id();
     let pid = crate::proc::getpid().unwrap_or(0) as u32;
     let mine: Vec<(u64, u64, bool)> = LOCKS.lock().unwrap().iter().filter(|l| l.0 == h).map(|&(_, s, l, x)| (s, l, x)).collect();
+    // A hot path (SQLite locks and unlocks several times per transaction): only our own entries are
+    // rewritten, with no kernel calls; dead processes' entries are swept only when the table is full.
     with_lock_table(host, |t| {
-        for e in t.iter_mut().filter(|e| e.win == me || (e.win != 0 && !alive(e.win))) {
+        for e in t.iter_mut().filter(|e| e.win == me) {
             *e = Published::default();
+        }
+        if t.iter().filter(|e| e.win == 0).count() < mine.len() {
+            for e in t.iter_mut().filter(|e| e.win != 0 && !alive(e.win)) {
+                *e = Published::default();
+            }
         }
         let mut free = t.iter_mut().filter(|e| e.win == 0);
         for (s, l, x) in mine {
