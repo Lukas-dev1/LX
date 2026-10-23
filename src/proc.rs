@@ -19,6 +19,9 @@ struct Kid {
     process: OwnedHandle,
     /// SIGCHLD already raised for its exit.
     notified: bool,
+    /// Its process group as last seen (inherited from us at fork): an exited child's mailbox is gone,
+    /// and waitpid(0) / waitpid(-pgid) must still find it.
+    pgid: u32,
 }
 static CHILDREN: Mutex<Vec<Kid>> = Mutex::new(Vec::new());
 static PARENT: AtomicU32 = AtomicU32::new(0);
@@ -220,7 +223,8 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
         return Err(fail("child failed to rebuild the guest".into()));
     }
     let pid = child.id();
-    CHILDREN.lock().unwrap().push(Kid { pid, process: OwnedHandle::from(child), notified: false });
+    let pgid = signal::ids(None).map_or(self::pid(), |(g, _)| g);
+    CHILDREN.lock().unwrap().push(Kid { pid, process: OwnedHandle::from(child), notified: false, pgid });
     // A parent blocked in epoll_wait/poll/read hears of the exit at once, not at its next syscall return
     // (postgres's postmaster sleeps up to 60 s waiting for its startup process to exit).
     std::thread::spawn(move || {
@@ -358,18 +362,23 @@ pub fn waitid(idtype: u64, id: u64, info: u64, options: u64) -> R {
 /// Wait for a child matching `sel` to exit: (its pid, its lx exit code), None under !blocking when none
 /// has. `keep`: leave it waitable (WNOWAIT).
 fn wait_child(sel: Which, blocking: bool, keep: bool) -> Result<Option<(u32, u32)>, i64> {
-    let matches = |k: &Kid| match sel {
+    let matches = |k: &mut Kid| match sel {
         Which::Any => true,
         Which::Pid(p) => k.pid == p,
-        Which::Group(g) => signal::ids(Some(k.pid)).is_some_and(|(kg, _)| kg == g),
+        Which::Group(g) => {
+            if let Some((kg, _)) = signal::ids(Some(k.pid)) {
+                k.pgid = kg; // it may have moved (setpgid); once it has exited, the last one seen counts
+            }
+            k.pgid == g
+        }
     };
     loop {
         // Wait on our own duplicates with the lock released: other threads keep making syscalls,
         // and one of them may reap (and close) a child meanwhile.
         let waits: Vec<(u32, OwnedHandle)> = {
-            let kids = CHILDREN.lock().unwrap();
-            kids.iter().filter(|k| matches(k)).take(63)
-                .filter_map(|k| k.process.try_clone().ok().map(|h| (k.pid, h))).collect()
+            let mut kids = CHILDREN.lock().unwrap();
+            kids.iter_mut().filter_map(|k| if matches(k) { k.process.try_clone().ok().map(|h| (k.pid, h)) } else { None })
+                .take(63).collect()
         };
         if waits.is_empty() {
             return Err(ECHILD);
