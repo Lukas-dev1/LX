@@ -59,7 +59,8 @@ fn table_file(pid: u32, rest: &str) -> Option<String> {
         // pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime
         // cutime cstime priority nice threads itrealvalue starttime vsize rss ... (52 fields)
         "stat" => format!("{} ({}) S {} {} {} 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 {} 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-            p.pid, p.comm, p.ppid, p.pid, p.pid, p.start_ms / 10),
+            p.pid, p.comm, p.ppid, crate::proc::getpgid(p.pid).unwrap_or(p.pid as i64),
+            crate::proc::getsid(p.pid).unwrap_or(p.pid as i64), p.start_ms / 10),
         "status" => format!("Name:\t{}\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
                              Uid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t1\n",
             p.comm, p.pid, p.pid, p.ppid, u = p.uid, g = p.gid),
