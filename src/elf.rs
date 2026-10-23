@@ -32,6 +32,23 @@ fn u64_(f: &[u8], o: u64) -> Result<u64, String> { Ok(u64::from_le_bytes(rd(f, o
 struct Seg { flags: u32, off: u64, vaddr: u64, filesz: u64, memsz: u64 }
 
 /// `host`: the file on disk, so its segments can be shared copy-on-write views (see syscall::map_image).
+/// An ELF's PT_INTERP (its dynamic linker), read without loading anything.
+pub fn interp(f: &[u8]) -> Result<Option<String>, String> {
+    if f.get(..4) != Some(b"\x7fELF") || f.get(4) != Some(&2) || f.get(5) != Some(&1) {
+        return Err("not a 64-bit little-endian ELF".into());
+    }
+    let (phoff, phnum) = (u64_(f, 0x20)?, u16_(f, 0x38)?);
+    for i in 0..phnum {
+        let p = phoff + i * 56;
+        if u32_(f, p)? == PT_INTERP {
+            let (off, len) = (u64_(f, p + 8)? as usize, u64_(f, p + 0x20)? as usize);
+            let s = f.get(off..off.saturating_add(len)).ok_or("bad PT_INTERP")?;
+            return Ok(Some(String::from_utf8_lossy(s).trim_end_matches('\0').to_string()));
+        }
+    }
+    Ok(None)
+}
+
 pub fn load(f: &[u8], host: Option<&std::path::Path>) -> Result<Image, String> {
     if f.get(..4) != Some(b"\x7fELF") || f.get(4) != Some(&2) || f.get(5) != Some(&1) {
         return Err("not a 64-bit little-endian ELF".into());

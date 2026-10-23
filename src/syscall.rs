@@ -523,6 +523,35 @@ pub fn release_guest_memory() {
     crate::jump::clear();
 }
 
+/// execve in place: the old program's memory, views, shared memory attachments and code patches go,
+/// so the new one starts in an empty guest address space. We run on our own stack here (lx_direct or the
+/// exception handler's), but an allocation holding it would stay.
+pub fn reset_for_exec() {
+    let marker = 0u64;
+    let here = &marker as *const u64 as u64;
+    ALLOCS.lock().unwrap().retain(|&(base, len)| {
+        if (base..base + len).contains(&here) {
+            return true;
+        }
+        release_span(base, len);
+        false
+    });
+    unmap_views(0, u64::MAX);
+    for v in COW_VIEWS.lock().unwrap().drain(..) {
+        unsafe { CloseHandle(v.section) };
+    }
+    SHM_AT.lock().unwrap().clear();
+    {
+        let mut c = CODE.lock().unwrap();
+        c.regions.clear();
+        c.sites.clear();
+    }
+    crate::jump::clear();
+    MAP_GEN.fetch_add(1, Relaxed);
+    let t = ts();
+    (t.fs, t.clear_tid) = (0, 0);
+}
+
 /// Serialize everything a forked child needs to rebuild the guest's address space and runtime state.
 /// Committed sub-ranges carry their protection; the child copies their contents from us.
 pub fn snapshot() -> Vec<String> {

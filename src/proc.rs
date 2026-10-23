@@ -747,6 +747,13 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
         return Err(ENOEXEC); // the shell then runs it as a script itself
     }
     drop(bytes); // we only wait from here on: don't keep the whole program (traefik: 176 MB) while it runs
+    // A single-threaded process (shells, entrypoint scripts, `exec nginx`) replaces its program in place,
+    // as Linux does: no new Windows process to start (~20 ms) and none left behind waiting. With other
+    // threads it goes the old way: stopping them could leave one of our locks held (stop_others).
+    if crate::thread::live() == 1 && unsafe { GetCurrentThreadId() } == crate::thread::MAIN_TID.load(Relaxed)
+        && std::env::var("LX_NOINPLACE").map_or(true, |v| v != "1") {
+        return exec_in_place(&lookup, argv, env);
+    }
     let spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner()); // see fork
     let (mut state, handles) = fs::proc_state(false);
     state.push(PARENT.load(Relaxed).to_string()); // exec keeps the pid relationship
@@ -767,6 +774,20 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> R {
     syscall::release_guest_memory();
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
     exit(code as u64)
+}
+
+/// execve within this process. Everything that can fail is checked first (crate::prepare), so a bad
+/// program is still an error for the caller; past that point the old program is gone, as on Linux.
+/// Kept: the pid, children, ids, the signal mask and pending signals, ignored signals, fds without
+/// FD_CLOEXEC, alarm, seccomp filters. Reset: memory, code patches, handlers, POSIX timers, sigaltstack.
+fn exec_in_place(lookup: &str, argv: Vec<String>, env: Vec<String>) -> R {
+    let p = crate::prepare(lookup, argv, "").map_err(|(e, _)| e)?;
+    fs::close_cloexec();
+    signal::reset_for_exec();
+    syscall::reset_for_exec();
+    let e = crate::launch(p, env);
+    eprintln!("[lx] execve: {e}");
+    die(9) // too late for an error return, as on Linux
 }
 
 /// The exec'd side (`lx --exec <state>`): rebuild the fd table; returns (exe, argv, env).
