@@ -285,14 +285,90 @@ pub fn clone3(c: &mut Context, args: u64, size: u64) -> R {
 
 pub fn wait4(pid: i64, status: u64, options: u64) -> R {
     const WNOHANG: u64 = 1;
-    let blocking = options & WNOHANG == 0;
+    if options & !(WNOHANG | 2 | 8 | 0xe000_0000) != 0 {
+        return Err(syscall::EINVAL); // WUNTRACED, WCONTINUED, __WNOTHREAD/__WALL/__WCLONE are the rest
+    }
+    if pid == i32::MIN as i64 {
+        return Err(ESRCH); // -INT_MIN has no positive pid
+    }
+    let sel = match pid {
+        -1 => Which::Any,
+        0 => Which::Group(signal::ids(None).map_or(self::pid(), |(g, _)| g)),
+        p if p < 0 => Which::Group(host_pid(-p as u32)),
+        p => Which::Pid(host_pid(p as u32)),
+    };
+    let Some((pid, code)) = wait_child(sel, options & WNOHANG == 0, false)? else { return Ok(0) };
+    if status != 0 {
+        unsafe { *(status as *mut i32) = wait_status(code) as i32 };
+    }
+    Ok(pid as i64)
+}
+
+/// The wait status for an lx exit code: WIFSIGNALED with the signal, or WIFEXITED with WEXITSTATUS = code.
+fn wait_status(code: u32) -> u32 {
+    if code & 0xFFFF_0000 == SIGNALED { code & 0x7f } else { (code & 0xff) << 8 }
+}
+
+/// Which children a wait is for.
+#[derive(Clone, Copy)]
+enum Which {
+    Any,
+    Pid(u32),
+    /// Children in this process group (host pid of its leader).
+    Group(u32),
+}
+
+/// waitid(idtype, id, infop, options): P_ALL 0, P_PID 1, P_PGID 2; WEXITED required (stopped and
+/// continued children never happen here), WNOHANG, WNOWAIT leaves the child to be waited for again.
+/// infop gets a siginfo: SIGCHLD, CLD_EXITED or CLD_KILLED, the pid, uid and status.
+pub fn waitid(idtype: u64, id: u64, info: u64, options: u64) -> R {
+    const WNOHANG: u64 = 1;
+    const WEXITED: u64 = 4;
+    const WNOWAIT: u64 = 0x0100_0000;
+    if options & !(WNOHANG | 2 | WEXITED | 8 | WNOWAIT | 0xe000_0000) != 0 || options & (WEXITED | 2 | 8) == 0 {
+        return Err(syscall::EINVAL);
+    }
+    let sel = match idtype {
+        0 => Which::Any,
+        1 if id as i32 > 0 => Which::Pid(host_pid(id as u32)),
+        2 => Which::Group(if id == 0 { signal::ids(None).map_or(self::pid(), |(g, _)| g) } else { host_pid(id as u32) }),
+        _ => return Err(syscall::EINVAL),
+    };
+    if options & WEXITED == 0 {
+        // Only WSTOPPED/WCONTINUED: nothing here ever stops, so there's nothing to report.
+        return if options & WNOHANG != 0 { Ok(0) } else { Err(ECHILD) };
+    }
+    let got = wait_child(sel, options & WNOHANG == 0, options & WNOWAIT != 0)?;
+    if info != 0 {
+        let mut si = [0u8; 128];
+        if let Some((pid, code)) = got {
+            let killed = code & 0xFFFF_0000 == SIGNALED;
+            let put = |si: &mut [u8; 128], off: usize, v: i32| si[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            put(&mut si, 0, signal::SIGCHLD as i32);
+            put(&mut si, 8, if killed { 2 } else { 1 }); // CLD_KILLED, CLD_EXITED
+            put(&mut si, 16, guest_pid(pid) as i32);
+            put(&mut si, 20, UID.load(Relaxed) as i32);
+            put(&mut si, 24, if killed { (code & 0x7f) as i32 } else { (code & 0xff) as i32 });
+        }
+        crate::syscall::put_guest(info, &si)?; // under WNOHANG with none ready: zeroed, si_pid 0
+    }
+    Ok(0)
+}
+
+/// Wait for a child matching `sel` to exit: (its pid, its lx exit code), None under !blocking when none
+/// has. `keep`: leave it waitable (WNOWAIT).
+fn wait_child(sel: Which, blocking: bool, keep: bool) -> Result<Option<(u32, u32)>, i64> {
+    let matches = |k: &Kid| match sel {
+        Which::Any => true,
+        Which::Pid(p) => k.pid == p,
+        Which::Group(g) => signal::ids(Some(k.pid)).is_some_and(|(kg, _)| kg == g),
+    };
     loop {
         // Wait on our own duplicates with the lock released: other threads keep making syscalls,
         // and one of them may reap (and close) a child meanwhile.
         let waits: Vec<(u32, OwnedHandle)> = {
             let kids = CHILDREN.lock().unwrap();
-            // ponytail: process groups (pid 0 or < -1) are treated as "any child".
-            kids.iter().filter(|k| pid <= 0 || k.pid as i64 == pid).take(63)
+            kids.iter().filter(|k| matches(k)).take(63)
                 .filter_map(|k| k.process.try_clone().ok().map(|h| (k.pid, h))).collect()
         };
         if waits.is_empty() {
@@ -311,19 +387,17 @@ pub fn wait4(pid: i64, status: u64, options: u64) -> R {
             continue;
         }
         if r >= n {
-            return Ok(0); // WAIT_TIMEOUT under WNOHANG
+            return Ok(None); // WAIT_TIMEOUT under WNOHANG
         }
         let mut kids = CHILDREN.lock().unwrap();
         let Some(i) = kids.iter().position(|k| k.pid == waits[r].0) else { continue }; // reaped elsewhere
-        let kid = kids.remove(i);
         let mut code = 0u32;
-        unsafe { GetExitCodeProcess(kid.process.as_raw_handle() as isize, &mut code) };
-        if status != 0 {
-            // WIFSIGNALED with the signal, or WIFEXITED with WEXITSTATUS = code.
-            let st = if code & 0xFFFF_0000 == SIGNALED { code & 0x7f } else { (code & 0xff) << 8 };
-            unsafe { *(status as *mut i32) = st as i32 };
+        unsafe { GetExitCodeProcess(kids[i].process.as_raw_handle() as isize, &mut code) };
+        let pid = kids[i].pid;
+        if !keep {
+            kids.remove(i);
         }
-        return Ok(kid.pid as i64);
+        return Ok(Some((pid, code)));
     }
 }
 

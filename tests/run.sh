@@ -55,6 +55,7 @@ cc_static 2 rootfs/restarttest guest/restarttest.c
 cc_static 2 rootfs/ptimer guest/ptimer.c
 cc_static 1 rootfs/spinsig guest/spinsig.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
+cc_static 2 rootfs/waitidtest guest/waitidtest.c
 cc_static 2 rootfs/shfutex guest/shfutex.c
 cc_static 2 rootfs/sysbench guest/sysbench.c
 cc_static 2 rootfs/xmmtest guest/xmmtest.c
@@ -102,6 +103,7 @@ expect "SA_RESTART: an interrupted read continues" 0 "read=1" -- rootfs /restart
 expect "POSIX timers: a periodic timer_create timer keeps firing" 0 "ticks=3 armed=1" -- rootfs /ptimer
 expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
+expect "waitid: P_PID, WNOWAIT, CLD_KILLED, WNOHANG" 0 "peek=1 reap=1 killed=1 none=1" -- rootfs /waitidtest
 expect "a shared futex wakes another process (FUTEX_WAKE counts it)" 0 "woke=1 child=0" -- rootfs /shfutex
 expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regress.sh
 expect "entrypoint.sh"    0   "APP_MODE=production"      -- rootfs/alpine /entrypoint.sh
