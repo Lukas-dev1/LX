@@ -1891,10 +1891,11 @@ fn nanosleep(ts: u64, rem: u64) -> R {
         return Err(EINVAL);
     }
     let start = Instant::now();
-    let r = signal::interruptible_sleep(timespec_ms(ts).clamp(0, u32::MAX as i64 - 1) as u32);
+    let [s, ns] = unsafe { *(ts as *const [u64; 2]) };
+    let want = std::time::Duration::new(s, ns as u32);
+    let r = signal::precise_sleep(want);
     if r == Err(EINTR) {
-        let [s, ns] = unsafe { *(ts as *const [u64; 2]) };
-        remaining(rem, std::time::Duration::new(s, ns as u32), start);
+        remaining(rem, want, start);
     }
     r
 }
@@ -1970,7 +1971,7 @@ fn clock_nanosleep(clock: u64, flags: u64, req: u64, rem: u64) -> R {
         return Ok(0);
     }
     // A signal cuts it short (EINTR), as for nanosleep: Python's and glibc's sleep() come here.
-    let r = signal::interruptible_sleep(((wait.as_nanos() + 999_999) / 1_000_000).min(u32::MAX as u128 - 1) as u32);
+    let r = signal::precise_sleep(wait);
     if r == Err(EINTR) && flags & TIMER_ABSTIME == 0 {
         remaining(rem, wait, start);
     }
