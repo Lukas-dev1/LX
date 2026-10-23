@@ -998,7 +998,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         17 => fs::pread(a[0], a[1], a[2], a[3], false),
         18 => fs::pread(a[0], a[1], a[2], a[3], true),
         19 => fs::readv(a[0], a[1], a[2]),
-        295 | 327 => fs::preadv(a[0], a[1], a[2], a[3], false), // preadv, preadv2 (flags ignored)
+        327 | 328 if a[5] & !0x1f != 0 => Err(95), // preadv2/pwritev2: unknown RWF_* flags are EOPNOTSUPP (known ones are hints)
+        295 | 327 => fs::preadv(a[0], a[1], a[2], a[3], false), // preadv, preadv2
         296 | 328 => fs::preadv(a[0], a[1], a[2], a[3], true),  // pwritev, pwritev2
         285 => fs::fallocate(a[0], a[1], a[2], a[3]),
         37 => Ok(signal::set_alarm(a[0] * 1000, 0).0.div_ceil(1000) as i64), // alarm: the seconds left of the old one
@@ -1228,7 +1229,17 @@ pub fn write_handle(h: isize, buf: u64, len: u64) -> R {
     match err {
         232 | 109 => Err(EPIPE),
         995 => Err(EINTR), // a signal cancelled the write
-        _ => Err(EIO),
+        e => Err(io_errno(e)),
+    }
+}
+
+/// A failed ReadFile/WriteFile's error as Linux reports it; the rest is EIO.
+pub fn io_errno(err: u32) -> i64 {
+    match err {
+        5 => EBADF,   // ERROR_ACCESS_DENIED: the fd isn't open for this direction (write to a pipe's read end)
+        998 => EFAULT, // ERROR_NOACCESS: the guest buffer isn't mapped (NT probed it)
+        87 => EINVAL, // ERROR_INVALID_PARAMETER
+        _ => EIO,
     }
 }
 
@@ -1242,7 +1253,7 @@ pub fn read_handle(h: isize, buf: u64, len: u64) -> R {
     match err {
         109 => Ok(0),       // ERROR_BROKEN_PIPE is EOF
         995 => Err(EINTR),  // ERROR_OPERATION_ABORTED: a signal cancelled the read
-        _ => Err(EIO),
+        e => Err(io_errno(e)),
     }
 }
 
