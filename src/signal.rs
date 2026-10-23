@@ -352,11 +352,11 @@ pub fn listen() {
     }
     let me = unsafe { GetCurrentProcessId() };
     let Some((mb, ev)) = mailbox(me, true) else { return };
-    // Process group and session: inherited from the parent lx (LX_IDS, see spawn_lx), else our own.
+    // Process group and session: inherited from the parent lx (LX_PGRP, see spawn_lx), else our own.
     // An exec'd program keeps them where its pid's mailbox is: the predecessor's, which stays as a proxy.
     let own = match proc::pid() {
         p if p == me => {
-            let ids = std::env::var("LX_IDS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(me as u64 | (me as u64) << 32);
+            let ids = std::env::var("LX_PGRP").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(me as u64 | (me as u64) << 32);
             mb[1].store(ids, SeqCst);
             Some(mb)
         }

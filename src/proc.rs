@@ -147,7 +147,7 @@ fn spawn_lx(mode: &str, extra: &[String], state: Vec<String>) -> std::io::Result
     let (r, w) = inheritable_pipe()?;
     let (pgid, sid) = signal::ids(None).unwrap_or_default(); // the child starts in our group and session
     let mut child = std::process::Command::new(std::env::current_exe()?).arg(mode).arg(raw(&r)).args(extra)
-        .env("LX_IDS", (pgid as u64 | (sid as u64) << 32).to_string()).creation_flags(no_console_flags()).spawn()?;
+        .env("LX_PGRP", (pgid as u64 | (sid as u64) << 32).to_string()).creation_flags(no_console_flags()).spawn()?;
     drop(r);
     let (mut w, state) = (std::fs::File::from(w), state.join("\0"));
     let mut rest = state.as_bytes();
