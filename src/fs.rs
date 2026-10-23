@@ -2716,8 +2716,10 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
 
 /// F_GETPIPE_SZ / F_SETPIPE_SZ: a pipe's capacity as the guest set it (64 KB until then). Linux rounds a
 /// request up to a power-of-two number of pages; more than /proc/sys/fs/pipe-max-size (1 MB) is EPERM
-/// without CAP_SYS_RESOURCE, less than the data already in it EBUSY.
-/// ponytail: only remembered, keyed by the pipe end's handle; NT's own pipe buffer doesn't change.
+/// without CAP_SYS_RESOURCE.
+/// ponytail: only remembered (NT's own pipe buffer doesn't change), per pipe end rather than per pipe,
+/// keyed by the end's handle and never forgotten, so a reused handle value starts with the old size;
+/// no EBUSY for shrinking below the queued data.
 fn pipe_size(fd: u64, set: Option<u64>) -> R {
     static SIZES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
     let key = with(|fs| match fs.fd(fd)? {
