@@ -2285,6 +2285,15 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
         if meta.is_none() && flags & O_CREAT == 0 {
             return Err(ENOENT); // the lookup just found nothing: no host open to fail
         }
+        // An existing entry opens only as its mode allows the caller (O_TRUNC needs write too); O_PATH
+        // only names it and needs nothing (fchdir, AT_EMPTY_PATH, a dirfd: Go's os.Root, find -execdir).
+        const O_PATH: u64 = 0o10000000;
+        if let Some(m) = &meta && flags & O_PATH == 0 && fs.keeps_meta(&comps_of(&guest)) {
+            let want = match flags & 3 { 0 => 4, 1 => 2, _ => 6 } | if flags & O_TRUNC != 0 { 2 } else { 0 };
+            if !may_access(&host, m, want) {
+                return Err(EACCES);
+            }
+        }
         let is_dir = meta.is_some_and(|m| m.dir);
         let acc = flags & 3;
         let changes = acc != 0 || flags & (O_CREAT | O_TRUNC) != 0;
@@ -3207,16 +3216,22 @@ pub fn faccessat(dirfd: u64, path: u64, mode: u64) -> R {
         return Ok(0);
     }
     let m = attrs(&host).ok_or(ENOENT)?;
+    if mode == 0 || may_access(&host, &m, mode as u32) { Ok(0) } else { Err(EACCES) }
+}
+
+/// May the caller have `want` (4 read, 2 write, 1 execute/search) on the entry at `host`, by its stored
+/// mode and owner? Root may read and write anything, and execute what has any x bit (or is a directory).
+/// Entries without stored metadata allow it.
+/// ponytail: AT_EACCESS and capabilities aren't considered; a volume's files are the host's (callers skip).
+fn may_access(host: &Path, m: &Attrs, want: u32) -> bool {
     // Through stat's cache: which, make and shells call access(X_OK) for every $PATH entry.
-    let Some([perm, uid, gid]) = (mode != 0).then(|| cached(&METAS, &host, m.mtime, || get_meta(&host))).flatten() else { return Ok(0) };
-    let (me, my_gid) = (crate::proc::UID.load(std::sync::atomic::Ordering::Relaxed), crate::proc::GID.load(std::sync::atomic::Ordering::Relaxed));
-    let ok = if me == 0 {
-        mode & 1 == 0 || m.dir || perm & 0o111 != 0
-    } else {
-        let bits = if me == uid { perm >> 6 } else if my_gid == gid || crate::proc::in_group(gid) { perm >> 3 } else { perm } & 7;
-        mode as u32 & !bits == 0
-    };
-    if ok { Ok(0) } else { Err(EACCES) }
+    let Some([perm, uid, gid]) = cached(&METAS, host, m.mtime, || get_meta(host)) else { return true };
+    let me = crate::proc::UID.load(std::sync::atomic::Ordering::Relaxed);
+    if me == 0 {
+        return want & 1 == 0 || m.dir || perm & 0o111 != 0;
+    }
+    let bits = if me == uid { perm >> 6 } else if crate::proc::in_group(gid) { perm >> 3 } else { perm } & 7;
+    want & !bits == 0
 }
 
 /// The guest path of the running ELF, for /proc/self/exe (ld.so resolves $ORIGIN with it).
