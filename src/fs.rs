@@ -1315,6 +1315,7 @@ enum Io {
     Sock(Arc<Sock>),
     Event(Arc<EventFd>),
     Signal(Arc<crate::signal::SignalFd>),
+    Epoll(Arc<Mutex<crate::net::Epoll>>),
 }
 
 fn io_target(fd: u64) -> Result<Io, i64> {
@@ -1324,6 +1325,7 @@ fn io_target(fd: u64) -> Result<Io, i64> {
         Fd::Event(e) => Ok(Io::Event(e.clone())),
         Fd::Signal(s) => Ok(Io::Signal(s.clone())),
         Fd::Pipe(p) => Ok(Io::Pipe(p.clone())),
+        Fd::Epoll(e) => Ok(Io::Epoll(e.clone())),
         other => handle(other).map(Io::Handle),
     })
 }
@@ -1345,6 +1347,7 @@ pub fn read(fd: u64, buf: u64, len: u64) -> R {
             Ok(len as i64)
         }
         Io::Dev(Dev::Random) => crate::syscall::getrandom(buf, len),
+        Io::Epoll(_) => Err(EINVAL),
     }
 }
 
@@ -1356,7 +1359,7 @@ pub fn write(fd: u64, buf: u64, len: u64) -> R {
         Io::Sock(s) => s.send(buf, len, 0),
         Io::Dev(_) => Ok(len as i64), // devices swallow writes
         Io::Event(e) => e.write(buf, len),
-        Io::Signal(_) => Err(EINVAL),
+        Io::Signal(_) | Io::Epoll(_) => Err(EINVAL),
     }
 }
 
@@ -1401,15 +1404,13 @@ pub fn readiness(fd: i32, events: i16) -> i16 {
     if fd < 0 {
         return 0;
     }
-    if let Ok(ep) = epoll(fd as u64) {
-        return if crate::net::epoll_ready(&ep) { events & POLLIN } else { 0 };
-    }
     match io_target(fd as u64) {
         Err(_) => POLLNVAL,
         Ok(Io::Dev(_)) => events & (POLLIN | POLLOUT),
         Ok(Io::Sock(s)) => s.ready(events),
         Ok(Io::Event(e)) => e.ready(events),
         Ok(Io::Signal(s)) => s.ready(events),
+        Ok(Io::Epoll(e)) => if crate::net::epoll_ready(&e) { events & POLLIN } else { 0 },
         Ok(Io::Pipe(p)) => p.ready(events),
         Ok(Io::Handle(h)) => match unsafe { crate::win::GetFileType(h) } {
             3 => {
