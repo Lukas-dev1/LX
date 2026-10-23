@@ -254,12 +254,15 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
-fn mailbox(pid: u32, create: bool) -> Option<(&'static AtomicU64, isize)> {
+/// A process's mailbox: [pending signal bits, process group | session << 32] (both as host pids).
+type Mailbox = [AtomicU64; 2];
+
+fn mailbox(pid: u32, create: bool) -> Option<(&'static Mailbox, isize)> {
     use crate::win::*;
     let (map_name, ev_name) = (wide(&format!("Local\\lx-sig-{pid}")), wide(&format!("Local\\lx-sigev-{pid}")));
     unsafe {
         let (map, ev) = if create {
-            (CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, 0, 8, map_name.as_ptr()),
+            (CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, 0, 16, map_name.as_ptr()),
              CreateEventW(std::ptr::null_mut(), 0, 0, ev_name.as_ptr()))
         } else {
             (OpenFileMappingW(FILE_MAP_WRITE, 0, map_name.as_ptr()), OpenEventW(EVENT_MODIFY_STATE, 0, ev_name.as_ptr()))
@@ -267,9 +270,9 @@ fn mailbox(pid: u32, create: bool) -> Option<(&'static AtomicU64, isize)> {
         if map == 0 || ev == 0 {
             return None;
         }
-        let view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 8);
+        let view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 16);
         // ponytail: sender-side handles and views are never closed; senders are short-lived.
-        (!view.is_null()).then(|| (&*(view as *const AtomicU64), ev))
+        (!view.is_null()).then(|| (&*(view as *const Mailbox), ev))
     }
 }
 
@@ -278,10 +281,62 @@ pub fn send(pid: u32, sig: u64) -> R {
     if sig == 0 || sig > 64 {
         return Err(EINVAL);
     }
-    let (bits, ev) = mailbox(pid, false).ok_or(crate::syscall::ESRCH)?;
-    bits.fetch_or(bit(sig), SeqCst);
+    let (b, ev) = mailbox(pid, false).ok_or(crate::syscall::ESRCH)?;
+    b[0].fetch_or(bit(sig), SeqCst);
     unsafe { crate::win::SetEvent(ev) };
     Ok(0)
+}
+
+/// Our own mailbox (set by listen).
+static OWN: std::sync::atomic::AtomicPtr<Mailbox> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// (process group, session) of host process `pid`, or ours for None. Read from the mailbox without keeping
+/// it mapped, since a group kill looks at every process on the machine.
+pub fn ids(pid: Option<u32>) -> Option<(u32, u32)> {
+    use crate::win::*;
+    let v = match pid {
+        None => match unsafe { OWN.load(SeqCst).as_ref() } {
+            Some(b) => b[1].load(SeqCst),
+            None => { let p = proc::pid() as u64; p | p << 32 }
+        },
+        Some(pid) => unsafe {
+            let map = OpenFileMappingW(FILE_MAP_WRITE, 0, wide(&format!("Local\\lx-sig-{pid}")).as_ptr());
+            if map == 0 {
+                return None;
+            }
+            let view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 16);
+            let v = view.as_ref().map(|_| (*(view as *const Mailbox))[1].load(SeqCst));
+            if !view.is_null() {
+                UnmapViewOfFile(view);
+            }
+            CloseHandle(map);
+            v?
+        },
+    };
+    Some((v as u32, (v >> 32) as u32))
+}
+
+/// Set the (process group, session) of host process `pid`, or ours for None.
+pub fn set_ids(pid: Option<u32>, pgid: u32, sid: u32) -> R {
+    let b = match pid {
+        None => unsafe { OWN.load(SeqCst).as_ref() }.ok_or(crate::syscall::ESRCH)?,
+        Some(pid) => mailbox(pid, false).ok_or(crate::syscall::ESRCH)?.0,
+    };
+    b[1].store(pgid as u64 | (sid as u64) << 32, SeqCst);
+    Ok(0)
+}
+
+/// Every lx process in process group `pgid` (host pids, mailbox names).
+pub fn group(pgid: u32) -> Vec<u32> {
+    unsafe extern "system" {
+        fn K32EnumProcesses(pids: *mut u32, cb: u32, needed: *mut u32) -> i32;
+    }
+    let mut pids = vec![0u32; 4096];
+    let mut n = 0u32;
+    unsafe { K32EnumProcesses(pids.as_mut_ptr(), 4 * pids.len() as u32, &mut n) };
+    pids.truncate(n as usize / 4);
+    pids.retain(|&p| p != 0 && ids(Some(p)).is_some_and(|(g, _)| g == pgid));
+    pids
 }
 
 /// Make this process signalable: create the mailbox, start the watcher, take over Ctrl-C.
@@ -295,10 +350,24 @@ pub fn listen() {
         INTR.store(CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()), SeqCst);
         SetConsoleCtrlHandler(Some(console_ctrl), 1);
     }
-    let Some((bits, ev)) = mailbox(unsafe { GetCurrentProcessId() }, true) else { return };
+    let me = unsafe { GetCurrentProcessId() };
+    let Some((mb, ev)) = mailbox(me, true) else { return };
+    // Process group and session: inherited from the parent lx (LX_IDS, see spawn_lx), else our own.
+    // An exec'd program keeps them where its pid's mailbox is: the predecessor's, which stays as a proxy.
+    let own = match proc::pid() {
+        p if p == me => {
+            let ids = std::env::var("LX_IDS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(me as u64 | (me as u64) << 32);
+            mb[1].store(ids, SeqCst);
+            Some(mb)
+        }
+        p => mailbox(p, false).map(|(b, _)| b),
+    };
+    if let Some(b) = own {
+        OWN.store(b as *const Mailbox as *mut Mailbox, SeqCst);
+    }
     std::thread::spawn(move || loop {
         unsafe { WaitForMultipleObjects(1, &ev, 0, u32::MAX) };
-        let mut b = bits.swap(0, SeqCst);
+        let mut b = mb[0].swap(0, SeqCst);
         while b != 0 {
             let sig = b.trailing_zeros() as u64 + 1;
             b &= b - 1;

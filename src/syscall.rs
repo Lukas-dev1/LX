@@ -1110,9 +1110,12 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         317 => crate::seccomp::seccomp(a[0], a[1], a[2]),
         115 => Ok(0),                  // getgroups: no supplementary groups
         116 => Ok(0),                  // setgroups: accepted
-        109 => Ok(0),                  // setpgid. ponytail: no process groups / job control
+        109 => proc::setpgid(a[0] as u32, a[1] as u32),
         110 => proc::getppid(),
-        111 | 112 | 121 => proc::getpid(), // getpgrp, setsid, getpgid
+        111 => proc::getpgid(0), // getpgrp
+        112 => proc::setsid(),
+        121 => proc::getpgid(a[0] as u32),
+        124 => proc::getsid(a[0] as u32),
         158 if a[0] == 0x1002 => { ts().fs = a[1]; Ok(0) } // arch_prctl(ARCH_SET_FS)
         158 if a[0] == 0x1003 => { unsafe { *(a[1] as *mut u64) = ts().fs }; Ok(0) } // ARCH_GET_FS
         158 => Err(EINVAL), // the rest (CET, AMX, CPUID faulting): not supported, as glibc's probes expect

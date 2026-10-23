@@ -145,7 +145,9 @@ pub fn no_console_flags() -> u32 {
 fn spawn_lx(mode: &str, extra: &[String], state: Vec<String>) -> std::io::Result<Child> {
     use std::os::windows::process::CommandExt;
     let (r, w) = inheritable_pipe()?;
-    let mut child = std::process::Command::new(std::env::current_exe()?).arg(mode).arg(raw(&r)).args(extra).creation_flags(no_console_flags()).spawn()?;
+    let (pgid, sid) = signal::ids(None).unwrap_or_default(); // the child starts in our group and session
+    let mut child = std::process::Command::new(std::env::current_exe()?).arg(mode).arg(raw(&r)).args(extra)
+        .env("LX_IDS", (pgid as u64 | (sid as u64) << 32).to_string()).creation_flags(no_console_flags()).spawn()?;
     drop(r);
     let (mut w, state) = (std::fs::File::from(w), state.join("\0"));
     let mut rest = state.as_bytes();
@@ -358,15 +360,56 @@ pub fn kill(pid: i64, sig: u64) -> R {
     if pid == me {
         return if sig == 0 { Ok(0) } else { signal::raise(sig) }; // delivered when this syscall returns
     }
-    if pid <= 0 {
-        // ponytail: no process groups; "my group" / "everyone" means our children.
+    if pid == -1 {
+        // ponytail: "everyone" means our children.
         let pids: Vec<u32> = CHILDREN.lock().unwrap().iter().map(|k| k.pid).collect();
         for p in pids {
             let _ = kill(p as i64, sig);
         }
         return Ok(0);
     }
+    if pid <= 0 {
+        let pgid = if pid == 0 { signal::ids(None).ok_or(ESRCH)?.0 } else { host_pid(-pid as u32) };
+        let members = signal::group(pgid);
+        if members.is_empty() {
+            return Err(ESRCH);
+        }
+        let mine = members.contains(&unsafe { GetCurrentProcessId() }) || members.contains(&self::pid());
+        for p in members.into_iter().filter(|&p| p != unsafe { GetCurrentProcessId() } && p != self::pid()) {
+            let _ = send(p, sig);
+        }
+        return if mine && sig != 0 { signal::raise(sig) } else { Ok(0) }; // ourselves last, as we may die of it
+    }
     send(pid as u32, sig)
+}
+
+/// setpgid(pid, pgid): 0 means the caller / the target's own pid.
+pub fn setpgid(pid: u32, pgid: u32) -> R {
+    let target = if pid == 0 || host_pid(pid) == self::pid() { None } else { Some(host_pid(pid)) };
+    let me = target.unwrap_or(self::pid());
+    let pgid = if pgid == 0 { me } else { host_pid(pgid) };
+    let (_, sid) = signal::ids(target).ok_or(ESRCH)?;
+    signal::set_ids(target, pgid, sid)
+}
+
+pub fn getpgid(pid: u32) -> R {
+    let target = if pid == 0 || host_pid(pid) == self::pid() { None } else { Some(host_pid(pid)) };
+    Ok(guest_pid(signal::ids(target).ok_or(ESRCH)?.0) as i64)
+}
+
+pub fn getsid(pid: u32) -> R {
+    let target = if pid == 0 || host_pid(pid) == self::pid() { None } else { Some(host_pid(pid)) };
+    Ok(guest_pid(signal::ids(target).ok_or(ESRCH)?.1) as i64)
+}
+
+/// setsid: a new session and group led by us; EPERM if we already lead a group (like the container's pid 1).
+pub fn setsid() -> R {
+    let me = self::pid();
+    if signal::ids(None).is_some_and(|(g, _)| g == me) {
+        return Err(syscall::EPERM);
+    }
+    signal::set_ids(None, me, me)?;
+    Ok(guest_pid(me) as i64)
 }
 
 /// Signal any lx guest process by pid (the mailbox). SIGKILL goes the same way (the watcher thread exits,
