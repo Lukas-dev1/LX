@@ -73,13 +73,12 @@ pub fn getgroups(size: u64, list: u64) -> R {
     Ok(g.len() as i64)
 }
 
-/// setgroups(size, list): root only (CAP_SETGID), at most NGROUPS_MAX (65536).
+/// setgroups(size, list): at most NGROUPS_MAX (65536).
+/// ponytail: capabilities aren't modeled, so it isn't refused for lacking CAP_SETGID: setpriv and gosu
+/// keep it across their uid switch (PR_SET_KEEPCAPS) and call setgroups after, as redis's entrypoint does.
 pub fn setgroups(size: u64, list: u64) -> R {
     if size as i32 > 65536 || (size as i32) < 0 {
         return Err(syscall::EINVAL);
-    }
-    if UID.load(Relaxed) != 0 {
-        return Err(syscall::EPERM);
     }
     syscall::check_guest(list, size as usize * 4, false)?;
     let g: Vec<u32> = (0..size as usize).map(|i| unsafe { *(list as *const u32).add(i) }).collect();
