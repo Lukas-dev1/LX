@@ -100,7 +100,7 @@ expect "signalfd in epoll, woken by a child's signal" 0 "OK" -- rootfs /sigfdtes
 expect "SIGTERM reaches threads parked in futexes (Go idle)" 0 "sigfutex OK" -- rootfs /sigfutex
 expect "SA_RESTART: an interrupted read continues" 0 "read=1" -- rootfs /restarttest
 expect "POSIX timers: a periodic timer_create timer keeps firing" 0 "ticks=3 armed=1" -- rootfs /ptimer
-expect "SysV semaphores and message queues across fork" 0 "sysv waiting=1 got=hello n=16 child=0 nowait=EAGAIN/ENOMSG nsems=2 perm=1 info=1 key=1 gone=1" -- rootfs /sysvipc
+expect "SysV semaphores and message queues across fork" 0 "sysv waiting=1 got=hello n=16 child=0 nowait=EAGAIN/ENOMSG nsems=2 perm=1 info=1 stat=1 key=1 gone=1" -- rootfs /sysvipc
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
 expect "a shared futex wakes another process (FUTEX_WAKE counts it)" 0 "woke=1 child=0" -- rootfs /shfutex
 expect "regress.sh"       0   "ALL OK"                   -- rootfs/alpine /regress.sh
