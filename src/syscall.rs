@@ -1534,7 +1534,16 @@ fn mmap_growable(section: isize, sprot: u32, access: u32, fd: u64, off: u64, vle
 /// (in the same placeholder, so the address range stays ours) and have the guest retry. Also true when
 /// another thread just did that and the page is there now.
 fn grow_view(addr: u64, write: bool) -> bool {
-    let mut views = VIEWS.lock().unwrap();
+    // Every access violation comes through here: if lx itself faulted holding VIEWS, give up after a
+    // second (and crash with the fault) rather than deadlock; another thread holds it only briefly.
+    let start = std::time::Instant::now();
+    let mut views = loop {
+        match VIEWS.try_lock() {
+            Ok(v) => break v,
+            Err(_) if start.elapsed().as_secs() >= 1 => return false,
+            Err(_) => std::thread::yield_now(),
+        }
+    };
     let Some(v) = views.iter_mut().find(|v| v.full > v.len && (v.base..v.base + v.full).contains(&addr)) else {
         return false;
     };
