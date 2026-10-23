@@ -55,6 +55,8 @@ pub fn load_ids() {
 }
 
 /// Supplementary groups (setgroups; su, login and initgroups set them), inherited like the ids.
+/// ponytail: they ride in LX_IDS, and a Windows environment variable holds at most 32767 characters, so
+/// some 5000 groups or more would make the next fork or exec fail; no real system has that many.
 static GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// getgroups(size, list): with size 0 only the count; a list too short is EINVAL.
@@ -84,6 +86,11 @@ pub fn setgroups(size: u64, list: u64) -> R {
     *GROUPS.lock().unwrap() = g;
     save_ids();
     Ok(0)
+}
+
+/// Our supplementary groups (for /proc/self/status).
+pub fn groups() -> Vec<u32> {
+    GROUPS.lock().unwrap().clone()
 }
 
 /// Whether the caller is in group `gid` (its own or a supplementary one), for permission checks.

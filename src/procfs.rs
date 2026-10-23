@@ -181,7 +181,8 @@ fn status() -> String {
     let name = crate::fs::exe_name();
     let (uid, gid) = (crate::proc::UID.load(std::sync::atomic::Ordering::Relaxed), crate::proc::GID.load(std::sync::atomic::Ordering::Relaxed));
     format!("Name:\t{name}\nUmask:\t0022\nState:\tR (running)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\n\
-             Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n\
+             Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nGroups:\t{}\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n\
              SigBlk:\t0000000000000000\nCpus_allowed_list:\t0-{}\n",
+            crate::proc::groups().iter().map(|g| format!("{g} ")).collect::<String>(),
             vsz >> 10, rss >> 10, crate::thread::live(), std::thread::available_parallelism().map_or(1, |n| n.get()) - 1)
 }
