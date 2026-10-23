@@ -512,6 +512,30 @@ pub fn attrs(p: &Path) -> Option<Attrs> {
     })
 }
 
+/// attrs() of a path in the image, which stays as it is while an upper layer takes the writes: from a
+/// listing of its directory, made once per process. Path searches (Erlang's code path, Python's
+/// imports, $PATH) probe many names per directory, mostly missing ones, and every host call costs
+/// tens of microseconds.
+/// ponytail: a directory is listed whole on first use, however big, and stays cached for the process.
+fn lower_attrs(p: &Path) -> Option<Attrs> {
+    use std::os::windows::fs::MetadataExt;
+    type Listing = Arc<HashMap<std::ffi::OsString, Attrs>>;
+    static DIRS: Mutex<Option<HashMap<PathBuf, Listing>>> = Mutex::new(None);
+    let (dir, name) = (p.parent()?, p.file_name()?);
+    let cached = DIRS.lock().unwrap().get_or_insert_with(HashMap::new).get(dir).cloned();
+    let listing = cached.unwrap_or_else(|| {
+        let entry = |e: fs::DirEntry| {
+            let m = e.metadata().ok()?;
+            let mtime = m.last_write_time().saturating_sub(116_444_736_000_000_000).saturating_mul(100);
+            Some((e.file_name(), Attrs { dir: m.is_dir(), len: m.file_size(), mtime, marker: m.file_attributes() & MARKER_ATTR != 0 }))
+        };
+        let l: Listing = Arc::new(fs::read_dir(dir).map(|rd| rd.flatten().filter_map(entry).collect()).unwrap_or_default());
+        DIRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(dir.to_path_buf(), l.clone());
+        l
+    });
+    listing.get(name).copied()
+}
+
 /// getdents' d_type for a directory entry, from what the listing already returned (no extra call):
 /// DT_DIR, DT_REG for a file that can't be one of our markers (empty, or larger than any: symlinks
 /// are at most 4096 bytes), else DT_UNKNOWN so the reader stats it (find over a big tree otherwise
@@ -743,7 +767,7 @@ impl Fs {
         if self.hidden(comps) {
             return (upper, None);
         }
-        match attrs(&lower) {
+        match lower_attrs(&lower) {
             Some(m) => (lower, Some(m)),
             None => (upper, None),
         }
@@ -956,7 +980,7 @@ impl Fs {
         };
         let mut lower = self.root.clone();
         lower.extend(comps.iter().map(|c| enc(c)));
-        if let Some(m) = attrs(&lower) {
+        if let Some(m) = lower_attrs(&lower) {
             return (lower, Some(m));
         }
         let mut upper = up.clone();
