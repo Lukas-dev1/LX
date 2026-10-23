@@ -3222,8 +3222,22 @@ pub fn truncate(dirfd: u64, path: u64, fd: Option<u64>, len: u64) -> R {
 /// sizes its /dev/shm segments so); FALLOC_FL_KEEP_SIZE alone has nothing to do. Hole punching etc.: EOPNOTSUPP.
 pub fn fallocate(fd: u64, mode: u64, off: u64, len: u64) -> R {
     const FALLOC_FL_KEEP_SIZE: u64 = 1;
+    if (off as i64) < 0 || (len as i64) <= 0 {
+        return Err(EINVAL);
+    }
+    if off + len > i64::MAX as u64 {
+        return Err(27); // EFBIG: past the largest file size
+    }
     with(|fs| {
-        let Fd::File { f, .. } = fs.fd(fd)? else { return Err(crate::syscall::ENODEV) };
+        let f = match fs.fd(fd)? {
+            Fd::File { f, .. } => f,
+            Fd::Pipe(_) | Fd::Socket(_) => return Err(ESPIPE),
+            Fd::Dir { .. } => return Err(EISDIR),
+            _ => return Err(crate::syscall::ENODEV),
+        };
+        if !writable_handle(f) {
+            return Err(EBADF); // opened read-only
+        }
         match mode {
             0 => {
                 let end = off.checked_add(len).ok_or(EINVAL)?;
@@ -3235,6 +3249,30 @@ pub fn fallocate(fd: u64, mode: u64, off: u64, len: u64) -> R {
             FALLOC_FL_KEEP_SIZE => Ok(0),
             _ => Err(95), // EOPNOTSUPP
         }
+    })
+}
+
+/// Whether an open file allows writing (FILE_WRITE_DATA in its granted access).
+fn writable_handle(f: &File) -> bool {
+    #[repr(C)]
+    struct AccessInfo { granted: u32 }
+    unsafe extern "system" {
+        fn NtQueryInformationFile(h: isize, iosb: *mut [usize; 2], info: *mut AccessInfo, len: u32, class: u32) -> i32;
+    }
+    let (mut iosb, mut info) = ([0usize; 2], AccessInfo { granted: 0 });
+    // FileAccessInformation (8)
+    let st = unsafe { NtQueryInformationFile(f.as_raw_handle() as isize, &mut iosb, &mut info, 4, 8) };
+    st != 0 || info.granted & 0x2 != 0 // FILE_WRITE_DATA; if we can't tell, let the write path decide
+}
+
+/// posix_fadvise: only advice, but its arguments are checked as Linux does.
+pub fn fadvise(fd: u64, len: u64, advice: u64) -> R {
+    if advice > 5 || (len as i64) < 0 {
+        return Err(EINVAL);
+    }
+    with(|fs| match fs.fd(fd)? {
+        Fd::Pipe(_) | Fd::Socket(_) => Err(ESPIPE),
+        _ => Ok(0),
     })
 }
 

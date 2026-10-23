@@ -1138,7 +1138,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         228 => clock_gettime(a[0], a[1]),
         229 => clock_getres(a[0], a[1]),
         201 => time(a[0]),
-        221 => Ok(0),                  // fadvise64: advice only
+        221 => fs::fadvise(a[0], a[2], a[3]), // fadvise64(fd, offset, len, advice)
         237 | 238 => Ok(0),            // mbind, set_mempolicy: NUMA placement has no meaning here; accept it
         239 => Err(ENOSYS),            // get_mempolicy: callers treat this as "no NUMA" 
         188..=199 => Err(95),          // *xattr: EOPNOTSUPP, like a filesystem without extended attributes
