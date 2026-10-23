@@ -116,6 +116,8 @@ pub struct EventFd {
     changed: std::sync::Condvar,
     semaphore: bool,
     nonblock: std::sync::atomic::AtomicBool,
+    /// Read since epoll last looked: its edge re-arms (see Pipe::rearm).
+    pub rearm: AtomicU32,
 }
 
 impl EventFd {
@@ -126,6 +128,7 @@ impl EventFd {
             changed: std::sync::Condvar::new(),
             semaphore: flags & EFD_SEMAPHORE != 0,
             nonblock: std::sync::atomic::AtomicBool::new(flags & O_NONBLOCK != 0),
+            rearm: AtomicU32::new(0),
         }
     }
 
@@ -335,13 +338,17 @@ pub struct Pipe {
     nonblock: std::sync::atomic::AtomicBool,
     /// A pseudo terminal's end: (its number, whether it's the master).
     pty: Option<(u32, bool)>,
+    /// Read since epoll last looked: an edge-triggered registration reports it again if data is there.
+    /// Linux signals an edge on each arrival; we only see states, and a reader that drained it to EAGAIN
+    /// while more came in before our next look would wait forever (cgo under go build: 6903 bytes unread).
+    pub rearm: AtomicU32,
 }
 
 impl Pipe {
     /// A pipe end from another lx process, `extra` as `extra()` made it.
     fn inherited(h: usize, extra: &str) -> Pipe {
         let pty = extra.get(2..).and_then(|n| n.parse().ok()).map(|n| (n, extra.as_bytes()[1] == b'm'));
-        Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: extra.starts_with('1').into(), pty }
+        Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: extra.starts_with('1').into(), pty, rearm: AtomicU32::new(0) }
     }
 
     fn extra(&self) -> String {
@@ -1335,7 +1342,7 @@ pub fn pipe2(fds: u64, flags: u64) -> R {
         return Err(EIO);
     }
     let nonblock = flags & O_NONBLOCK != 0;
-    let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None }));
+    let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0) }));
     let cloexec = flags & O_CLOEXEC != 0;
     let (a, b) = with(|fs| (fs.add(own(r), 0, cloexec), fs.add(own(w), 0, cloexec)));
     unsafe { *(fds as *mut [i32; 2]) = [a as i32, b as i32] };
@@ -1359,7 +1366,7 @@ pub fn internal_pipe(flags: u64) -> Result<(i64, OwnedHandle), i64> {
         unsafe { CloseHandle(r) };
         return Err(EIO);
     }
-    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None };
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0) };
     Ok((add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0), unsafe { OwnedHandle::from_raw_handle(w as _) }))
 }
 
@@ -1421,7 +1428,11 @@ fn io_target(fd: u64) -> Result<Io, i64> {
 }
 
 pub fn read(fd: u64, buf: u64, len: u64) -> R {
-    match io_target(fd)? {
+    let target = io_target(fd)?;
+    if let Io::Pipe(p) = &target {
+        p.rearm.store(1, Relaxed); // see Pipe::rearm
+    }
+    match target {
         Io::Handle(h) if is_console(h) => read_console(h, buf, len),
         Io::Handle(h) => read_handle(h, buf, len),
         Io::Pipe(p) if p.is_pts() => pts_read(&p, buf, len),
@@ -1429,7 +1440,10 @@ pub fn read(fd: u64, buf: u64, len: u64) -> R {
         Io::Pipe(p) if p.pty.is_some() => p.io(buf, len, false).and_then(|n| if n == 0 && len > 0 { Err(EIO) } else { Ok(n) }),
         Io::Pipe(p) => p.io(buf, len, false),
         Io::Sock(s) => s.recv(buf, len, 0),
-        Io::Event(e) => e.read(buf, len),
+        Io::Event(e) => {
+            e.rearm.store(1, Relaxed);
+            e.read(buf, len)
+        }
         Io::Signal(s) => s.read(buf, len),
         Io::Dev(Dev::Null) => Ok(0),
         Io::Dev(Dev::Zero) => {
@@ -1470,6 +1484,15 @@ pub fn epoll(fd: u64) -> Result<Arc<Mutex<Epoll>>, i64> {
 /// Whether fd is a regular file or directory (never "not ready", so epoll refuses it).
 pub fn is_file(fd: u64) -> bool {
     with(|fs| matches!(fs.fd(fd), Ok(Fd::File { .. } | Fd::Dir { .. })))
+}
+
+/// Whether fd (a pipe or eventfd) was read since the last call: epoll then re-arms its edge.
+pub fn take_rearm(fd: i32) -> u32 {
+    with(|fs| match fs.fd(fd as u64) {
+        Ok(Fd::Pipe(p)) => p.rearm.swap(0, Relaxed),
+        Ok(Fd::Event(e)) => e.rearm.swap(0, Relaxed),
+        _ => 0,
+    })
 }
 
 pub fn add_fd(fd: Fd, cloexec: bool) -> i64 {
@@ -1688,7 +1711,7 @@ fn pty_stat(pty: Option<(u32, bool)>) -> [u64; 18] {
 }
 
 fn add_pty(h: isize, n: u32, master: bool, flags: u64) -> R {
-    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: Some((n, master)) };
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: Some((n, master)), rearm: AtomicU32::new(0) };
     Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
 }
 
@@ -1777,7 +1800,7 @@ fn open_fifo(id: u64, flags: u64) -> R {
     } else {
         return fifo_reader(name, flags);
     };
-    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None };
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0) };
     Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
 }
 
@@ -1886,7 +1909,7 @@ fn fifo_reader(name: Vec<u16>, flags: u64) -> R {
             }
         });
     });
-    let fd = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None };
+    let fd = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0) };
     if flags & 3 == 0 && flags & O_NONBLOCK == 0 {
         // Linux's open waits for a writer.
         while first.recv_timeout(std::time::Duration::from_millis(5)).is_err() {
