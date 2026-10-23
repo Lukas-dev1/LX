@@ -842,6 +842,13 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
         let readable = ok && m.state == MEM_COMMIT && m.protect & 0xff & !0x01 != 0; // not PAGE_NOACCESS
         if readable { (m.base as u64 + m.region_size as u64).min(c.rip + 15) } else { c.rip }
     };
+    const STATUS_SINGLE_STEP: u32 = 0x8000_0004;
+    if rec.code == STATUS_SINGLE_STEP {
+        // signal::kick's trap flag: deliver here if this is guest code; past a jump into lx (or a DLL) the
+        // signal goes as that syscall returns instead.
+        c.eflags &= !0x100;
+        return if region.is_some() || jit { resume_with_signals(c) } else { EXCEPTION_CONTINUE_EXECUTION };
+    }
     let Some((_, end)) = region.or(jit.then(|| (c.rip, jit_end()))) else {
         if debug() && rec.code == STATUS_ACCESS_VIOLATION {
             let base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;

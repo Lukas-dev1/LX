@@ -15,6 +15,11 @@ static LIVE: AtomicU64 = AtomicU64::new(1);
 /// Other guest threads (tid, handle), so execve can stop them like Linux does.
 static THREADS: Mutex<Vec<(u32, isize)>> = Mutex::new(Vec::new());
 
+/// The Windows handle of guest thread `tid` (0 if it isn't one of ours).
+pub fn handle_of(tid: u32) -> isize {
+    THREADS.lock().unwrap().iter().find(|t| t.0 == tid).map_or(0, |t| t.1)
+}
+
 pub fn set_main() {
     MAIN_TID.store(unsafe { GetCurrentThreadId() }, Relaxed);
 }
