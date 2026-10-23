@@ -14,6 +14,7 @@ mod ptable;
 mod seccomp;
 mod signal;
 mod syscall;
+mod sysvipc;
 mod thread;
 
 use std::ffi::c_void;
