@@ -2704,11 +2704,23 @@ fn chmeta(fs: &Fs, c: &[String], host: &Path, mode: Option<u64>, owner: Option<(
     let mut m = get_meta(&up).or_else(|| get_meta(host)).unwrap_or([0o755, 0, 0]);
     if let Some(mode) = mode {
         m[0] = mode as u32 & 0o7777;
+        // Setting S_ISGID takes being root or in the file's group, else it's dropped silently.
+        let (uid, gid) = (crate::proc::UID.load(std::sync::atomic::Ordering::Relaxed), crate::proc::GID.load(std::sync::atomic::Ordering::Relaxed));
+        if uid != 0 && gid != m[2] {
+            m[0] &= !0o2000;
+        }
     }
     if let Some((uid, gid)) = owner {
         for (slot, id) in [(1, uid as u32), (2, gid as u32)] {
             if id != u32::MAX {
                 m[slot] = id;
+            }
+        }
+        // chown of a non-directory drops S_ISUID, and S_ISGID when it's group-executable, even for root.
+        if !dir {
+            m[0] &= !0o4000;
+            if m[0] & 0o2010 == 0o2010 {
+                m[0] &= !0o2000;
             }
         }
     }
