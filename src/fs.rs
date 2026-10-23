@@ -2875,9 +2875,9 @@ fn chmeta(fs: &Fs, c: &[String], host: &Path, mode: Option<u64>, owner: Option<(
     let mut m = get_meta(&up).or_else(|| get_meta(host)).unwrap_or([0o755, 0, 0]);
     if let Some(mode) = mode {
         m[0] = mode as u32 & 0o7777;
-        // Setting S_ISGID takes being root or in the file's group, else it's dropped silently.
-        let (uid, gid) = (crate::proc::UID.load(std::sync::atomic::Ordering::Relaxed), crate::proc::GID.load(std::sync::atomic::Ordering::Relaxed));
-        if uid != 0 && gid != m[2] {
+        // Setting S_ISGID takes being root or in the file's group (supplementary ones count), else it's
+        // dropped silently.
+        if crate::proc::UID.load(std::sync::atomic::Ordering::Relaxed) != 0 && !crate::proc::in_group(m[2]) {
             m[0] &= !0o2000;
         }
     }
