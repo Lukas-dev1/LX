@@ -1840,16 +1840,20 @@ fn pts_read(p: &Pipe, buf: u64, len: u64) -> R {
         data.iter_mut().filter(|b| **b == b'\r').for_each(|b| *b = b'\n');
     }
     let mut n = n as usize;
-    if t[3] & ISIG != 0 && data.contains(&3) {
+    let vintr = (t[4] >> 8) as u8; // c_cc[VINTR], after c_line
+    if t[3] & ISIG != 0 && data.contains(&vintr) {
         // ponytail: the signal goes to the reader, not the foreground process group lx doesn't track.
         n = 0;
         for i in 0..data.len() {
-            if data[i] != 3 {
+            if data[i] != vintr {
                 data[n] = data[i];
                 n += 1;
             }
         }
         let _ = crate::signal::raise(2);
+        if n == 0 {
+            return Err(crate::syscall::EINTR); // not EOF: a handler (SA_RESTART) reads on
+        }
     }
     if t[3] & ECHO != 0 && n > 0 {
         // ponytail: echoed as is, no ECHOE erase or ECHOCTL ^X forms.

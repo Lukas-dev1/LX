@@ -36,4 +36,17 @@ if pid == 0:
     os._exit(0)
 os.write(fd, b"\x03")
 assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == -2
+
+# A child that handles SIGINT sees ^C as the signal, not as end of input, and reads on.
+pid, fd = pty.fork()
+if pid == 0:
+    import signal
+    signal.signal(signal.SIGINT, lambda *_: os.write(1, b"INT "))
+    os.write(1, b"ready ")
+    os._exit(len(os.read(0, 10)))
+os.read(fd, 100)  # "ready ": the handler is set
+os.write(fd, b"\x03")
+os.read(fd, 100)  # "INT "
+os.write(fd, b"ok\r")
+assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 3
 print("pty OK")
