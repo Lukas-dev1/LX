@@ -12,7 +12,6 @@
 //! follows costs a ~2.7 KB exception frame below the guest rsp (fatal on Go's small goroutine stacks).
 //! Their stub reloads FS base first, with no stack and no flags: rax is parked in a TEB slot via gs:.
 use iced_x86::{BlockEncoder, BlockEncoderOptions, FlowControl, Instruction, InstructionBlock, Mnemonic, OpKind, Register};
-use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -82,22 +81,32 @@ fn area_near(s: &mut State, lo: u64, hi: u64, need: u64) -> Option<usize> {
 /// Near branch targets inside [lo, hi): the places a rewrite must not cover (except at its first byte).
 /// Streams the decoder: a whole code region as a Vec<Instruction> is ~10x its size (numpy's 30 MB
 /// OpenBLAS would need 320 MB), and the windowed rewrite below only ever looks 4 instructions back.
-fn branch_targets(instrs: impl IntoIterator<Item = Instruction>, lo: u64, hi: u64) -> HashSet<u64> {
-    let mut t = HashSet::new();
-    for i in instrs {
-        let i = &i;
-        let target = match i.flow_control() {
-            FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::Call
-                if matches!(i.op0_kind(), OpKind::NearBranch64 | OpKind::NearBranch32 | OpKind::NearBranch16) => i.near_branch_target(),
-            // Code addresses taken with lea (function pointers, computed gotos): treat as targets too.
-            _ if i.is_ip_rel_memory_operand() && i.mnemonic() == Mnemonic::Lea => i.ip_rel_memory_address(),
-            _ => continue,
-        };
-        if (lo..hi).contains(&target) {
-            t.insert(target);
-        }
+fn branch_targets(instrs: impl IntoIterator<Item = Instruction>, lo: u64, hi: u64) -> Targets {
+    let mut t: Vec<u64> = instrs.into_iter().filter_map(|i| target_of(&i, lo, hi)).collect();
+    t.sort_unstable();
+    t.dedup();
+    Targets(t)
+}
+
+/// Where `i` may send control inside [lo, hi), if anywhere.
+fn target_of(i: &Instruction, lo: u64, hi: u64) -> Option<u64> {
+    let target = match i.flow_control() {
+        FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::Call
+            if matches!(i.op0_kind(), OpKind::NearBranch64 | OpKind::NearBranch32 | OpKind::NearBranch16) => i.near_branch_target(),
+        // Code addresses taken with lea (function pointers, computed gotos): treat as targets too.
+        _ if i.is_ip_rel_memory_operand() && i.mnemonic() == Mnemonic::Lea => i.ip_rel_memory_address(),
+        _ => return None,
+    };
+    (lo..hi).contains(&target).then_some(target)
+}
+
+/// Branch targets, sorted: cheaper to build than a hash set for a whole library's worth, same lookups.
+struct Targets(Vec<u64>);
+
+impl Targets {
+    fn contains(&self, a: &u64) -> bool {
+        self.0.binary_search(a).is_ok()
     }
-    t
 }
 
 fn simple(i: &Instruction) -> bool {
@@ -109,7 +118,7 @@ fn simple(i: &Instruction) -> bool {
 /// carries the jmp). Instructions before the site are taken first. Taking ones after it (forward) is
 /// only needed when a branch or a jump target sits right before the site, as with glibc's errno stores
 /// and its syscall wrappers.
-fn displace(instrs: &[Instruction], k: usize, targets: &HashSet<u64>) -> Option<(usize, usize)> {
+fn displace(instrs: &[Instruction], k: usize, targets: &Targets) -> Option<(usize, usize)> {
     let mut bytes = instrs[k].len();
     let mut j = k;
     while bytes < 5 && j > 0 && k - j < 4 && simple(&instrs[j - 1]) && !targets.contains(&instrs[j].ip()) {
@@ -238,7 +247,7 @@ fn install(s: &mut State, code: &mut [u8], addr: u64, start: u64, end: u64, ai: 
 }
 
 /// Count an %fs: site left on the fault fallback; with LX_PATCHLOG, say why (with the code around it).
-fn fs_left(instrs: &[Instruction], k: usize, targets: &HashSet<u64>, why: &str) {
+fn fs_left(instrs: &[Instruction], k: usize, targets: &Targets, why: &str) {
     FS_LEFT.fetch_add(1, Relaxed);
     if crate::syscall::patchlog() {
         use iced_x86::{Formatter, IntelFormatter};
@@ -260,7 +269,22 @@ fn fs_left(instrs: &[Instruction], k: usize, targets: &HashSet<u64>, why: &str) 
 pub fn rewrite(code: &mut [u8], addr: u64) -> Vec<u64> {
     use iced_x86::{Decoder, DecoderOptions};
     let hi = addr + code.len() as u64;
-    let targets = branch_targets(Decoder::with_ip(64, code, addr, DecoderOptions::NONE), addr, hi);
+    // One decode of the whole region: each instruction's offset, the branch targets, and where the sites
+    // are. Only the few instructions around a site are decoded again below (a libc is ~150k instructions,
+    // a few hundred sites; three whole decodes were most of an exec's start-up).
+    let mut starts: Vec<u32> = Vec::new();
+    let mut sites: Vec<usize> = Vec::new();
+    let mut targets: Vec<u64> = Vec::new();
+    for i in Decoder::with_ip(64, code, addr, DecoderOptions::NONE) {
+        if i.mnemonic() == Mnemonic::Syscall || is_fs_access(&i) {
+            sites.push(starts.len());
+        }
+        starts.push((i.ip() - addr) as u32);
+        targets.extend(target_of(&i, addr, hi));
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    let targets = Targets(targets);
     let mut fallback = Vec::new();
     let mut s = S.lock().unwrap();
     let mut busy: Vec<(u64, u64)> = Vec::new(); // byte ranges already rewritten
@@ -310,21 +334,13 @@ pub fn rewrite(code: &mut [u8], addr: u64) -> Vec<u64> {
             }
         }
     };
-    let mut instrs: Vec<Instruction> = Vec::with_capacity(9);
-    let mut k = 0; // the next site, as an index into instrs
-    for i in Decoder::with_ip(64, code, addr, DecoderOptions::NONE) {
-        if instrs.len() == 9 {
-            instrs.remove(0);
-            k -= 1;
-        }
-        instrs.push(i);
-        if instrs.len() - k == 5 {
-            site(&instrs, k);
-            k += 1;
-        }
-    }
-    for k in k..instrs.len() {
-        site(&instrs, k); // the last few, with less to look ahead at
+    // Each site with up to 4 instructions either side, decoded again from the recorded starts.
+    for &n in &sites {
+        let first = n.saturating_sub(4);
+        let count = (n + 5).min(starts.len()) - first;
+        let off = starts[first] as usize;
+        let instrs: Vec<Instruction> = Decoder::with_ip(64, &code[off..], addr + off as u64, DecoderOptions::NONE).into_iter().take(count).collect();
+        site(&instrs, n - first);
     }
     for (start, end, ai, stub, bytes) in patches {
         install(&mut s, code, addr, start, end, ai, stub, &bytes);
