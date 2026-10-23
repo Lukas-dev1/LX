@@ -1021,7 +1021,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         99 => sysinfo(a[0]),
         100 => times(a[0]),
         309 => getcpu(a[0], a[1]),
-        204 => sched_getaffinity(a[1], a[2]),
+        204 => sched_getaffinity(a[0], a[1], a[2]),
         // Scheduling policy: everything is SCHED_OTHER at priority 0; changes are accepted, not applied.
         // (pthread_getschedparam failing aborted Abseil's mutex setup in node's npm.)
         143 => { if a[1] != 0 { unsafe { *(a[1] as *mut i32) = 0 } }; Ok(0) } // sched_getparam
@@ -1099,7 +1099,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         88 => fs::symlinkat(a[0], CWD, a[1]),
         89 => fs::readlinkat(CWD, a[0], a[1], a[2]),
         95 => fs::umask(a[0]),
-        96 => gettimeofday(a[0]),
+        96 => gettimeofday(a[0], a[1]),
         102 | 107 => Ok(proc::UID.load(Relaxed) as i64), // getuid, geteuid
         104 | 108 => Ok(proc::GID.load(Relaxed) as i64), // getgid, getegid
         105 => proc::set_id(&proc::UID, a[0]),            // setuid
@@ -1227,6 +1227,11 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
     let mut done = 0usize;
     let ok = unsafe { WriteProcessMemory(GetCurrentProcess(), addr as *mut _, bytes.as_ptr(), bytes.len(), &mut done) };
     if ok != 0 && done == bytes.len() { Ok(0) } else { Err(EFAULT) }
+}
+
+/// u64s as the guest's little-endian bytes, for put_guest.
+pub fn as_bytes(v: &[u64]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
 // Guest buffers go straight to the NT kernel, which probes them: a bad pointer is an error, not a crash.
@@ -1891,10 +1896,13 @@ fn clock_gettime(clock: u64, ts: u64) -> R {
     Ok(0)
 }
 
-fn gettimeofday(tv: u64) -> R {
+fn gettimeofday(tv: u64, tz: u64) -> R {
+    if tz != 0 {
+        put_guest(tz, &[0; 8])?; // struct timezone: UTC, no DST
+    }
     if tv != 0 {
         let (s, ns) = now(0);
-        unsafe { *(tv as *mut [u64; 2]) = [s, ns / 1000] };
+        put_guest(tv, &as_bytes(&[s, ns / 1000]))?;
     }
     Ok(0)
 }
@@ -1917,25 +1925,31 @@ fn nanosleep(ts: u64, rem: u64) -> R {
 /// ponytail: new limits are accepted but not enforced.
 fn rlimit(resource: u64, _new: u64, old: u64) -> R {
     const INF: u64 = u64::MAX;
+    if resource > 15 {
+        return Err(EINVAL); // RLIMIT_NLIMITS is 16
+    }
     let (cur, max) = match resource {
         3 => (8 << 20, INF),        // RLIMIT_STACK
         7 => (1024, 1 << 20),       // RLIMIT_NOFILE
         _ => (INF, INF),
     };
     if old != 0 {
-        unsafe { *(old as *mut [u64; 2]) = [cur, max] };
+        put_guest(old, &as_bytes(&[cur, max]))?;
     }
     Ok(0)
 }
 
 /// All host CPUs are ours. Returns the mask size like the kernel does.
-fn sched_getaffinity(len: u64, mask: u64) -> R {
+fn sched_getaffinity(pid: u64, len: u64, mask: u64) -> R {
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
-    if len < 8 {
+    if len < 8 || len % 8 != 0 {
         return Err(EINVAL);
     }
+    if pid != 0 {
+        proc::kill(pid as i64, 0)?; // ESRCH for a process that isn't there
+    }
     let bits = if cpus == 64 { u64::MAX } else { (1u64 << cpus) - 1 };
-    unsafe { *(mask as *mut u64) = bits };
+    put_guest(mask, &bits.to_le_bytes())?;
     Ok(8)
 }
 
@@ -1953,12 +1967,12 @@ fn setitimer(which: u64, new: u64, old: u64) -> R {
 }
 
 fn getitimer(which: u64, cur: u64) -> R {
-    if which != 0 {
-        return Err(EINVAL); // ITIMER_VIRTUAL / ITIMER_PROF
-    }
-    let (left, iv) = signal::alarm_left();
-    unsafe { *(cur as *mut [u64; 4]) = [iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000] };
-    Ok(0)
+    let (left, iv) = match which {
+        0 => signal::alarm_left(),
+        1 | 2 => (0, 0), // ITIMER_VIRTUAL / ITIMER_PROF: never armed here
+        _ => return Err(EINVAL),
+    };
+    put_guest(cur, &as_bytes(&[iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000]))
 }
 
 fn clock_nanosleep(clock: u64, flags: u64, req: u64, rem: u64) -> R {

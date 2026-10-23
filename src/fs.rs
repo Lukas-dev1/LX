@@ -3242,9 +3242,7 @@ pub fn getcwd(buf: u64, size: u64) -> R {
     with(|fs| {
         let n = fs.cwd.len() + 1;
         if (size as usize) < n { return Err(ERANGE) }
-        let out = unsafe { guest_mut(buf, n) };
-        out[..n - 1].copy_from_slice(fs.cwd.as_bytes());
-        out[n - 1] = 0;
+        crate::syscall::put_guest(buf, &[fs.cwd.as_bytes(), &[0]].concat())?;
         Ok(n as i64)
     })
 }
