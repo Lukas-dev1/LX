@@ -505,21 +505,42 @@ pub fn sigtimedwait(set: u64, info: u64, timeout_ms: i64) -> R {
     }
 }
 
+/// When the armed ITIMER_REAL fires next, and its interval (ms).
+static ALARM_NEXT: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+
+fn left(next: Option<(std::time::Instant, u64)>, now: std::time::Instant) -> (u64, u64) {
+    next.map_or((0, 0), |(at, iv)| (at.saturating_duration_since(now).as_millis().max(1) as u64, iv))
+}
+
+/// getitimer(ITIMER_REAL): (ms left, interval ms).
+pub fn alarm_left() -> (u64, u64) {
+    left(*ALARM_NEXT.lock().unwrap(), std::time::Instant::now())
+}
+
 /// setitimer(ITIMER_REAL) / alarm: SIGALRM after `value_ms`, then every `interval_ms` (0 = once).
-/// Each call replaces the previous timer. ponytail: the old timer's remaining time reads as 0, and
-/// ITIMER_VIRTUAL/PROF (CPU-time timers) aren't supported.
-pub fn set_alarm(value_ms: u64, interval_ms: u64) {
+/// Each call replaces the previous timer and returns what was left of it (ms, interval ms).
+/// ponytail: ITIMER_VIRTUAL/PROF (CPU-time timers) aren't supported.
+pub fn set_alarm(value_ms: u64, interval_ms: u64) -> (u64, u64) {
     static GEN: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::Instant::now();
+    let mut next = ALARM_NEXT.lock().unwrap();
+    let old = left(*next, now);
     let id = GEN.fetch_add(1, SeqCst) + 1;
     if value_ms == 0 {
-        return; // disarm
+        *next = None; // disarm
+        return old;
     }
+    *next = Some((now + std::time::Duration::from_millis(value_ms), interval_ms));
     std::thread::spawn(move || {
         let mut wait = value_ms;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(wait));
-            if GEN.load(SeqCst) != id {
-                return; // replaced or disarmed meanwhile
+            {
+                let mut next = ALARM_NEXT.lock().unwrap();
+                if GEN.load(SeqCst) != id {
+                    return; // replaced or disarmed meanwhile
+                }
+                *next = (interval_ms != 0).then(|| (std::time::Instant::now() + std::time::Duration::from_millis(interval_ms), interval_ms));
             }
             arrive(14); // SIGALRM
             if interval_ms == 0 {
@@ -528,6 +549,7 @@ pub fn set_alarm(value_ms: u64, interval_ms: u64) {
             wait = interval_ms;
         }
     });
+    old
 }
 
 /// `TERM`, `SIGTERM`, `15` -> 15.
