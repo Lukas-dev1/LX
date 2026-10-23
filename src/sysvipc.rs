@@ -183,11 +183,12 @@ fn id_of(t: &Table, slot: usize) -> i64 {
 
 /// ipcperms: may the caller have `want` (4 read, 2 write/alter) on `e`? Root may do anything.
 fn allowed(e: &Entry, want: u32) -> bool {
-    let (uid, gid) = (crate::proc::UID.load(Relaxed), crate::proc::GID.load(Relaxed));
+    let uid = crate::proc::UID.load(Relaxed);
     if uid == 0 {
         return true;
     }
-    let granted = if uid == e.uid || uid == e.cuid { e.mode >> 6 } else if gid == e.gid || gid == e.cgid { e.mode >> 3 } else { e.mode } & 7;
+    let group = crate::proc::in_group(e.gid) || crate::proc::in_group(e.cgid); // supplementary groups count
+    let granted = if uid == e.uid || uid == e.cuid { e.mode >> 6 } else if group { e.mode >> 3 } else { e.mode } & 7;
     want & !granted == 0
 }
 
