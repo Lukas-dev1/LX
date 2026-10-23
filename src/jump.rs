@@ -120,6 +120,15 @@ fn displace(instrs: &[Instruction], k: usize, targets: &HashSet<u64>) -> Option<
     Some((j, m))
 }
 
+/// A REX byte before another prefix: the CPU ignores it and no compiler emits it, so the linear decode
+/// started inside an instruction (data in .text: libgcrypt's tables run into `sub rsp,0x48` and its
+/// last byte read as a REX on the next `mov rax,fs:[0x28]`). Rewriting such a "site" corrupts real code.
+fn misdecoded(b: &[u8]) -> bool {
+    let prefix = |x: u8| matches!(x, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3);
+    let n = b.iter().take_while(|&&x| prefix(x) || x & 0xf0 == 0x40).count();
+    b[..n].windows(2).any(|w| w[0] & 0xf0 == 0x40 && prefix(w[1]))
+}
+
 fn is_fs_access(i: &Instruction) -> bool {
     i.memory_segment() == Register::FS && i.op_count() > 0 && i.flow_control() == FlowControl::Next
         && (0..i.op_count()).any(|op| i.op_kind(op) == OpKind::Memory)
@@ -263,8 +272,10 @@ pub fn rewrite(code: &mut [u8], addr: u64) -> Vec<u64> {
         if overlaps(&busy, instrs[k].ip(), site_end) {
             return; // displaced by an earlier site (forward): its stub already handles this one
         }
+        let bytes = |i: &Instruction| &code[(i.ip() - addr) as usize..(i.ip() - addr) as usize + i.len()];
         let range = displace(instrs, k, &targets).filter(|&(j, m)| {
             !overlaps(&busy, instrs[j].ip(), instrs[m].ip() + instrs[m].len() as u64)
+                && !instrs[j..=m].iter().any(|i| misdecoded(bytes(i)))
         });
         let ai = range.and_then(|(j, m)| area_near(&mut s, instrs[j].ip(), instrs[m].ip() + instrs[m].len() as u64, 320));
         let (Some((j, m)), Some(ai)) = (range, ai) else {
@@ -391,6 +402,14 @@ pub fn restore(f: &[String]) -> Result<&[String], String> {
     }
     let used = f.len() - it.len();
     Ok(&f[used..])
+}
+
+#[test]
+fn rex_before_a_prefix_is_a_misdecode() {
+    assert!(misdecoded(&[0x48, 0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0, 0, 0])); // libgcrypt, one byte early
+    assert!(!misdecoded(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0, 0, 0])); // mov rax,fs:[0x28]
+    assert!(!misdecoded(&[0xf3, 0x48, 0x0f, 0xb8, 0xc0])); // popcnt rax,rax: prefix, then REX
+    assert!(!misdecoded(&[0x0f, 0x05]));
 }
 
 #[test]
