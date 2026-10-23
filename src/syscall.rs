@@ -2074,11 +2074,9 @@ unsafe extern "system" {
     fn timeEndPeriod(ms: u32) -> u32;
 }
 
-/// Linux timers are ~1 ms; NT's default tick is 15.6 ms, so a 1 ms futex or condition wait took 16.
-/// Turned on by the first short timed wait (per-process on Windows 11) and left on: processes that only
-/// wait long, like an idle server, keep the coarse tick and its lower power use.
-/// The 1 ms timer for the length of one short wait (poll, epoll_wait, sleeps): ended when the guard
-/// drops, so a server whose event loop passes short timeouts doesn't keep the fast tick while idle.
+/// Linux timers are ~1 ms; NT's default tick is 15.6 ms, so a 1 ms wait took 16. This raises the timer
+/// resolution for the length of one short wait (futex, poll, epoll_wait, sleeps), ended when the guard
+/// drops: a server whose event loop passes short timeouts doesn't keep the fast tick while idle.
 pub struct FineWait;
 
 impl FineWait {
@@ -2094,13 +2092,6 @@ impl Drop for FineWait {
     fn drop(&mut self) {
         unsafe { timeEndPeriod(1) };
     }
-}
-
-pub fn fine_timer() {
-    static ON: std::sync::Once = std::sync::Once::new();
-    ON.call_once(|| unsafe {
-        timeBeginPeriod(1);
-    });
 }
 
 /// The interrupted guest's FP/vector state for a signal frame: on the direct path the XSAVE image
