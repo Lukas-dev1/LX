@@ -1531,9 +1531,7 @@ pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, ev: u64) -> R {
 /// epoll_wait: level-triggered by default, with edge-triggered and one-shot emulated on top of polling.
 /// Waits in WSAPoll over the registered sockets (other fds are re-checked every slice).
 pub fn sys_epoll_wait(epfd: u64, out: u64, max: u64, timeout_ms: i64) -> R {
-    if (1..16).contains(&timeout_ms) {
-        crate::syscall::fine_timer();
-    }
+    let _fine = crate::syscall::FineWait::for_ms(timeout_ms);
     let ep = fs::epoll(epfd)?;
     if max == 0 || max > 1 << 16 {
         return Err(EINVAL);

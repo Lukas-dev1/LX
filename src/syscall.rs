@@ -2071,11 +2071,31 @@ fn mincore(addr: u64, len: u64, vec: u64) -> R {
 #[link(name = "winmm")]
 unsafe extern "system" {
     fn timeBeginPeriod(ms: u32) -> u32;
+    fn timeEndPeriod(ms: u32) -> u32;
 }
 
 /// Linux timers are ~1 ms; NT's default tick is 15.6 ms, so a 1 ms futex or condition wait took 16.
 /// Turned on by the first short timed wait (per-process on Windows 11) and left on: processes that only
 /// wait long, like an idle server, keep the coarse tick and its lower power use.
+/// The 1 ms timer for the length of one short wait (poll, epoll_wait, sleeps): ended when the guard
+/// drops, so a server whose event loop passes short timeouts doesn't keep the fast tick while idle.
+pub struct FineWait;
+
+impl FineWait {
+    pub fn for_ms(ms: i64) -> Option<FineWait> {
+        (1..16).contains(&ms).then(|| {
+            unsafe { timeBeginPeriod(1) };
+            FineWait
+        })
+    }
+}
+
+impl Drop for FineWait {
+    fn drop(&mut self) {
+        unsafe { timeEndPeriod(1) };
+    }
+}
+
 pub fn fine_timer() {
     static ON: std::sync::Once = std::sync::Once::new();
     ON.call_once(|| unsafe {

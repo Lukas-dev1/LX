@@ -458,9 +458,7 @@ pub fn intr_event() -> isize {
 
 /// Sleep up to `ms` (u32::MAX = forever), cut short by a deliverable signal: then Err(EINTR).
 pub fn interruptible_sleep(ms: u32) -> R {
-    if ms < 16 {
-        crate::syscall::fine_timer(); // else a 1 ms sleep takes NT's 15.6 ms tick
-    }
+    let _fine = crate::syscall::FineWait::for_ms(ms as i64); // else a 1 ms sleep takes NT's 15.6 ms tick
     let ev = intr_event();
     let start = std::time::Instant::now();
     loop {
