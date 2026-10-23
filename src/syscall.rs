@@ -1187,9 +1187,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
     if strace() {
         // Every syscall, like strace: pid, number, first four arguments, result.
         let res = match r { Ok(v) => format!("{v:#x}"), Err(e) => format!("-{e}") };
-        dlog(format_args!("pid {} syscall {} ({:#x}, {:#x}, {:#x}, {:#x}) = {res}", unsafe { GetCurrentProcessId() }, c.rax, a[0], a[1], a[2], a[3]));
+        dlog(format_args!("pid {} syscall {} ({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) = {res}", unsafe { GetCurrentProcessId() }, c.rax, a[0], a[1], a[2], a[3], a[4], a[5]));
     } else if let Err(e) = r && debug() {
-        eprintln!("[lx] syscall {} ({:#x}, {:#x}, {:#x}, {:#x}) -> -{e}", c.rax, a[0], a[1], a[2], a[3]);
+        eprintln!("[lx] syscall {} ({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) -> -{e}", c.rax, a[0], a[1], a[2], a[3], a[4], a[5]);
     }
     r.unwrap_or_else(|e| -e)
 }
