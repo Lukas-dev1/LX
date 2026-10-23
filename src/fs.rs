@@ -1724,7 +1724,7 @@ pub fn mknodat(dirfd: u64, path: u64, mode: u64) -> R {
             fs::write(&host, [FIFO_MAGIC, &id.finish().to_le_bytes()].concat()).map_err(errno)?;
             mark(&host);
             if fs.keeps_meta(&comps_of(&guest)) {
-                let _ = set_meta(&host, new_meta(mode));
+                let _ = set_meta(&host, new_meta_in(&host, mode, false));
             }
             Ok(0)
         }),
@@ -2275,7 +2275,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
                 .open(&host)
                 .map_err(errno)?;
             if flags & O_CREAT != 0 && meta.is_none() && fs.keeps_meta(&comps_of(&guest)) {
-                let _ = set_meta(&host, new_meta(mode));
+                let _ = set_meta(&host, new_meta_in(&host, mode, false));
             }
             Fd::File { f, host }
         };
@@ -2796,6 +2796,19 @@ fn new_meta(mode: u64) -> [u32; 3] {
     [mode as u32 & 0o7777 & !UMASK.load(Relaxed), crate::proc::UID.load(Relaxed), crate::proc::GID.load(Relaxed)]
 }
 
+/// new_meta for an entry created at `host`: in a set-group-ID directory it takes the directory's group,
+/// and a new directory there is set-group-ID too, as on Linux.
+fn new_meta_in(host: &Path, mode: u64, dir: bool) -> [u32; 3] {
+    let mut m = new_meta(mode);
+    if let Some([_, _, gid]) = host.parent().and_then(get_meta).filter(|p| p[0] & 0o2000 != 0) {
+        m[2] = gid;
+        if dir {
+            m[0] |= 0o2000;
+        }
+    }
+    m
+}
+
 /// umask(mask): returns the old one; later lx processes (fork, exec) get the new one (proc::save_ids).
 pub fn umask(mask: u64) -> R {
     let old = UMASK.swap(mask as u32 & 0o777, Relaxed);
@@ -3183,7 +3196,7 @@ pub fn mkdirat(dirfd: u64, path: u64, mode: u64) -> R {
         let up = fs.writable(&c, false)?;
         fs::create_dir(&up).map_err(errno)?;
         if fs.keeps_meta(&c) {
-            let _ = set_meta(&up, new_meta(mode));
+            let _ = set_meta(&up, new_meta_in(&up, mode, true));
         }
         if was_hidden {
             // Recreated over a deleted image dir: it must not show the old contents (overlayfs: opaque).
