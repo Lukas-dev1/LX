@@ -1068,6 +1068,11 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         37 => Ok(signal::set_alarm(a[0] * 1000, 0).0.div_ceil(1000) as i64), // alarm: the seconds left of the old one
         38 => setitimer(a[0], a[1], a[2]),
         36 => getitimer(a[0], a[1]),
+        // Setting the clock: a container may not (Docker's seccomp profile answers EPERM too).
+        // adjtimex/clock_adjtime with modes 0 only read: the clock is in sync, nothing being adjusted.
+        227 | 164 => Err(EPERM), // clock_settime, settimeofday
+        159 => adjtimex_read(a[0]),
+        305 => if valid_clock(a[0]) { adjtimex_read(a[1]) } else { Err(EINVAL) }, // clock_adjtime
         222 => signal::timer_create(a[0], a[1], a[2]),
         223 => signal::timer_settime(a[0], a[1], a[2], a[3]),
         224 => signal::timer_gettime(a[0], a[1]),
@@ -1976,6 +1981,24 @@ fn time(out: u64) -> R {
         unsafe { *(out as *mut u64) = s };
     }
     Ok(s as i64)
+}
+
+/// adjtimex as a reader: struct timex with modes 0 gets "synchronized" (TIME_OK), anything else is a change
+/// a container may not make. Offsets: modes 0, status 32, constant 40, precision 48, tolerance 56,
+/// time (timeval) 64, tick 80.
+fn adjtimex_read(tx: u64) -> R {
+    let modes = u32::from_le_bytes(get_guest::<4>(tx)?);
+    if modes != 0 {
+        return Err(EPERM);
+    }
+    let (s, ns) = now(0);
+    let mut t = [0u8; 208];
+    t[64..72].copy_from_slice(&s.to_le_bytes());
+    t[72..80].copy_from_slice(&(ns / 1000).to_le_bytes());
+    t[80..88].copy_from_slice(&10_000u64.to_le_bytes()); // tick: 10000 us, as USER_HZ 100 has it
+    t[48..56].copy_from_slice(&1u64.to_le_bytes()); // precision 1 us
+    put_guest(tx, &t)?;
+    Ok(0) // TIME_OK
 }
 
 /// The clock ids Linux knows (10 was CLOCK_SGI_CYCLE, gone). Negative ids name another process's
