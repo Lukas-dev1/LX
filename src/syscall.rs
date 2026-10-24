@@ -485,7 +485,7 @@ fn alloc_ex(fixed: Option<u64>, len: u64, commit: bool) -> Option<u64> {
         },
         None => loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 return None;
             }
             if at(a) == a {
@@ -1559,6 +1559,9 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     if len == 0 || addr % PAGE != 0 || off % PAGE != 0 || flags & 3 == 0 { // MAP_SHARED, MAP_PRIVATE or both (_VALIDATE)
         return Err(EINVAL);
     }
+    if len > USER_END {
+        return Err(ENOMEM); // more than the address space (Go's TestMmapErrorSign)
+    }
     // MAP_SHARED_VALIDATE: a flag this kernel doesn't know is EOPNOTSUPP rather than ignored.
     const KNOWN: u64 = 0x3 | 0x10 | 0x20 | 0x40 | 0x100 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x1_0000
         | 0x2_0000 | 0x4_0000 | 0x10_0000 | 0x400_0000 | 0x3f << 26;
@@ -1733,7 +1736,7 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
     } else {
         loop {
             let a = NEXT.fetch_add(vlen.next_multiple_of(0x10000), Relaxed);
-            if a + vlen > WINDOW.1 {
+            if a.checked_add(vlen).is_none_or(|e| e > WINDOW.1) {
                 unsafe { CloseHandle(section) };
                 return Err(ENOMEM);
             }
@@ -1772,7 +1775,7 @@ fn mmap_growable(section: isize, sprot: u32, access: u32, fd: u64, off: u64, vle
     };
     let base = loop {
         let a = NEXT.fetch_add(full.next_multiple_of(0x10000), Relaxed);
-        if a + full > WINDOW.1 {
+        if a.checked_add(full).is_none_or(|e| e > WINDOW.1) {
             return fail(ENOMEM);
         }
         if unsafe { VirtualAlloc2(0, a as *mut _, full as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0) } as u64 == a {
@@ -1927,6 +1930,9 @@ fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -> R 
     const MREMAP_FIXED: u64 = 2;
     // MREMAP_FIXED needs MAYMOVE, an aligned target and one that doesn't overlap the old mapping.
     let fixed = flags & MREMAP_FIXED != 0;
+    if new_len > USER_END {
+        return Err(ENOMEM);
+    }
     if new_len == 0 || old % PAGE != 0 || flags & !7 != 0 || fixed && (flags & MREMAP_MAYMOVE == 0 || new_addr % PAGE != 0
         || new_addr < old + old_len && old < new_addr + new_len) {
         return Err(EINVAL);
@@ -2483,7 +2489,7 @@ pub fn map_image(host: &std::path::Path, segs: &[ImageSeg], fixed: bool, lo: u64
     } else {
         loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 break None;
             }
             if reserve(a) == a {
@@ -2863,7 +2869,7 @@ fn mmap_cow(addr: u64, len: u64, prot: u64, fixed: bool, fd: u64, off: u64, hole
     } else {
         let a = loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 unsafe { CloseHandle(section) };
                 return None;
             }

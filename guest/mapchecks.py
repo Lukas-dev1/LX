@@ -34,4 +34,6 @@ out += [
     "mremap fixed " + err(libc.syscall(25, p, 4096, 4096, 2, p + 4096)),
     "sendfile to rdonly " + err(libc.sendfile(ro, ro, None, 0)),
 ]
+huge = libc.mmap(None, 2**64 - 4096, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0)
+out.append("huge " + err(huge) + ", after " + err(libc.mmap(None, 4096, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0)))
 print(", ".join(out))
