@@ -4003,7 +4003,9 @@ pub fn getcwd(buf: u64, size: u64) -> R {
 // The root a process resolves absolute paths (and absolute symlinks) from, as guest path components;
 // ".." stops there. Empty: the container's root. It goes to later lx processes (fork, exec) in
 // LX_CHROOT, in the host environment like LX_IDS. ponytail: the cwd stays where it was, as on Linux,
-// and /proc inside a chroot is only what the chroot itself holds (none, unless the guest made one).
+// and /proc, /dev and /proc/self/fd inside a chroot are only what the chroot itself holds (our
+// synthetic ones match container paths), as in an unprepared Linux chroot; fds opened before it still
+// work (sshd's privsep relies on that). jail() clones the list per lookup: free while it's empty.
 static JAIL: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 fn jail() -> Vec<String> {
