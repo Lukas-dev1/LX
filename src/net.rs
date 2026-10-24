@@ -1145,6 +1145,9 @@ pub fn sys_sendmsg(fd: u64, msg: u64, flags: u64) -> R {
 pub fn sys_recvmsg(fd: u64, msg: u64, flags: u64) -> R {
     let m = unsafe { &mut *(msg as *mut [u64; 7]) };
     let iovs = iovecs(m[2], m[3])?;
+    for &[base, len] in &iovs {
+        crate::syscall::check_guest(base, len as usize, true)?;
+    }
     let total: u64 = iovs.iter().map(|v| v[1]).sum();
     let mut buf = vec![0u8; total.min(1 << 20) as usize];
     let name_len_ptr = if m[0] != 0 { &mut m[1] as *mut u64 as u64 } else { 0 };
@@ -1286,13 +1289,14 @@ fn iovecs(iov: u64, n: u64) -> Result<Vec<[u64; 2]>, i64> {
     if n > 1024 {
         return Err(EINVAL);
     }
+    crate::syscall::check_guest(iov, n as usize * 16, false)?;
     Ok((0..n).map(|i| unsafe { *((iov + i * 16) as *const [u64; 2]) }).collect())
 }
 
 fn gather(iov: u64, n: u64) -> Result<Vec<u8>, i64> {
     let mut data = Vec::new();
     for [base, len] in iovecs(iov, n)? {
-        data.extend_from_slice(unsafe { std::slice::from_raw_parts(base as *const u8, len as usize) });
+        data.extend(crate::syscall::get_guest_vec(base, len as usize).ok_or(crate::syscall::EFAULT)?);
     }
     Ok(data)
 }

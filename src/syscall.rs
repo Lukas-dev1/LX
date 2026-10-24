@@ -1086,7 +1086,7 @@ const STRUCTS: &[(u64, usize, usize, bool, bool)] = &[
     (63, 0, 390, true, false),                         // uname
     (22, 0, 8, true, false), (293, 0, 8, true, false), // pipe, pipe2
     (125, 0, 8, true, false), (125, 1, 24, true, true), // capget
-    (46, 1, 56, false, false),                         // sendmsg
+    (46, 1, 56, false, false), (47, 1, 56, true, false), // sendmsg, recvmsg
     (51, 2, 4, true, false), (52, 2, 4, true, false),  // getsockname, getpeername: addrlen
 ];
 
