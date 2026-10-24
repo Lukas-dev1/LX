@@ -1013,6 +1013,14 @@ fn accept_nowait(ls: usize) -> Result<(usize, Vec<u8>), i64> {
 
 pub fn sys_accept(fd: u64, addr: u64, lenp: u64, flags: u64) -> R {
     let s = fs::sock(fd)?;
+    // A socket that can't accept fails at once on Linux; s.op below would wait for POLLIN forever.
+    if is_udp(s.s) {
+        return Err(95); // EOPNOTSUPP
+    }
+    let (mut listening, mut len) = (0i32, 4i32);
+    if unsafe { getsockopt(s.s, 0xffff, 0x0002, (&mut listening as *mut i32).cast(), &mut len) } == 0 && listening == 0 {
+        return Err(EINVAL); // SO_ACCEPTCONN: not listening
+    }
     let unix = s.unix.lock().unwrap().is_some();
     let new = s.op(POLLIN, false, || {
         if !unix {
