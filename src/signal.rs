@@ -848,6 +848,28 @@ pub fn parse(name: &str) -> Option<u64> {
 
 /// rt_sigsuspend (mask_ptr != 0) and pause (mask_ptr == 0): swap in the mask, sleep until a signal
 /// can be delivered, return EINTR. The handler then runs on the way out of the syscall.
+/// ppoll, pselect6, epoll_pwait(2): wait under the guest's sigmask (`size` bytes at `mask_ptr`; none:
+/// the thread's own). A signal that ends the wait is delivered under it and the old mask comes back
+/// after its handler, as with sigsuspend; otherwise it comes back right away.
+pub fn with_mask(mask_ptr: u64, size: u64, wait: impl FnOnce() -> R) -> R {
+    if mask_ptr == 0 {
+        return wait();
+    }
+    if size != 8 {
+        return Err(EINVAL);
+    }
+    let new = u64::from_le_bytes(crate::syscall::get_guest::<8>(mask_ptr)?);
+    let old = mask();
+    set_mask(new);
+    let r = wait();
+    if r == Err(EINTR) && deliverable() {
+        crate::syscall::ts().suspended_mask = Some(old);
+    } else {
+        set_mask(old);
+    }
+    r
+}
+
 pub fn sigsuspend(mask_ptr: u64) -> R {
     crate::syscall::ts().suspended_mask = Some(mask());
     if mask_ptr != 0 {
