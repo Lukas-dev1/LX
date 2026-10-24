@@ -628,6 +628,12 @@ fn v6only(s: usize) -> bool {
 /// its other connections to 127.0.0.1 or ::1 to its own loopback address, and host.docker.internal to
 /// the host's 127.0.0.1.
 fn dest_addr(s: usize, a: &mut [u8]) {
+    // The wildcard address as a destination is this host on Linux; Winsock refuses it (WSAEADDRNOTAVAIL).
+    match u16::from_le_bytes([a[0], a[1]]) {
+        AF_INET if a.len() >= 8 && a[4..8] == [0; 4] => a[4..8].copy_from_slice(&[127, 0, 0, 1]),
+        AF_INET6_WIN if a.len() >= 24 && a[8..24] == [0; 16] => a[23] = 1,
+        _ => {}
+    }
     let Some(ports) = published() else { return };
     if a.len() < 8 || !is_loopback(a) {
         return;
@@ -864,13 +870,13 @@ pub fn sys_socket(domain: u64, ty: u64, proto: u64) -> R {
         }
         let mut sock = unix_dgram(ty & SOCK_NONBLOCK != 0)?;
         (sock.udgram, sock.netlink) = (false, true);
-        return Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0));
+        return fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0);
     }
     let af = family(domain)?;
     let base = (ty & 0xf) as i32; // SOCK_STREAM 1, SOCK_DGRAM 2, SOCK_RAW 3: same numbers
     if af == 1 && base == 2 {
         let sock = unix_dgram(ty & SOCK_NONBLOCK != 0)?;
-        return Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0));
+        return fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0);
     }
     if af == 1 && base != 1 {
         return Err(93); // EPROTONOSUPPORT: Windows has stream AF_UNIX sockets only
@@ -884,7 +890,7 @@ pub fn sys_socket(domain: u64, ty: u64, proto: u64) -> R {
         unsafe { setsockopt(s, 41, 27, (&off as *const i32).cast(), 4) };
     }
     let sock = Sock::new(s, ty & SOCK_NONBLOCK != 0);
-    Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0))
+    fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0)
 }
 
 /// socketpair: Windows has no AF_UNIX pairs. A stream pair is two native AF_UNIX sockets met through a
@@ -894,8 +900,8 @@ pub fn sys_socketpair(_domain: u64, ty: u64, _proto: u64, out: u64) -> R {
     init();
     let (nb, cx) = (ty & SOCK_NONBLOCK != 0, ty & SOCK_CLOEXEC != 0);
     let (x, y) = if ty & 0xf == 2 { dgram_pair(nb)? } else { stream_pair(nb)? };
-    let a = fs::add_fd(Fd::Socket(Arc::new(x)), cx);
-    let b = fs::add_fd(Fd::Socket(Arc::new(y)), cx);
+    let a = fs::add_fd(Fd::Socket(Arc::new(x)), cx)?;
+    let b = fs::add_fd(Fd::Socket(Arc::new(y)), cx).inspect_err(|_| _ = fs::close(a as u64))?;
     unsafe { *(out as *mut [i32; 2]) = [a as i32, b as i32] };
     Ok(0)
 }
@@ -1013,6 +1019,14 @@ fn accept_nowait(ls: usize) -> Result<(usize, Vec<u8>), i64> {
 
 pub fn sys_accept(fd: u64, addr: u64, lenp: u64, flags: u64) -> R {
     let s = fs::sock(fd)?;
+    // A socket that can't accept fails at once on Linux; s.op below would wait for POLLIN forever.
+    if is_udp(s.s) {
+        return Err(95); // EOPNOTSUPP
+    }
+    let (mut listening, mut len) = (0i32, 4i32);
+    if unsafe { getsockopt(s.s, 0xffff, 0x0002, (&mut listening as *mut i32).cast(), &mut len) } == 0 && listening == 0 {
+        return Err(EINVAL); // SO_ACCEPTCONN: not listening
+    }
     let unix = s.unix.lock().unwrap().is_some();
     let new = s.op(POLLIN, false, || {
         if !unix {
@@ -1029,7 +1043,7 @@ pub fn sys_accept(fd: u64, addr: u64, lenp: u64, flags: u64) -> R {
         addr_out(&new.1, addr, lenp);
     }
     let sock = Sock::new(new.0, flags & SOCK_NONBLOCK != 0);
-    Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), flags & SOCK_CLOEXEC != 0))
+    fs::add_fd(Fd::Socket(Arc::new(sock)), flags & SOCK_CLOEXEC != 0)
 }
 
 fn so_error(s: usize) -> i64 {
@@ -1145,6 +1159,9 @@ pub fn sys_sendmsg(fd: u64, msg: u64, flags: u64) -> R {
 pub fn sys_recvmsg(fd: u64, msg: u64, flags: u64) -> R {
     let m = unsafe { &mut *(msg as *mut [u64; 7]) };
     let iovs = iovecs(m[2], m[3])?;
+    for &[base, len] in &iovs {
+        crate::syscall::check_guest(base, len as usize, true)?;
+    }
     let total: u64 = iovs.iter().map(|v| v[1]).sum();
     let mut buf = vec![0u8; total.min(1 << 20) as usize];
     let name_len_ptr = if m[0] != 0 { &mut m[1] as *mut u64 as u64 } else { 0 };
@@ -1286,13 +1303,14 @@ fn iovecs(iov: u64, n: u64) -> Result<Vec<[u64; 2]>, i64> {
     if n > 1024 {
         return Err(EINVAL);
     }
+    crate::syscall::check_guest(iov, n as usize * 16, false)?;
     Ok((0..n).map(|i| unsafe { *((iov + i * 16) as *const [u64; 2]) }).collect())
 }
 
 fn gather(iov: u64, n: u64) -> Result<Vec<u8>, i64> {
     let mut data = Vec::new();
     for [base, len] in iovecs(iov, n)? {
-        data.extend_from_slice(unsafe { std::slice::from_raw_parts(base as *const u8, len as usize) });
+        data.extend(crate::syscall::get_guest_vec(base, len as usize).ok_or(crate::syscall::EFAULT)?);
     }
     Ok(data)
 }
@@ -1304,6 +1322,12 @@ pub fn sys_shutdown(fd: u64, how: u64) -> R {
 
 pub fn sys_getsockname(fd: u64, addr: u64, lenp: u64, peer: bool) -> R {
     let s = fs::sock(fd)?;
+    // *lenp (dispatch checked the pointer) must be >= 0, and that much of addr writable.
+    let room = i32::from_le_bytes(crate::syscall::get_guest::<4>(lenp)?);
+    if room < 0 {
+        return Err(EINVAL);
+    }
+    crate::syscall::check_guest(addr, (room as usize).min(128), true)?;
     if s.netlink {
         addr_out(&nl_addr(if peer { 0 } else { nl_pid() }), addr, lenp);
         return Ok(0);
@@ -1488,7 +1512,7 @@ pub fn sys_epoll_create(flags: u64) -> R {
     if flags & !0o2000000 != 0 {
         return Err(EINVAL); // only EPOLL_CLOEXEC
     }
-    Ok(fs::add_fd(Fd::Epoll(Arc::new(Mutex::new(Epoll::default()))), flags & 0o2000000 != 0))
+    fs::add_fd(Fd::Epoll(Arc::new(Mutex::new(Epoll::default()))), flags & 0o2000000 != 0)
 }
 
 pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, ev: u64) -> R {
