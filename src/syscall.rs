@@ -2743,7 +2743,16 @@ pub fn truncate_mapped(h: isize, size: u64, set: impl FnOnce() -> std::io::Resul
             (false, true) => 0x20,
             (false, false) => 0x02,
         };
-        let section = if len == 0 { 0 } else { unsafe { CreateFileMappingW(h, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) } };
+        // An executable view's section needs a handle that may execute (see mmap_shared).
+        let x = if access & FILE_MAP_EXECUTE != 0 {
+            unsafe { crate::win::ReOpenFile(h, 0x8000_0000 | 0x2000_0000 | if access & FILE_MAP_WRITE != 0 { 0x4000_0000 } else { 0 }, 7, 0) }
+        } else {
+            -1
+        };
+        let section = if len == 0 { 0 } else { unsafe { CreateFileMappingW(if x != -1 { x } else { h }, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) } };
+        if x != -1 {
+            unsafe { CloseHandle(x) }; // the section keeps the file
+        }
         let head = len.next_multiple_of(PAGE).min(full);
         if head > 0 {
             carve(base, head);
