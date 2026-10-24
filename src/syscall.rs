@@ -1557,6 +1557,7 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     const MAP_SHARED: u64 = 0x01;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
+    const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
     if len == 0 || addr % PAGE != 0 || off % PAGE != 0 || flags & 3 == 0 { // MAP_SHARED, MAP_PRIVATE or both (_VALIDATE)
         return Err(EINVAL);
     }
@@ -1585,7 +1586,10 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     // a MAP_FIXED first cuts any copy-on-write view out of its way.
     let fixed = flags & MAP_FIXED != 0;
     let holes = if fixed { punch_views(addr, len) } else { Vec::new() };
-    let cow = if flags & MAP_ANONYMOUS == 0 { mmap_cow(addr, len, prot, fixed, fd, off, &holes) } else { None };
+    // MAP_FIXED_NOREPLACE: exactly at addr, never over an existing mapping (a private file copy: the
+    // copy-on-write views pick their own place). ponytail: MAP_SHARED ignores it.
+    let noreplace = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) == MAP_FIXED_NOREPLACE;
+    let cow = if flags & MAP_ANONYMOUS == 0 && !noreplace { mmap_cow(addr, len, prot, fixed, fd, off, &holes) } else { None };
     if cow.is_none() {
         for &(a, n) in &holes {
             place_plain(a, n, false); // ordinary reserved memory for the paths below
@@ -1607,6 +1611,9 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     } else {
         // A free hint is honored, like Linux (Go places its heap with hints); otherwise our own window.
         let hinted = (addr != 0).then(|| alloc_ex(Some(addr), len, !reserve_only)).flatten();
+        if noreplace && hinted != Some(addr) {
+            return Err(EEXIST);
+        }
         hinted.or_else(|| alloc_ex(None, len, !reserve_only)).ok_or(ENOMEM)?
     };
     if reserve_only {
