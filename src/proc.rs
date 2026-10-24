@@ -24,6 +24,14 @@ struct Kid {
     pgid: u32,
 }
 static CHILDREN: Mutex<Vec<Kid>> = Mutex::new(Vec::new());
+/// Children reaped in the last minute, (pid, when): fork doesn't hand their pids out again (see fork).
+static REAPED: Mutex<Vec<(u32, std::time::Instant)>> = Mutex::new(Vec::new());
+
+fn recently_reaped(pid: u32) -> bool {
+    let mut r = REAPED.lock().unwrap();
+    r.retain(|(_, t)| t.elapsed() < std::time::Duration::from_secs(60));
+    r.iter().any(|(p, _)| *p == pid)
+}
 static PARENT: AtomicU32 = AtomicU32::new(0);
 
 /// Linux user/group ids, as the guest sees them. Containers start as root (0).
@@ -257,7 +265,20 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     let me = unsafe { OwnedHandle::from_raw_handle(me as _) };
     let fail = |e: String| { eprintln!("[lx] fork: {e}"); EAGAIN };
     let (ready_r, ready_w) = inheritable_pipe().map_err(|e| fail(e.to_string()))?;
-    let child = spawn_lx("--fork", &[raw(&me), raw(&ready_w)], state);
+    // Windows hands a freed pid out again at once; a child must not get one we just reaped, which may
+    // still be a process group's id (a shell's or test runner's late `kill -9 -$pgid` would hit it). Such a
+    // child is held, so the next spawn gets another pid, and killed before it ever runs guest code.
+    let mut held = Vec::new();
+    let child = loop {
+        match spawn_lx("--fork", &[raw(&me), raw(&ready_w)], state.clone()) {
+            Ok(c) if held.len() < 4 && recently_reaped(c.id()) => held.push(c),
+            r => break r,
+        }
+    };
+    for mut h in held {
+        let _ = h.kill();
+        let _ = h.wait();
+    }
     syscall::views_inheritable(false); // the child has its copies of the shared-memory sections now
     drop((spawning, handles));
     let mut child = child.map_err(|e| fail(e.to_string()))?;
@@ -456,6 +477,7 @@ fn wait_child(sel: Which, blocking: bool, keep: bool) -> Result<Option<(u32, u32
         unsafe { GetExitCodeProcess(kids[i].process.as_raw_handle() as isize, &mut code) };
         let pid = kids[i].pid;
         if !keep {
+            REAPED.lock().unwrap().push((pid, std::time::Instant::now()));
             kids.remove(i);
             crate::ptable::reap(guest_pid(pid)); // its zombie leaves /proc
         }
