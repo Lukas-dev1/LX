@@ -119,11 +119,21 @@ pub fn raise(sig: u64) -> R {
     if sig == 0 || sig > 64 {
         return Err(EINVAL);
     }
+    if sig == SIGCONT {
+        cont(); // whatever its handler: a stopped process goes on
+    }
     let mut s = S.lock().unwrap();
     // An ignored signal (SIG_IGN, or a default action of "ignore" like SIGCHLD's) that isn't blocked is
     // discarded when it's sent, as on Linux: left pending it would make the next wait4 return EINTR.
     let handler = s.actions[sig as usize].handler;
     let blocked = MAIN_MASK.load(std::sync::atomic::Ordering::Relaxed) & bit(sig) != 0;
+    // SIGSTOP, and SIGTSTP/SIGTTIN/SIGTTOU left at their default: the process stops (a blocked one waits
+    // in pending, and stops when deliver finds it).
+    if sig == 19 || (matches!(sig, 20..=22) && handler == 0 && !blocked) {
+        drop(s);
+        stop(sig);
+        return Ok(0);
+    }
     if !blocked && (handler == 1 || (handler == 0 && default_ignores(sig))) {
         return Ok(0);
     }
@@ -346,15 +356,16 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
-/// A process's mailbox: [pending signal bits, process group | session << 32] (both as host pids).
-type Mailbox = [AtomicU64; 2];
+/// A process's mailbox: [pending signal bits, process group | session << 32] (both as host pids), and its
+/// job-control state for the parent's wait (see `stop`): a wait status, with bit 32 while unreported.
+type Mailbox = [AtomicU64; 3];
 
 fn mailbox(pid: u32, create: bool) -> Option<(&'static Mailbox, isize)> {
     use crate::win::*;
     let (map_name, ev_name) = (wide(&format!("Local\\lx-sig-{pid}")), wide(&format!("Local\\lx-sigev-{pid}")));
     unsafe {
         let (map, ev) = if create {
-            (CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, 0, 16, map_name.as_ptr()),
+            (CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, 0, 24, map_name.as_ptr()),
              CreateEventW(std::ptr::null_mut(), 0, 0, ev_name.as_ptr()))
         } else {
             (OpenFileMappingW(FILE_MAP_WRITE, 0, map_name.as_ptr()), OpenEventW(EVENT_MODIFY_STATE, 0, ev_name.as_ptr()))
@@ -362,7 +373,7 @@ fn mailbox(pid: u32, create: bool) -> Option<(&'static Mailbox, isize)> {
         if map == 0 || ev == 0 {
             return None;
         }
-        let view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 16);
+        let view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 24);
         // ponytail: sender-side handles and views are never closed; senders are short-lived.
         (!view.is_null()).then(|| (&*(view as *const Mailbox), ev))
     }
@@ -897,6 +908,83 @@ pub fn sigsuspend(mask_ptr: u64) -> R {
     Err(EINTR)
 }
 
+const SIGCONT: u64 = 18;
+
+// ---- job control ----
+//
+// A stopped process's guest threads park at their next syscall boundary (deliver), where they hold none
+// of our locks; one spinning in guest code is kicked there, and one blocked in a syscall parks when it
+// returns (it does nothing meanwhile). The parent hears through SIGCHLD and reads the state from our
+// mailbox (child_state). ponytail: SIGCHLD goes to the parent on every stop and continue (SA_NOCLDSTOP
+// is the parent's to honor), and orphaned process groups aren't exempt from SIGTSTP.
+static STOPPED: AtomicBool = AtomicBool::new(false);
+
+fn run_event() -> isize {
+    static EV: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+    *EV.get_or_init(|| unsafe { crate::win::CreateEventW(std::ptr::null_mut(), 1, 1, std::ptr::null()) }) // manual, set
+}
+
+/// A guest thread of a stopped process waits here until SIGCONT.
+pub fn park_if_stopped() {
+    if STOPPED.load(SeqCst) {
+        crate::ptable::set_stopped(true); // again: this thread's syscall may have just marked it running
+        let ev = run_event();
+        unsafe { crate::win::WaitForMultipleObjects(1, &ev, 0, u32::MAX) };
+    }
+}
+
+fn stop(sig: u64) {
+    if STOPPED.swap(true, SeqCst) {
+        return;
+    }
+    unsafe extern "system" {
+        fn ResetEvent(ev: isize) -> i32;
+    }
+    unsafe { ResetEvent(run_event()) };
+    crate::ptable::set_stopped(true);
+    report(0x7f | sig << 8); // WIFSTOPPED, WSTOPSIG
+    let me = unsafe { crate::win::GetCurrentThreadId() };
+    for (tid, h) in std::iter::once((crate::thread::MAIN_TID.load(SeqCst), GUEST_THREAD.load(SeqCst))).chain(crate::thread::others()) {
+        if tid != me && let Some(t) = crate::syscall::ts_of(tid) {
+            kick(h, t);
+        }
+    }
+}
+
+fn cont() {
+    if !STOPPED.swap(false, SeqCst) {
+        return;
+    }
+    crate::ptable::set_stopped(false);
+    unsafe { crate::win::SetEvent(run_event()) };
+    report(0xffff); // WIFCONTINUED
+}
+
+/// Our job-control state for the parent's wait, and SIGCHLD to wake it.
+fn report(status: u64) {
+    if let Some(b) = unsafe { OWN.load(SeqCst).as_ref() } {
+        b[2].store(status | 1 << 32, SeqCst);
+    }
+    let parent = proc::parent_host();
+    if parent != 0 {
+        let _ = send(parent, 17);
+    }
+}
+
+/// A child's unreported stop or continue: its wait status (0x7f | sig << 8, or 0xffff), cleared unless
+/// `keep` (WNOWAIT).
+pub fn child_state(pid: u32, keep: bool) -> Option<u32> {
+    let (b, _) = mailbox(pid, false)?;
+    let v = b[2].load(SeqCst);
+    if v & 1 << 32 == 0 {
+        return None;
+    }
+    if !keep && b[2].compare_exchange(v, v & !(1 << 32), SeqCst, SeqCst).is_err() {
+        return None; // it changed meanwhile: the next look reports that
+    }
+    Some(v as u32 & 0xffff)
+}
+
 fn default_ignores(sig: u64) -> bool {
     matches!(sig, 17 | 18 | 23 | 28) // SIGCHLD, SIGCONT, SIGURG, SIGWINCH
 }
@@ -922,6 +1010,7 @@ pub const FRAME_MAX: usize = (8 + 4096 + 64 + 64 + UC_SIZE + SI_SIZE + 32) as us
 /// unblocked, run its default action, or point `c` at its handler and return the signal frame bytes,
 /// which the caller places at the new `c.rsp` once it's safe to (see syscall::resume_with_signals).
 pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
+    park_if_stopped();
     let restart = std::mem::take(&mut crate::syscall::ts().restart);
     proc::notice_child_exits();
     let mut s = S.lock().unwrap();
@@ -941,6 +1030,12 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
         let a = s.actions[sig as usize];
         match a.handler {
             0 if default_ignores(sig) => continue,
+            0 | 1 if sig == 19 || (a.handler == 0 && matches!(sig, 20..=22)) => {
+                drop(s);
+                stop(sig); // tkill'd to a thread (musl's raise), or a stop signal that was blocked
+                park_if_stopped();
+                s = S.lock().unwrap();
+            }
             0 => {
                 drop(s);
                 proc::die(sig); // default action: terminate (wait4 sees WIFSIGNALED)

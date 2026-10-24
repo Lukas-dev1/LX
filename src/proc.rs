@@ -34,6 +34,11 @@ fn recently_reaped(pid: u32) -> bool {
 }
 static PARENT: AtomicU32 = AtomicU32::new(0);
 
+/// Our parent lx process (host pid), 0 for the container's first.
+pub fn parent_host() -> u32 {
+    PARENT.load(Relaxed)
+}
+
 /// Linux user/group ids, as the guest sees them. Containers start as root (0).
 /// ponytail: tracked, not enforced (on Windows the whole container runs as the host user).
 pub static UID: AtomicU32 = AtomicU32::new(0);
@@ -368,7 +373,7 @@ pub fn wait4(pid: i64, status: u64, options: u64) -> R {
         p if p < 0 => Which::Group(host_pid(-p as u32)),
         p => Which::Pid(host_pid(p as u32)),
     };
-    let Some((pid, code)) = wait_child(sel, options & WNOHANG == 0, false)? else { return Ok(0) };
+    let Some((pid, code)) = wait_child(sel, options & WNOHANG == 0, false, options & (2 | 8))? else { return Ok(0) };
     if status != 0 {
         unsafe { *(status as *mut i32) = wait_status(code) as i32 };
     }
@@ -377,8 +382,14 @@ pub fn wait4(pid: i64, status: u64, options: u64) -> R {
 
 /// The wait status for an lx exit code: WIFSIGNALED with the signal, or WIFEXITED with WEXITSTATUS = code.
 fn wait_status(code: u32) -> u32 {
+    if code & 0xFFFF_0000 == JOB {
+        return code & 0xffff;
+    }
     if code & 0xFFFF_0000 == SIGNALED { code & 0x7f | if dumps_core(code & 0x7f) { 0x80 } else { 0 } } else { (code & 0xff) << 8 }
 }
+
+/// wait_child's code for a stop or continue: JOB | the wait status (signal::child_state).
+const JOB: u32 = 0x4A0B_0000;
 
 /// Signals whose default action dumps core: WCOREDUMP is set for them, as in a container whose core
 /// limit (unlimited here, see rlimit) lets the kernel dump. ponytail: no core file is written.
@@ -411,21 +422,25 @@ pub fn waitid(idtype: u64, id: u64, info: u64, options: u64) -> R {
         2 => Which::Group(if id == 0 { signal::ids(None).map_or(self::pid(), |(g, _)| g) } else { host_pid(id as u32) }),
         _ => return Err(syscall::EINVAL),
     };
-    if options & WEXITED == 0 {
-        // Only WSTOPPED/WCONTINUED: nothing here ever stops, so there's nothing to report.
-        return if options & WNOHANG != 0 { Ok(0) } else { Err(ECHILD) };
-    }
-    let got = wait_child(sel, options & WNOHANG == 0, options & WNOWAIT != 0)?;
+    let got = wait_child(sel, options & WNOHANG == 0, options & WNOWAIT != 0, options & (2 | 8) | if options & WEXITED != 0 { 0 } else { NO_EXIT })?;
     if info != 0 {
         let mut si = [0u8; 128];
         if let Some((pid, code)) = got {
             let killed = code & 0xFFFF_0000 == SIGNALED;
             let put = |si: &mut [u8; 128], off: usize, v: i32| si[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            // CLD_EXITED 1, CLD_KILLED 2, CLD_DUMPED 3, CLD_STOPPED 5, CLD_CONTINUED 6, and the status:
+            // the exit code, the signal, or SIGCONT
+            let (cld, status) = match code {
+                c if c & 0xFFFF_0000 == JOB && c & 0xffff == 0xffff => (6, 18),
+                c if c & 0xFFFF_0000 == JOB => (5, (c >> 8 & 0xff) as i32),
+                c if killed => (if dumps_core(c & 0x7f) { 3 } else { 2 }, (c & 0x7f) as i32),
+                c => (1, (c & 0xff) as i32),
+            };
             put(&mut si, 0, signal::SIGCHLD as i32);
-            put(&mut si, 8, if !killed { 1 } else if dumps_core(code & 0x7f) { 3 } else { 2 }); // CLD_EXITED, _DUMPED, _KILLED
+            put(&mut si, 8, cld);
             put(&mut si, 16, guest_pid(pid) as i32);
             put(&mut si, 20, UID.load(Relaxed) as i32);
-            put(&mut si, 24, if killed { (code & 0x7f) as i32 } else { (code & 0xff) as i32 });
+            put(&mut si, 24, status);
         }
         crate::syscall::put_guest(info, &si)?; // under WNOHANG with none ready: zeroed, si_pid 0
     }
@@ -434,7 +449,9 @@ pub fn waitid(idtype: u64, id: u64, info: u64, options: u64) -> R {
 
 /// Wait for a child matching `sel` to exit: (its pid, its lx exit code), None under !blocking when none
 /// has. `keep`: leave it waitable (WNOWAIT).
-fn wait_child(sel: Which, blocking: bool, keep: bool) -> Result<Option<(u32, u32)>, i64> {
+/// `job`: also report stopped (2, WUNTRACED/WSTOPPED) and continued (8, WCONTINUED) children; with
+/// NO_EXIT, only those (waitid without WEXITED).
+fn wait_child(sel: Which, blocking: bool, keep: bool, job: u64) -> Result<Option<(u32, u32)>, i64> {
     let matches = |k: &mut Kid| match sel {
         Which::Any => true,
         Which::Pid(p) => k.pid == p,
@@ -450,6 +467,19 @@ fn wait_child(sel: Which, blocking: bool, keep: bool) -> Result<Option<(u32, u32
         // and one of them may reap (and close) a child meanwhile.
         let waits: Vec<(u32, OwnedHandle)> = {
             let mut kids = CHILDREN.lock().unwrap();
+            if job & (2 | 8) != 0 {
+                let state = kids.iter_mut().find_map(|k| {
+                    if !matches(k) {
+                        return None;
+                    }
+                    let s = signal::child_state(k.pid, true)?;
+                    let want = if s == 0xffff { job & 8 != 0 } else { job & 2 != 0 };
+                    (want && (keep || signal::child_state(k.pid, false) == Some(s))).then_some((k.pid, JOB | s))
+                });
+                if let Some(got) = state {
+                    return Ok(Some(got));
+                }
+            }
             kids.iter_mut().filter_map(|k| if matches(k) { k.process.try_clone().ok().map(|h| (k.pid, h)) } else { None })
                 .take(63).collect()
         };
@@ -462,6 +492,17 @@ fn wait_child(sel: Which, blocking: bool, keep: bool) -> Result<Option<(u32, u32
             hs.push(signal::intr_event()); // a signal cuts the wait short
         }
         let r = unsafe { WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), 0, if blocking { u32::MAX } else { 0 }) } as usize;
+        if job & NO_EXIT != 0 && r < n {
+            // Waiting for stops only: an exit isn't ours to report (nor to reap); wait for the next change.
+            if !blocking {
+                return Ok(None);
+            }
+            let intr = signal::intr_event();
+            if intr == 0 || unsafe { WaitForMultipleObjects(1, &intr, 0, u32::MAX) } != 0 || signal::deliverable() {
+                return Err(crate::syscall::EINTR);
+            }
+            continue;
+        }
         if r == n && blocking {
             if signal::deliverable() {
                 return Err(crate::syscall::EINTR);
@@ -484,6 +525,9 @@ fn wait_child(sel: Which, blocking: bool, keep: bool) -> Result<Option<(u32, u32
         return Ok(Some((pid, code)));
     }
 }
+
+/// wait_child's `job` flag: waitid without WEXITED.
+const NO_EXIT: u64 = 1 << 32;
 
 /// Raise SIGCHLD for children that exited since we last looked (cheap: a zero-timeout wait each).
 pub fn notice_child_exits() {
