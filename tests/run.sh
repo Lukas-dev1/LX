@@ -187,6 +187,15 @@ expect "F_GETLK names the holder of a conflicting lock (type, range, pid)" 0 "ho
 expect "SIGPIPE on a write without a reader (default kills, Python gets EPIPE)" 0 "python EPIPE, default killed by 13" -- run -v "$GUEST" python:3.12-alpine python3 /t/sigpipe.py
 expect "O_PATH fds: no read/write, fstat and fchdir work" 0 "read EBADF, write EBADF, size 4, /tmp" -- run -v "$GUEST" python:3.12-alpine python3 /t/opath.py
 expect "RLIMIT_NOFILE: EMFILE at the soft limit, inherited by children" 0 "default 1024, open EMFILE at 50, pipe EMFILE, dup2 EBADF, raise hard refused, child (50, 4096)" -- run -v "$GUEST" python:3.12-alpine python3 /t/nofile.py
+expect "a listener on ::1 is reachable at its own port (Node and Vite listen on localhost = ::1), next to one on 127.0.0.1; ::1 without one reaches the IPv4 listener" 0 "v6 True ok v4 ok fallback ok" -- run python:3.12-alpine python3 -c 'import socket
+def tryc(fam, host, port, srv):
+    c = socket.socket(fam); c.settimeout(2)
+    try: c.connect((host, port)); srv.settimeout(2); srv.accept(); return "ok"
+    except OSError as e: return "fail " + str(e)
+a = socket.socket(socket.AF_INET); a.bind(("127.0.0.1", 0)); a.listen(); port = a.getsockname()[1]
+b = socket.socket(socket.AF_INET6); b.bind(("::1", port)); b.listen()
+d = socket.socket(socket.AF_INET); d.bind(("0.0.0.0", 0)); d.listen()
+print("v6", b.getsockname()[1] == port, tryc(socket.AF_INET6, "::1", port, b), "v4", tryc(socket.AF_INET, "127.0.0.1", port, a), "fallback", tryc(socket.AF_INET6, "::1", d.getsockname()[1], d))'
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]
