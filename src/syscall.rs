@@ -1188,6 +1188,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         21 => fs::faccessat(CWD, a[0], a[1]),
         28 => madvise(a[0], a[1], a[2]),
         149..=152 | 325 => Ok(0), // mlock, munlock, mlockall, munlockall, mlock2. ponytail: pages may still be paged out
+        // iopl / ioperm: port I/O needs CAP_SYS_RAWIO, which Docker doesn't give; bad arguments first.
+        172 => Err(if a[0] > 3 { EINVAL } else { EPERM }),
+        173 => Err(if a[0].saturating_add(a[1]) > 0x10000 { EINVAL } else { EPERM }),
         140 | 141 if a[0] > 2 => Err(EINVAL), // PRIO_PROCESS, PRIO_PGRP, PRIO_USER
         140 | 141 if (a[1] as i32) < 0 => Err(ESRCH), // no such process, group or user
         140 => Ok(20), // getpriority: the raw call answers 20 - nice; everyone runs at nice 0 (rpm asks)
