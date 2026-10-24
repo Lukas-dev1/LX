@@ -57,6 +57,8 @@ cc_static 2 rootfs/sysvipc guest/sysvipc.c
 cc_static 2 rootfs/epollet guest/epollet.c
 cc_static 2 rootfs/pipenb guest/pipenb.c
 cc_static 2 rootfs/pipewait guest/pipewait.c
+cc_static 2 rootfs/setxid guest/setxid.c
+cc_static 2 rootfs/sitkill guest/sitkill.c
 cc_static 1 rootfs/spinsig guest/spinsig.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
 cc_static 2 rootfs/waitidtest guest/waitidtest.c
@@ -109,6 +111,8 @@ expect "SysV semaphores and message queues across fork" 0 "sysv waiting=1 got=he
 expect "edge-triggered epoll: data arriving after a drain to EAGAIN is a new edge (pipe, eventfd)" 0 "epollet pipe=1 eventfd=1" -- rootfs /epollet
 expect "non-blocking pipe writes: EAGAIN when full (PIPE_BUF all or nothing), POLLOUT only with room, and its edge re-arms" 0 "pipenb first=1 filled=1 eagain=1 full-pollout=0 small-eagain=1 room=1 edge=1" -- rootfs /pipenb
 expect "a reader blocked in a big read leaves a non-blocking writer room (NT counts it against the quota); FIFOs too" 0 "pipewait blocked-reader=1 drained=1 fifo=1" -- rootfs /pipewait
+expect "setegid with threads blocked in a wait, a sleep and guest code: libc signals each, a sleeping one too" 0 "setxid r=0 egid=1 back=0" -- rootfs /setxid
+expect "a tgkill signal's siginfo: SI_TKILL with the sender's pid and uid (glibc's setuid needs it)" 0 "sitkill tkill=1 pid=1 uid=1" -- rootfs /sitkill
 expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
 expect "waitid: P_PID, WNOWAIT, CLD_KILLED, WNOHANG" 0 "peek=1 reap=1 killed=1 none=1" -- rootfs /waitidtest
@@ -182,12 +186,36 @@ signal.signal(signal.SIGCHLD, signal.SIG_IGN); d=os.fork()
 if d == 0: os._exit(0)
 time.sleep(0.5); print("default: %s then %s; SIG_IGN: %s" % (a, b, st(d)))'
 expect "/proc/<pid>/stat: S for a process blocked in a syscall, R for one running" 0 "sleep:S busy:R self:R" -- run alpine sh -c 'sleep 5 & s=$!; (while :; do :; done) & b=$!; sleep 1; echo "sleep:$(cut -d" " -f3 /proc/$s/stat) busy:$(cut -d" " -f3 /proc/$b/stat) self:$(cut -d" " -f3 /proc/self/stat)"; kill $b'
+expect "/proc/self/task lists our threads (the main one is the pid), each a directory with status" 0 "tasks 3 True dir True Uid:	0	0	0	0 bad False" -- run python:3.12-alpine python3 -c 'import os, threading, time; ev = threading.Event(); ts = [threading.Thread(target=ev.wait) for _ in range(2)]; [t.start() for t in ts]; time.sleep(0.2); tasks = sorted(os.listdir("/proc/self/task")); t = tasks[-1]; print("tasks", len(tasks), str(os.getpid()) in tasks, "dir", os.path.isdir("/proc/self/task/" + t), [l for l in open("/proc/self/task/%s/status" % t) if l.startswith("Uid")][0].strip(), "bad", os.path.exists("/proc/self/task/999999")); ev.set()'
 expect "F_GETFL shows how a file was opened; FIONBIO makes a pipe non-blocking" 0 "rd=0 wr=1 rw=2 ap=1025 nb=True" -- run python:3.12-alpine python3 -c 'import os,fcntl; g=lambda fd: fcntl.fcntl(fd,fcntl.F_GETFL) & 0o3003; r,w=os.pipe(); os.set_blocking(r,False); print("rd=%d wr=%d rw=%d ap=%d nb=%s" % (g(os.open("/etc/hostname",0)), g(os.open("/tmp/a",os.O_WRONLY|os.O_CREAT)), g(os.open("/tmp/a",os.O_RDWR)), g(os.open("/tmp/a",os.O_WRONLY|os.O_APPEND)), not os.get_blocking(r)))'
 expect "F_GETLK names the holder of a conflicting lock (type, range, pid)" 0 "holder type=1 start=10 len=5 is_parent=True" -- run -v "$GUEST" python:3.12-alpine python3 /t/getlk.py
 expect "SIGPIPE on a write without a reader (default kills, Python gets EPIPE)" 0 "python EPIPE, default killed by 13" -- run -v "$GUEST" python:3.12-alpine python3 /t/sigpipe.py
 expect "pwrite (musl: pwritev2 RWF_NOAPPEND) writes at the offset; sqlite" 0 "bad EBADF, append XbcY, sqlite 4950" -- run -v "$GUEST" python:3.12-alpine python3 /t/noappend.py
+expect "prctl keeps names and settings; personality and nice are kept" 0 "name worker-thread-n, other thread True, pdeathsig 10, bad sig EINVAL, dumpable 2 EINVAL, slack 1000, nnp 1, option 999 EINVAL, personality 0x40000, nice 5, lower EACCES" -- run -v "$GUEST" python:3.12-alpine python3 /t/prctlstate.py
+expect "mlock family checks flags and ranges" 0 "mlockall 0 EINVAL mlockall cur ok mlock2 flag EINVAL mlock unmapped ENOMEM mlock ok" -- run -v "$GUEST" python:3.12-alpine python3 /t/mlockchecks.py
+expect "madvise/mincore/memfd_create argument checks" 0 "madvise odd EINVAL, advice EINVAL, unmapped ENOMEM, shared dontneed ok x, mincore odd EINVAL, memfd long EINVAL" -- run -v "$GUEST" python:3.12-alpine python3 /t/memchecks.py
+expect "MAP_SHARED with PROT_EXEC on a file and a memfd" 0 "mprotect 0 call 42" -- run -v "$GUEST" python:3.12-alpine python3 /t/sharedexec.py
+expect "WCOREDUMP for core-dumping signals" 0 "SIGABRT core True, SIGTERM core False" -- run -v "$GUEST" python:3.12-alpine python3 /t/coredump.py
+expect "CPU itimers keep values; getrusage/getpriority/ioctl argument checks" 0 "prof (5.0, 1.0), rusage who EINVAL, rusage buf EFAULT, prio who ESRCH, pipe winsz ENOTTY, pipe fionread EFAULT" -- run -v "$GUEST" python:3.12-alpine python3 /t/argchecks2.py
+expect "a faulting child dies of SIGSEGV (WIFSIGNALED)" 0 "signaled True sig 11" -- run -v "$GUEST" python:3.12-alpine python3 /t/faultsig.py
+expect "futex: WAKE counts, timed WAIT never short, EFAULT/EINVAL" 0 "wait ETIMEDOUT short False, woke 1 then 2, none 0, unmapped EFAULT, odd EINVAL" -- run -v "$GUEST" python:3.12-alpine python3 /t/futexcount.py
+expect "fcntl owners and leases, flock op check, fsync of a pipe" 0 "owner 7, owner_ex (1, 42), rdlease on rdwr EAGAIN, lease 0, flock both EINVAL, fsync pipe EINVAL" -- run -v "$GUEST" python:3.12-alpine python3 /t/fcntlmisc.py
+expect "F_SETLK with a struct flock in read-only memory" 0 "setlk 0" -- run -v "$GUEST" python:3.12-alpine python3 /t/setlkro.py
+expect "eventfd: u64 max is EINVAL, full is not writable, F_GETFL O_NONBLOCK" 0 "max EINVAL, full writable False, nonblock True" -- run -v "$GUEST" python:3.12-alpine python3 /t/eventfdedge.py
+expect "ppoll/pselect/epoll_pwait wait under their sigmask" 0 "blocked timeout, handled after 1, unblocked EINTR, handled 2, mask back True" -- run -v "$GUEST" python:3.12-alpine python3 /t/pwaitmask.py
+expect "accept: EINVAL unlistened, EOPNOTSUPP on UDP; listeners still accept" 0 "unlistened EINVAL, udp ENOTSUP, tcp x, unix x" -- run -v "$GUEST" python:3.12-alpine python3 /t/acceptinval.py
+expect "connect/sendto to 0.0.0.0 and :: reach this host" 0 "0.0.0.0 tcp hi udp yo, :: tcp hi udp yo" -- run -v "$GUEST" python:3.12-alpine python3 /t/anyconnect.py
+expect "bad struct pointers are EFAULT, not a fault in lx" 0 "uname EFAULT, sysinfo EFAULT, pipe EFAULT, sigprocmask oldset EFAULT, sigprocmask size EINVAL, capget version EINVAL 0x20080522, timerfd_gettime EBADF" -- run -v "$GUEST" python:3.12-alpine python3 /t/efault.py
+expect "splice socket -> non-blocking pipe loses nothing when the pipe fills" 0 "moved True intact True" -- run -v "$GUEST" python:3.12-alpine python3 /t/splicekeep.py
+expect "sendfile with an unmapped offset pointer is EFAULT" 0 "sendfile -1 EFAULT" -- run -v "$GUEST" python:3.12-alpine python3 /t/sendfilefault.py
+expect "MAP_FIXED_NOREPLACE: EEXIST over a mapping, exact at a free address" 0 "over EEXIST free exact" -- run -v "$GUEST" python:3.12-alpine python3 /t/noreplace.py
+expect "mmap, munmap, msync, mremap and sendfile check their arguments" 0 "shared write on rdonly EACCES, read on wronly EACCES, private write on rdonly ok, bad fd EBADF, pipe ENODEV, no type EINVAL, munmap odd EINVAL, munmap 0 EINVAL, msync both EINVAL, msync odd EINVAL, mremap fixed EINVAL, sendfile to rdonly EBADF, huge ENOMEM, after ok" -- run -v "$GUEST" python:3.12-alpine python3 /t/mapchecks.py
 expect "O_PATH fds: no read/write, fstat and fchdir work" 0 "read EBADF, write EBADF, size 4, /tmp" -- run -v "$GUEST" python:3.12-alpine python3 /t/opath.py
+expect "hard links share an inode (tar stores the second as a link)" 0 "same=1 nlink=2 tar=t/y -> t/x" -- run alpine sh -c 'mkdir /tmp/t; echo z > /tmp/t/x; ln /tmp/t/x /tmp/t/y; [ "$(stat -c %i /tmp/t/x)" = "$(stat -c %i /tmp/t/y)" ] && s=1 || s=0; cd /tmp && tar cf t.tar t && echo "same=$s nlink=$(stat -c %h t/y) tar=$(tar tvf t.tar | grep -o "t/y -> t/x")"'
+expect "utimensat: atime apart from mtime, directories too, and a read-only file's owner may" 0 "a=2002 m=2003 dir=2001 ro=2004" -- run alpine sh -c 'echo x > /tmp/f; touch -a -d "2002-01-01 00:00:00" /tmp/f; touch -m -d "2003-01-01 00:00:00" /tmp/f; a=$(stat -c %x /tmp/f | cut -c1-4); m=$(stat -c %y /tmp/f | cut -c1-4); touch -d "2001-02-03 04:05:06" /usr; chmod 444 /tmp/f; touch -m -d "2004-01-01 00:00:00" /tmp/f; echo "a=$a m=$m dir=$(stat -c %y /usr | cut -c1-4) ro=$(date -r /tmp/f +%Y)"'
+expect "a path goes on only through directories: below a missing one ENOENT (mkdir and creat make no parents), below a file ENOTDIR; a trailing slash follows a symlink" 0 "mk=1 parent=0 creat=1 notdir=1 slash=1 link=d" -- run alpine sh -c 'mkdir /nope/a 2>/dev/null; mk=$?; [ -e /nope ]; p=$?; (true > /nope2/f) 2>/dev/null; c=$?; cat /etc/group/x 2>&1 | grep -q "Not a directory"; n=$?; ls /etc/hostname/ >/dev/null 2>&1; s=$?; ln -s /etc /l; echo "mk=$mk parent=$((1-p)) creat=$c notdir=$((1-n)) slash=$s link=$(ls -ld /l/ | cut -c1)"'
 expect "RLIMIT_NOFILE: EMFILE at the soft limit, inherited by children" 0 "default 1024, open EMFILE at 50, pipe EMFILE, dup2 EBADF, raise hard refused, child (50, 4096)" -- run -v "$GUEST" python:3.12-alpine python3 /t/nofile.py
+expect "fchmodat2 AT_SYMLINK_NOFOLLOW: a symlink is EOPNOTSUPP (its target untouched), a file changes" 0 "link ENOTSUP file 0o600 target 0o644" -- run python:3.12-alpine python3 -c 'import os, ctypes, errno; libc = ctypes.CDLL(None, use_errno=True); libc.syscall.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_char_p, ctypes.c_long, ctypes.c_long]; os.symlink("/etc/hostname", "/tmp/l"); open("/tmp/f", "w").close(); r = libc.syscall(452, -100, b"/tmp/l", 0o600, 0x100); e = ctypes.get_errno(); libc.syscall(452, -100, b"/tmp/f", 0o600, 0x100); print("link", errno.errorcode.get(e) if r < 0 else "ok", "file", oct(os.stat("/tmp/f").st_mode & 0o777), "target", oct(os.stat("/etc/hostname").st_mode & 0o777))'
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]

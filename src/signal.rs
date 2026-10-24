@@ -166,8 +166,10 @@ pub fn send_thread(tid: u64, sig: u64) -> R {
     if addr != 0 {
         unsafe { crate::win::WakeByAddressAll(addr as *const _) };
     }
-    if wtid == main {
-        unsafe { crate::win::SetEvent(INTR.load(SeqCst)) }; // the main thread's sleeps and waits use it
+    // What its sleeps and waits wait on (intr_event): INTR for the main thread, else its own.
+    let ev = if wtid == main { INTR.load(SeqCst) } else { t.wake.load(SeqCst) };
+    if ev != 0 {
+        unsafe { crate::win::SetEvent(ev) };
     }
     // A thread spinning in guest code makes no syscall to take it at: stop it there.
     let handled = S.lock().unwrap().actions[sig as usize].handler > 1;
@@ -546,9 +548,23 @@ unsafe extern "system" fn console_ctrl(kind: u32) -> i32 {
     1
 }
 
-/// The event a blocking wait should include so a signal interrupts it (0 before listen()).
+/// The event a blocking wait should include so a signal interrupts it (0 before listen()): INTR on the
+/// main thread, which signals from outside set, and the thread's own elsewhere, which tgkill sets and
+/// process-wide signals too (wake_futex_waiters). Before, other threads shared INTR: a tgkill didn't wake
+/// one in nanosleep (musl's and glibc's setuid wait for every thread to take theirs: gosu, Go with cgo).
 pub fn intr_event() -> isize {
-    INTR.load(SeqCst)
+    let intr = INTR.load(SeqCst);
+    if intr == 0 || unsafe { crate::win::GetCurrentThreadId() } == crate::thread::MAIN_TID.load(Relaxed) {
+        return intr;
+    }
+    let t = crate::syscall::ts();
+    let ev = t.wake.load(SeqCst);
+    if ev != 0 {
+        return ev;
+    }
+    let ev = unsafe { crate::win::CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
+    t.wake.store(ev, SeqCst);
+    ev
 }
 
 /// Sleep up to `ms` (u32::MAX = forever), cut short by a deliverable signal: then Err(EINTR).
@@ -848,6 +864,28 @@ pub fn parse(name: &str) -> Option<u64> {
 
 /// rt_sigsuspend (mask_ptr != 0) and pause (mask_ptr == 0): swap in the mask, sleep until a signal
 /// can be delivered, return EINTR. The handler then runs on the way out of the syscall.
+/// ppoll, pselect6, epoll_pwait(2): wait under the guest's sigmask (`size` bytes at `mask_ptr`; none:
+/// the thread's own). A signal that ends the wait is delivered under it and the old mask comes back
+/// after its handler, as with sigsuspend; otherwise it comes back right away.
+pub fn with_mask(mask_ptr: u64, size: u64, wait: impl FnOnce() -> R) -> R {
+    if mask_ptr == 0 {
+        return wait();
+    }
+    if size != 8 {
+        return Err(EINVAL);
+    }
+    let new = u64::from_le_bytes(crate::syscall::get_guest::<8>(mask_ptr)?);
+    let old = mask();
+    set_mask(new);
+    let r = wait();
+    if r == Err(EINTR) && deliverable() {
+        crate::syscall::ts().suspended_mask = Some(old);
+    } else {
+        set_mask(old);
+    }
+    r
+}
+
 pub fn sigsuspend(mask_ptr: u64) -> R {
     crate::syscall::ts().suspended_mask = Some(mask());
     if mask_ptr != 0 {
@@ -909,10 +947,16 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
             }
             1 => continue, // SIG_IGN
             _ => {
-                let code = if sig == SIGCHLD { 1 } else { 0 }; // si_code: CLD_EXITED / SI_USER
+                // si_code: SI_TKILL with our pid and uid for tkill/tgkill (glibc's SIGSETXID handler, which
+                // setuid waits on in every thread, ignores anything else), CLD_EXITED, or SI_USER.
+                let (code, who) = if own & bit(sig) != 0 {
+                    (-6i64 as u64, proc::getpid().unwrap_or(0) as u64 | (proc::UID.load(Relaxed) as u64) << 32)
+                } else {
+                    (if sig == SIGCHLD { 1 } else { 0 }, 0)
+                };
                 // SA_RESTART: the handler returns into the interrupted syscall, made again.
                 let again = (restart != 0 && a.flags & SA_RESTART != 0).then_some(restart - 1);
-                return Some(frame(&mut s, c, sig, a, code, 0, again)); // one handler at a time; the rest go when it returns via rt_sigreturn
+                return Some(frame(&mut s, c, sig, a, code, who, again)); // one handler at a time; the rest go when it returns via rt_sigreturn
             }
         }
     }
