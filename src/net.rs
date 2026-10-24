@@ -284,6 +284,17 @@ fn addr_out(a: &[u8], p: u64, lenp: u64) {
     if a.len() >= 2 && u16::from_le_bytes([a[0], a[1]]) == AF_INET6_WIN {
         a[..2].copy_from_slice(&AF_INET6_LINUX.to_le_bytes());
     }
+    // The container's own loopback address is its 127.0.0.1 (bind_addr, dest_addr): shown so, a server
+    // on 127.0.0.1 says so (Go's httptest URLs, a TLS certificate for 127.0.0.1), and a client of it is
+    // a 127.0.0.1 peer (pg_hba, redis protected mode). ponytail: a 0.0.0.0 listener shows 127.0.0.1 too.
+    if let Some(ip) = own_ip() {
+        let fam = u16::from_le_bytes([a[0], a[1]]);
+        if fam == AF_INET && a.len() >= 8 && a[4..8] == ip {
+            a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        } else if fam == AF_INET6_LINUX && a.len() >= 24 && a[8..20] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] && a[20..24] == ip {
+            a[20..24].copy_from_slice(&[127, 0, 0, 1]);
+        }
+    }
     let room = unsafe { *(lenp as *const u32) } as usize;
     let n = room.min(a.len());
     unsafe {

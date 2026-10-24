@@ -187,6 +187,7 @@ expect "F_GETLK names the holder of a conflicting lock (type, range, pid)" 0 "ho
 expect "SIGPIPE on a write without a reader (default kills, Python gets EPIPE)" 0 "python EPIPE, default killed by 13" -- run -v "$GUEST" python:3.12-alpine python3 /t/sigpipe.py
 expect "O_PATH fds: no read/write, fstat and fchdir work" 0 "read EBADF, write EBADF, size 4, /tmp" -- run -v "$GUEST" python:3.12-alpine python3 /t/opath.py
 expect "RLIMIT_NOFILE: EMFILE at the soft limit, inherited by children" 0 "default 1024, open EMFILE at 50, pipe EMFILE, dup2 EBADF, raise hard refused, child (50, 4096)" -- run -v "$GUEST" python:3.12-alpine python3 /t/nofile.py
+expect "the container's loopback shows as 127.0.0.1: a 127.0.0.1 listener's getsockname, its peers, UDP senders" 0 "listen 127.0.0.1 peer 127.0.0.1 udp 127.0.0.1" -- run python:3.12-alpine python3 -c 'import socket; a = socket.socket(); a.bind(("127.0.0.1", 0)); a.listen(); c = socket.socket(); c.connect(a.getsockname()); s, peer = a.accept(); u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 0)); v = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); v.sendto(b"x", u.getsockname()); d, frm = u.recvfrom(9); print("listen", a.getsockname()[0], "peer", peer[0], "udp", frm[0])'
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]
