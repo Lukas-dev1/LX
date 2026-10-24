@@ -58,6 +58,7 @@ cc_static 2 rootfs/epollet guest/epollet.c
 cc_static 2 rootfs/pipenb guest/pipenb.c
 cc_static 2 rootfs/pipewait guest/pipewait.c
 cc_static 2 rootfs/setxid guest/setxid.c
+cc_static 2 rootfs/sitkill guest/sitkill.c
 cc_static 1 rootfs/spinsig guest/spinsig.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
 cc_static 2 rootfs/waitidtest guest/waitidtest.c
@@ -111,6 +112,7 @@ expect "edge-triggered epoll: data arriving after a drain to EAGAIN is a new edg
 expect "non-blocking pipe writes: EAGAIN when full (PIPE_BUF all or nothing), POLLOUT only with room, and its edge re-arms" 0 "pipenb first=1 filled=1 eagain=1 full-pollout=0 small-eagain=1 room=1 edge=1" -- rootfs /pipenb
 expect "a reader blocked in a big read leaves a non-blocking writer room (NT counts it against the quota); FIFOs too" 0 "pipewait blocked-reader=1 drained=1 fifo=1" -- rootfs /pipewait
 expect "setegid with threads blocked in a wait, a sleep and guest code: libc signals each, a sleeping one too" 0 "setxid r=0 egid=1 back=0" -- rootfs /setxid
+expect "a tgkill signal's siginfo: SI_TKILL with the sender's pid and uid (glibc's setuid needs it)" 0 "sitkill tkill=1 pid=1 uid=1" -- rootfs /sitkill
 expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
 expect "waitid: P_PID, WNOWAIT, CLD_KILLED, WNOHANG" 0 "peek=1 reap=1 killed=1 none=1" -- rootfs /waitidtest

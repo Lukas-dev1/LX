@@ -925,10 +925,16 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
             }
             1 => continue, // SIG_IGN
             _ => {
-                let code = if sig == SIGCHLD { 1 } else { 0 }; // si_code: CLD_EXITED / SI_USER
+                // si_code: SI_TKILL with our pid and uid for tkill/tgkill (glibc's SIGSETXID handler, which
+                // setuid waits on in every thread, ignores anything else), CLD_EXITED, or SI_USER.
+                let (code, who) = if own & bit(sig) != 0 {
+                    (-6i64 as u64, proc::getpid().unwrap_or(0) as u64 | (proc::UID.load(Relaxed) as u64) << 32)
+                } else {
+                    (if sig == SIGCHLD { 1 } else { 0 }, 0)
+                };
                 // SA_RESTART: the handler returns into the interrupted syscall, made again.
                 let again = (restart != 0 && a.flags & SA_RESTART != 0).then_some(restart - 1);
-                return Some(frame(&mut s, c, sig, a, code, 0, again)); // one handler at a time; the rest go when it returns via rt_sigreturn
+                return Some(frame(&mut s, c, sig, a, code, who, again)); // one handler at a time; the rest go when it returns via rt_sigreturn
             }
         }
     }
