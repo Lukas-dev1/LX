@@ -1020,6 +1020,9 @@ impl Fs {
         if path.len() >= 4096 || path.split('/').any(|c| c.len() > 255) {
             return Err(ENAMETOOLONG); // PATH_MAX, NAME_MAX
         }
+        // A trailing slash names a directory: a symlink there is followed, and a file is ENOTDIR.
+        let want_dir = path.ends_with('/') && path.trim_end_matches('/') != "" && path.trim_end_matches('/') != ".";
+        let follow = follow || want_dir;
         let mut todo = split(path);
         let mut comps: Vec<String> = if path.starts_with('/') { vec![] } else { split(dir).into() };
         let mut hops = 0;
@@ -1062,11 +1065,23 @@ impl Fs {
                     next.extend(todo.drain(..));
                     todo = next;
                 } else {
+                    // A path goes on only through a directory (or a mount, or /proc, /sys and /dev, which
+                    // are made up after this): else creating /a/b would quietly make /a in the upper layer.
+                    if !todo.is_empty() && !matches!(comps[0].as_str(), "proc" | "sys" | "dev") && self.mount_of(&comps).is_none() {
+                        match &meta {
+                            None => return Err(ENOENT),
+                            Some(m) if !m.dir => return Err(ENOTDIR),
+                            _ => {}
+                        }
+                    }
                     last = Some((host, meta));
                 }
             }
         }
         let (host, meta) = last.unwrap_or_else(|| self.host_meta_below(&comps, not_in_upper, Some(seen)));
+        if want_dir && meta.as_ref().is_some_and(|m| !m.dir) && self.mount_of(&comps).is_none() {
+            return Err(ENOTDIR);
+        }
         Ok((format!("/{}", comps.join("/")), host, meta))
     }
 
@@ -3950,6 +3965,7 @@ fn remove_any(p: &Path) {
 fn resolve_stays_inside_rootfs() {
     let root = std::env::temp_dir().join(format!("lx-test-{}", std::process::id()));
     fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("etc")).unwrap();
     write_link(&root.join("bin/sh"), "busybox").unwrap();
     write_link(&root.join("up"), "../../../..").unwrap();
     write_link(&root.join("loop"), "loop").unwrap();
@@ -4033,10 +4049,13 @@ fn layer_never_touches_the_image() {
     // A deep image path the upper layer has none of resolves through the image alone.
     assert_eq!(f.resolve("/", "/usr/lib/py/m.py", true).unwrap().1, lower.join("usr/lib/py/m.py"));
     assert_eq!(f.resolve("/usr/lib", "py/m.py", false).unwrap().1, lower.join("usr/lib/py/m.py"));
-    // The lookup's attributes (what stat and open use): there for image files, None below a missing dir.
+    // The lookup's attributes (what stat and open use): there for image files; below a missing dir or
+    // a file there's nothing (ENOENT, ENOTDIR), and a trailing slash wants a directory.
     let meta = |p: &str| f.resolve_attrs("/", p, true).unwrap().2;
     assert!(meta("/usr/lib/py/m.py").is_some_and(|m| !m.dir && m.len == 1) && meta("/usr/lib").is_some_and(|m| m.dir));
-    assert!(meta("/usr/nope/m.py").is_none() && meta("/nope/a/b").is_none());
+    assert!(meta("/usr/nope").is_none());
+    let err = |p: &str| f.resolve_attrs("/", p, true).err();
+    assert_eq!((err("/usr/nope/m.py"), err("/nope/a/b"), err("/usr/lib/py/m.py/x"), err("/usr/lib/py/m.py/")), (Some(ENOENT), Some(ENOENT), Some(ENOTDIR), Some(ENOTDIR)));
     let w = f.writable(&c("/etc/a.conf"), true).unwrap();
     fs::write(&w, "container").unwrap();
     assert_eq!(fs::read_to_string(f.host(&c("/etc/a.conf"))).unwrap(), "container");
@@ -4050,8 +4069,8 @@ fn layer_never_touches_the_image() {
     // Deleting an image entry is a whiteout: hidden in the container, still in the image.
     f.remove(&c("/etc/conf.d"), true).unwrap();
     assert!(!exists(&f.host(&c("/etc/conf.d/x"))));
-    assert!(!exists(&f.resolve("/", "/etc/conf.d/x", true).unwrap().1));
-    assert!(meta("/etc/conf.d").is_none() && meta("/etc/conf.d/x").is_none());
+    assert_eq!(f.resolve("/", "/etc/conf.d/x", true).err(), Some(ENOENT));
+    assert!(meta("/etc/conf.d").is_none());
     assert_eq!(names("/etc"), ["a.conf", "new"]);
     assert!(lower.join("etc/conf.d/x").exists());
 

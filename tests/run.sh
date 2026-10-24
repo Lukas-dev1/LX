@@ -186,6 +186,7 @@ expect "F_GETFL shows how a file was opened; FIONBIO makes a pipe non-blocking" 
 expect "F_GETLK names the holder of a conflicting lock (type, range, pid)" 0 "holder type=1 start=10 len=5 is_parent=True" -- run -v "$GUEST" python:3.12-alpine python3 /t/getlk.py
 expect "SIGPIPE on a write without a reader (default kills, Python gets EPIPE)" 0 "python EPIPE, default killed by 13" -- run -v "$GUEST" python:3.12-alpine python3 /t/sigpipe.py
 expect "O_PATH fds: no read/write, fstat and fchdir work" 0 "read EBADF, write EBADF, size 4, /tmp" -- run -v "$GUEST" python:3.12-alpine python3 /t/opath.py
+expect "a path goes on only through directories: below a missing one ENOENT (mkdir and creat make no parents), below a file ENOTDIR; a trailing slash follows a symlink" 0 "mk=1 parent=0 creat=1 notdir=1 slash=1 link=d" -- run alpine sh -c 'mkdir /nope/a 2>/dev/null; mk=$?; [ -e /nope ]; p=$?; (true > /nope2/f) 2>/dev/null; c=$?; cat /etc/group/x 2>&1 | grep -q "Not a directory"; n=$?; ls /etc/hostname/ >/dev/null 2>&1; s=$?; ln -s /etc /l; echo "mk=$mk parent=$((1-p)) creat=$c notdir=$((1-n)) slash=$s link=$(ls -ld /l/ | cut -c1)"'
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]
