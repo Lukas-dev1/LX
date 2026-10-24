@@ -20,6 +20,13 @@ pub fn handle_of(tid: u32) -> isize {
     THREADS.lock().unwrap().iter().find(|t| t.0 == tid).map_or(0, |t| t.1)
 }
 
+/// Our guest threads' tids, the main one (the pid) first: /proc/self/task.
+pub fn tids() -> Vec<u32> {
+    let mut v = vec![crate::proc::getpid().unwrap_or(0) as u32];
+    v.extend(THREADS.lock().unwrap().iter().map(|t| t.0));
+    v
+}
+
 pub fn set_main() {
     MAIN_TID.store(unsafe { GetCurrentThreadId() }, Relaxed);
 }

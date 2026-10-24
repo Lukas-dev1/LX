@@ -3672,27 +3672,33 @@ pub fn set_exe(guest: &str) {
 
 /// `/proc/self` and `/proc/self/fd` (or our pid) as synthetic directories: Some(true) for the fd one.
 /// httpd stats `/proc/self/fd/` for `ErrorLog /proc/self/fd/2`; fd-closing loops list it.
-fn proc_dir(guest: &str) -> Option<bool> {
+/// Which synthetic /proc directory `guest` is: 0 a process's, 1 its fd/, 2 its task/ (our threads).
+fn proc_dir(guest: &str) -> Option<u8> {
     let r = guest.strip_prefix("/proc/")?;
     let (pid, rest) = r.split_once('/').unwrap_or((r, ""));
     if pid != "self" && crate::proc::host_pid(pid.parse().ok()?) != crate::proc::pid() {
-        // Another process of the container: its directory (no fd/ for it: ponytail).
-        return (rest.is_empty() && crate::ptable::get(pid.parse().ok()?).is_some()).then_some(false);
+        // Another process of the container: its directory (no fd/ or task/ for it: ponytail).
+        return (rest.is_empty() && crate::ptable::get(pid.parse().ok()?).is_some()).then_some(0);
     }
+    let rest = crate::procfs::in_task(rest);
     match rest {
-        "" => Some(false),
-        "fd" => Some(true),
+        "" => Some(0),
+        "fd" => Some(1),
+        "task" => Some(2),
         _ => None,
     }
 }
 
 /// What getdents lists in a `proc_dir`: (name, d_type).
-fn proc_entries(fd_dir: bool, fds: &[Option<Slot>]) -> Vec<(String, u8)> {
+fn proc_entries(kind: u8, fds: &[Option<Slot>]) -> Vec<(String, u8)> {
     const DT_REG: u8 = 8;
     const DT_DIR: u8 = 4;
     const DT_LNK: u8 = 10;
-    if !fd_dir {
-        let mut v: Vec<(String, u8)> = vec![("fd".into(), DT_DIR), ("exe".into(), DT_LNK), ("cwd".into(), DT_LNK), ("root".into(), DT_LNK)];
+    if kind == 2 {
+        return crate::thread::tids().into_iter().map(|t| (t.to_string(), DT_DIR)).collect();
+    }
+    if kind == 0 {
+        let mut v: Vec<(String, u8)> = vec![("fd".into(), DT_DIR), ("task".into(), DT_DIR), ("exe".into(), DT_LNK), ("cwd".into(), DT_LNK), ("root".into(), DT_LNK)];
         v.extend(["cmdline", "comm", "stat", "status"].map(|f| (f.to_string(), DT_REG)));
         return v;
     }
@@ -3982,8 +3988,8 @@ pub fn getdents64(fd: u64, buf: u64, count: u64) -> R {
         let (guest, start) = (guest.clone(), *pos);
         let (guest, host) = fs.resolve("/", &guest, true)?;
         let mut names: Vec<(String, u8)> = vec![(".".into(), 4), ("..".into(), 4)];
-        if let Some(fd_dir) = proc_dir(&guest) {
-            names.extend(proc_entries(fd_dir, &fs.fds));
+        if let Some(kind) = proc_dir(&guest) {
+            names.extend(proc_entries(kind, &fs.fds));
         } else {
             names.extend(fs.list(&comps_of(&guest))?);
             if guest == "/proc" {
