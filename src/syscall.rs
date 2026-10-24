@@ -76,6 +76,9 @@ pub struct ThreadState {
     /// so a sender can wake it. Read and written by other threads.
     pub tpending: std::sync::atomic::AtomicU64,
     pub futex_addr: std::sync::atomic::AtomicU64,
+    /// A thread other than the main one: its own auto-reset event for signal::intr_event (0 until it
+    /// first waits), so a signal sent to it alone breaks its sleeps and waits too.
+    pub wake: std::sync::atomic::AtomicIsize,
     /// Whether we're running on host_stack right now.
     on_host: bool,
     /// The TEB's own stack fields (StackBase, StackLimit, DeallocationStack) before the guest took over.
@@ -143,9 +146,14 @@ pub fn ts_of(tid: u32) -> Option<&'static ThreadState> {
 /// handling waits for any thread to take the signal; the others just wait again (a spurious wakeup).
 pub fn wake_futex_waiters() {
     for &(_, ts) in THREAD_TS.lock().unwrap().iter() {
-        let addr = unsafe { &*(ts as *const ThreadState) }.futex_addr.load(Relaxed);
+        let ts = unsafe { &*(ts as *const ThreadState) };
+        let addr = ts.futex_addr.load(Relaxed);
         if addr != 0 {
             unsafe { crate::win::WakeByAddressAll(addr as *const _) };
+        }
+        let ev = ts.wake.load(Relaxed);
+        if ev != 0 {
+            unsafe { crate::win::SetEvent(ev) }; // and one in a sleep or a pipe wait
         }
     }
 }
@@ -153,6 +161,10 @@ pub fn wake_futex_waiters() {
 pub fn forget_ts() {
     let me = unsafe { GetCurrentThreadId() };
     THREAD_TS.lock().unwrap().retain(|e| e.0 != me);
+    let ev = ts().wake.swap(0, Relaxed);
+    if ev != 0 {
+        unsafe { CloseHandle(ev) };
+    }
 }
 
 /// This thread's state, created on first use.
@@ -168,7 +180,7 @@ pub fn ts() -> &'static mut ThreadState {
         fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host + HOST_STACK as u64,
         frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None, restart: 0,
         tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
-        on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]), in_direct: false,
+        wake: std::sync::atomic::AtomicIsize::new(0), on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]), in_direct: false,
         kick: Default::default(), kicked: Default::default(), via_kick: 0,
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
