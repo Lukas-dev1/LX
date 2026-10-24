@@ -399,7 +399,7 @@ impl Pipe {
                 self.rearm.fetch_or(4, Relaxed); // POLLOUT: an edge-triggered waiter hears when there's room
                 return Err(crate::syscall::EAGAIN);
             }
-            len = len.min(room);
+            len = len.min(room); // ponytail: another writer may fill it before WriteFile, which then waits briefly
         }
         if !write && self.nonblocking() {
             match self.available() {
