@@ -2271,6 +2271,10 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
     if let Some(n) = fd_alias(&guest) {
         return dup(n, 0, cloexec);
     }
+    // O_NOFOLLOW on a symlink is ELOOP, not the link itself opened as a file (O_PATH may name it).
+    if flags & O_NOFOLLOW != 0 && flags & 0o10000000 == 0 && meta.as_ref().is_some_and(|m| link_target(&host, m).is_some()) {
+        return Err(ELOOP);
+    }
     if let Some(id) = meta.and_then(|m| fifo_id(&host, &m)) {
         return open_fifo(id, flags); // outside the fs lock: it may wait for the other end
     }
