@@ -2934,7 +2934,9 @@ fn posix_lock(fd: u64, cmd: u64, arg: u64) -> R {
     const F_RDLCK: i16 = 0;
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
-    crate::syscall::check_guest(arg, 32, true)?; // struct flock, before the fd, as Linux copies it in first
+    // struct flock, before the fd, as Linux copies it in first; only F_GETLK and F_OFD_GETLK write it back
+    // (a `static const` lock is fine for the others).
+    crate::syscall::check_guest(arg, 32, matches!(cmd, 5 | 36))?;
     let (h, pos, size, host) = with(|fs| match fs.fd(fd)? {
         Fd::File { f, host } => {
             let pos = f.stream_position().unwrap_or(0);
