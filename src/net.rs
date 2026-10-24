@@ -579,12 +579,10 @@ fn bind_addr(s: usize, a: &mut [u8]) {
     if port == 0 {
         // An ephemeral port on loopback (a test server on 127.0.0.1:0) is where the container's clients of
         // 127.0.0.1 go: its own address. One on any address is usually a client's, which must keep
-        // reaching other hosts: left alone.
+        // reaching other hosts: left alone. One on ::1 stays there (see below).
         let Some(ip) = own_ip() else { return };
         if fam == AF_INET && a[4..8] == [127, 0, 0, 1] {
             a[4..8].copy_from_slice(&ip);
-        } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == LOOPBACK6 && !v6only(s) {
-            a[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
         }
         return;
     }
@@ -609,15 +607,12 @@ fn bind_addr(s: usize, a: &mut [u8]) {
         a[4..8].copy_from_slice(&ip);
     } else if fam == AF_INET6_WIN && a.len() >= 24 && (a[8..24] == [0; 16] || a[8..24] == LOOPBACK6) {
         // A dual-stack [::] listener answers IPv4 too (php-fpm's `listen = 9000`, clients dial 127.0.0.1):
-        // ::ffff:<ip>. An IPV6_V6ONLY one (nginx's [::]:80 next to its 0.0.0.0:80), or one on ::1, would
-        // take ::1, which every container shares: it gets a free port there instead, and the container's
-        // clients of ::1 reach its IPv4 address (dest_addr).
-        // ponytail: so a server listening on ::1 alone is unreachable.
+        // ::ffff:<ip>. An IPV6_V6ONLY one (nginx's [::]:80 next to its 0.0.0.0:80), or one on ::1, takes
+        // ::1 itself (Go's dual-stack servers, anything told to listen on ::1); the container's clients
+        // of ::1 go there when something listens on it, else to its IPv4 address (dest_addr).
+        // ponytail: ::1 is the host's, shared: two containers can't both listen on ::1 at one port.
         if v6only(s) || a[8..24] == LOOPBACK6 {
             a[8..24].copy_from_slice(&LOOPBACK6);
-            if own_ip().is_some() {
-                set_port(a, 0);
-            }
         } else {
             a[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
         }
@@ -639,6 +634,12 @@ fn v6only(s: usize) -> bool {
 /// its other connections to 127.0.0.1 or ::1 to its own loopback address, and host.docker.internal to
 /// the host's 127.0.0.1.
 fn dest_addr(s: usize, a: &mut [u8]) {
+    // The wildcard address as a destination is this host on Linux; Winsock refuses it (WSAEADDRNOTAVAIL).
+    match u16::from_le_bytes([a[0], a[1]]) {
+        AF_INET if a.len() >= 8 && a[4..8] == [0; 4] => a[4..8].copy_from_slice(&[127, 0, 0, 1]),
+        AF_INET6_WIN if a.len() >= 24 && a[8..24] == [0; 16] => a[23] = 1,
+        _ => {}
+    }
     let Some(ports) = published() else { return };
     if a.len() < 8 || !is_loopback(a) {
         return;
@@ -668,9 +669,31 @@ fn dest_addr(s: usize, a: &mut [u8]) {
     let (Some(ip), false) = (own_ip(), port_of(a) == 53) else { return };
     if fam == AF_INET && a[4..8] == [127, 0, 0, 1] {
         a[4..8].copy_from_slice(&ip);
-    } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == LOOPBACK6 && !v6only(s) {
+    } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == LOOPBACK6 && !v6only(s) && !bound_to_loopback6(s) && !on_loopback6(s, port_of(a)) {
         a[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
     }
+}
+
+/// Whether s is bound to ::1 (Go's dialer binds a local address first): it can only reach ::1 then.
+fn bound_to_loopback6(s: usize) -> bool {
+    let (mut a, mut l) = ([0u8; 28], 28i32);
+    (unsafe { getsockname(s, a.as_mut_ptr(), &mut l) } == 0) && u16::from_le_bytes([a[0], a[1]]) == AF_INET6_WIN && a[8..24] == LOOPBACK6
+}
+
+/// Whether something has [::1]:port (of s's type): then a connection to ::1 goes there, as asked. Asked
+/// by trying to bind it, only for connections to ::1 (rare).
+fn on_loopback6(s: usize, port: u16) -> bool {
+    let probe = unsafe { socket(AF_INET6_WIN as i32, if is_udp(s) { 2 } else { 1 }, 0) };
+    if probe == usize::MAX {
+        return false;
+    }
+    let mut a = [0u8; 28];
+    a[..2].copy_from_slice(&AF_INET6_WIN.to_le_bytes());
+    a[2..4].copy_from_slice(&port.to_be_bytes());
+    a[8..24].copy_from_slice(&LOOPBACK6);
+    let taken = unsafe { bind(probe, a.as_ptr(), 28) } != 0 && unsafe { WSAGetLastError() } == 10048; // WSAEADDRINUSE
+    unsafe { closesocket(probe) };
+    taken
 }
 
 /// getsockname(): show the container port the program asked for.
@@ -1024,6 +1047,14 @@ fn accept_nowait(ls: usize) -> Result<(usize, Vec<u8>), i64> {
 
 pub fn sys_accept(fd: u64, addr: u64, lenp: u64, flags: u64) -> R {
     let s = fs::sock(fd)?;
+    // A socket that can't accept fails at once on Linux; s.op below would wait for POLLIN forever.
+    if is_udp(s.s) {
+        return Err(95); // EOPNOTSUPP
+    }
+    let (mut listening, mut len) = (0i32, 4i32);
+    if unsafe { getsockopt(s.s, 0xffff, 0x0002, (&mut listening as *mut i32).cast(), &mut len) } == 0 && listening == 0 {
+        return Err(EINVAL); // SO_ACCEPTCONN: not listening
+    }
     let unix = s.unix.lock().unwrap().is_some();
     let new = s.op(POLLIN, false, || {
         if !unix {
@@ -1156,6 +1187,9 @@ pub fn sys_sendmsg(fd: u64, msg: u64, flags: u64) -> R {
 pub fn sys_recvmsg(fd: u64, msg: u64, flags: u64) -> R {
     let m = unsafe { &mut *(msg as *mut [u64; 7]) };
     let iovs = iovecs(m[2], m[3])?;
+    for &[base, len] in &iovs {
+        crate::syscall::check_guest(base, len as usize, true)?;
+    }
     let total: u64 = iovs.iter().map(|v| v[1]).sum();
     let mut buf = vec![0u8; total.min(1 << 20) as usize];
     let name_len_ptr = if m[0] != 0 { &mut m[1] as *mut u64 as u64 } else { 0 };
@@ -1297,13 +1331,14 @@ fn iovecs(iov: u64, n: u64) -> Result<Vec<[u64; 2]>, i64> {
     if n > 1024 {
         return Err(EINVAL);
     }
+    crate::syscall::check_guest(iov, n as usize * 16, false)?;
     Ok((0..n).map(|i| unsafe { *((iov + i * 16) as *const [u64; 2]) }).collect())
 }
 
 fn gather(iov: u64, n: u64) -> Result<Vec<u8>, i64> {
     let mut data = Vec::new();
     for [base, len] in iovecs(iov, n)? {
-        data.extend_from_slice(unsafe { std::slice::from_raw_parts(base as *const u8, len as usize) });
+        data.extend(crate::syscall::get_guest_vec(base, len as usize).ok_or(crate::syscall::EFAULT)?);
     }
     Ok(data)
 }
@@ -1315,6 +1350,12 @@ pub fn sys_shutdown(fd: u64, how: u64) -> R {
 
 pub fn sys_getsockname(fd: u64, addr: u64, lenp: u64, peer: bool) -> R {
     let s = fs::sock(fd)?;
+    // *lenp (dispatch checked the pointer) must be >= 0, and that much of addr writable.
+    let room = i32::from_le_bytes(crate::syscall::get_guest::<4>(lenp)?);
+    if room < 0 {
+        return Err(EINVAL);
+    }
+    crate::syscall::check_guest(addr, (room as usize).min(128), true)?;
     if s.netlink {
         addr_out(&nl_addr(if peer { 0 } else { nl_pid() }), addr, lenp);
         return Ok(0);
@@ -1368,6 +1409,13 @@ pub fn sys_setsockopt(fd: u64, level: u64, name: u64, val: u64, len: u64) -> R {
 
 pub fn sys_getsockopt(fd: u64, level: u64, name: u64, val: u64, lenp: u64) -> R {
     let s = fs::sock(fd)?;
+    // *lenp must be readable and >= 0, and that much of val writable.
+    let room = i32::from_le_bytes(crate::syscall::get_guest::<4>(lenp)?);
+    if room < 0 {
+        return Err(EINVAL);
+    }
+    crate::syscall::check_guest(lenp, 4, true)?;
+    crate::syscall::check_guest(val, (room as usize).min(256), true)?;
     let int = |v: i32| unsafe {
         *(val as *mut i32) = v;
         *(lenp as *mut u32) = 4;
