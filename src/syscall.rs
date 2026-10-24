@@ -1056,6 +1056,18 @@ fn dispatch(c: &mut Context) -> i64 {
     if main {
         crate::ptable::syscall_state(false);
     }
+    // A write to a pipe or socket nobody reads any more is EPIPE plus SIGPIPE, whose default kills the
+    // writer: that's how a producer stops once its consumer quit (`yes | head -1`). A send can opt out
+    // with MSG_NOSIGNAL; Python and others ignore SIGPIPE, and raise drops an ignored signal.
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    if r == -EPIPE && match c.rax {
+        1 | 18 | 20 | 296 | 328 => true, // write, pwrite64, writev, pwritev, pwritev2
+        44 | 307 => a[3] & MSG_NOSIGNAL == 0, // sendto, sendmmsg
+        46 => a[2] & MSG_NOSIGNAL == 0,       // sendmsg
+        _ => false,
+    } {
+        let _ = signal::raise(13);
+    }
     IN_SYSCALL[0].store(0, Relaxed);
     r
 }
@@ -1452,7 +1464,7 @@ pub fn write_handle(h: isize, buf: u64, len: u64) -> R {
     if ok != 0 {
         return Ok(done as i64);
     }
-    // ERROR_NO_DATA / ERROR_BROKEN_PIPE: the reader is gone. ponytail: EPIPE without SIGPIPE.
+    // ERROR_NO_DATA / ERROR_BROKEN_PIPE: the reader is gone (dispatch adds the SIGPIPE).
     match err {
         232 | 109 => Err(EPIPE),
         995 => Err(EINTR), // a signal cancelled the write
