@@ -3700,6 +3700,11 @@ fn writable_handle(f: &File) -> bool {
 }
 
 /// The access a handle was opened with (FileAccessInformation), if NT says.
+/// Whether a handle may write (FILE_WRITE_DATA), or NT won't say.
+pub fn handle_writable(h: isize) -> bool {
+    granted_access(h).is_none_or(|g| g & 2 != 0)
+}
+
 fn granted_access(h: isize) -> Option<u32> {
     unsafe extern "system" {
         fn NtQueryInformationFile(h: isize, iosb: *mut [usize; 2], info: *mut u32, len: u32, class: u32) -> i32;
