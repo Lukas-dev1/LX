@@ -1308,6 +1308,12 @@ pub fn sys_shutdown(fd: u64, how: u64) -> R {
 
 pub fn sys_getsockname(fd: u64, addr: u64, lenp: u64, peer: bool) -> R {
     let s = fs::sock(fd)?;
+    // *lenp (dispatch checked the pointer) must be >= 0, and that much of addr writable.
+    let room = i32::from_le_bytes(crate::syscall::get_guest::<4>(lenp)?);
+    if room < 0 {
+        return Err(EINVAL);
+    }
+    crate::syscall::check_guest(addr, (room as usize).min(128), true)?;
     if s.netlink {
         addr_out(&nl_addr(if peer { 0 } else { nl_pid() }), addr, lenp);
         return Ok(0);
