@@ -618,14 +618,20 @@ fn d_type(e: &fs::DirEntry) -> u8 {
 pub struct Slot {
     fd: Fd,
     cloexec: bool,
+    /// F_SETOWN(_EX): (F_OWNER_TID 0 / _PID 1 / _PGRP 2, id). ponytail: kept for F_GETOWN; no SIGIO is sent.
+    owner: (i32, i32),
+    /// F_SETLEASE: F_RDLCK 0, F_WRLCK 1, F_UNLCK 2. ponytail: kept for F_GETLEASE; leases are never broken.
+    lease: i16,
 }
+
+const NO_OWNER: (i32, i32) = (1, 0);
 static FS: Mutex<Option<Fs>> = Mutex::new(None);
 
 pub fn init(root: PathBuf) {
     let std = |n: i32| {
         let h = unsafe { crate::win::GetStdHandle(n as u32) };
         let owned = (h != 0 && h != -1).then(|| unsafe { BorrowedHandle::borrow_raw(h as _) }.try_clone_to_owned().ok());
-        owned.flatten().map(|h| Slot { fd: Fd::Handle(h), cloexec: false })
+        owned.flatten().map(|h| Slot { fd: Fd::Handle(h), cloexec: false, owner: NO_OWNER, lease: 2 })
     };
     note_marked_roots(&root, None);
     *FS.lock().unwrap() = Some(Fs { root, upper: None, mounts: Vec::new(), cwd: "/".into(), fds: vec![std(-10), std(-11), std(-12)] });
@@ -1173,7 +1179,7 @@ impl Fs {
         if self.fds.len() <= i {
             self.fds.resize_with(i + 1, || None);
         }
-        self.fds[i] = Some(Slot { fd, cloexec });
+        self.fds[i] = Some(Slot { fd, cloexec, owner: NO_OWNER, lease: 2 });
         Ok(i as i64)
     }
 }
@@ -1367,7 +1373,7 @@ pub fn init_from(fields: &[String]) -> Result<&[String], String> {
         while fds.len() <= fd {
             fds.push(None);
         }
-        fds[fd] = Some(Slot { fd: fd_, cloexec: cloexec == "1" });
+        fds[fd] = Some(Slot { fd: fd_, cloexec: cloexec == "1", owner: NO_OWNER, lease: 2 });
         rest = more;
     }
     let upper = (!upper.is_empty()).then(|| PathBuf::from(upper));
@@ -3023,7 +3029,8 @@ pub fn fsync(fd: u64) -> R {
             }
             r => r.map(|_| 0).map_err(errno),
         },
-        _ => Ok(0), // pipes, sockets, devices, directories: nothing to flush
+        Fd::Dir { .. } | Fd::Handle(_) => Ok(0), // nothing of ours to flush
+        _ => Err(EINVAL), // pipes, sockets, devices: they can't be synced
     })
 }
 
@@ -3033,6 +3040,9 @@ pub fn flock(fd: u64, op: u64) -> R {
     const LOCK_EX: u64 = 2;
     const LOCK_NB: u64 = 4;
     const LOCK_UN: u64 = 8;
+    if !matches!(op & !LOCK_NB, LOCK_SH | LOCK_EX | LOCK_UN) {
+        return Err(EINVAL); // exactly one of them
+    }
     let h = with(|fs| match fs.fd(fd)? {
         Fd::File { f, .. } => Ok(f.as_raw_handle() as isize),
         Fd::Dir { .. } => Ok(-1), // directories: nothing to lock on NT here; succeed like an uncontended lock
@@ -3091,7 +3101,7 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
         while fs.fds.len() <= new as usize {
             fs.fds.push(None);
         }
-        fs.fds[new as usize] = Some(Slot { fd: d, cloexec: flags & O_CLOEXEC != 0 });
+        fs.fds[new as usize] = Some(Slot { fd: d, cloexec: flags & O_CLOEXEC != 0, owner: NO_OWNER, lease: 2 });
         Ok(new as i64)
     })
 }
@@ -3112,7 +3122,8 @@ fn pipe_size(fd: u64, set: Option<u64>) -> R {
     let sizes = sizes.get_or_insert_with(HashMap::new);
     match set {
         None => Ok(*sizes.get(&key).unwrap_or(&65536) as i64),
-        Some(n) if n > 1 << 20 => Err(crate::syscall::EPERM),
+        Some(n) if n > 1 << 31 => Err(EINVAL), // no pipe size rounds to that
+        Some(n) if n > 1 << 20 => Err(crate::syscall::EPERM), // past pipe-max-size without CAP_SYS_RESOURCE
         Some(n) => {
             let n = n.max(4096).next_power_of_two();
             sizes.insert(key, n);
@@ -3136,7 +3147,42 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             Ok(slot.cloexec as i64) // F_GETFD
         }),
         // F_SETFL / F_GETFL: O_NONBLOCK matters for sockets. ponytail: ignored on pipes and files.
-        8 => with(|fs| fs.fd(fd).map(|_| 0)), // F_SETOWN: only matters for SIGIO, which we don't send
+        // F_SETOWN / F_GETOWN (a negative id: a process group), F_SETOWN_EX / F_GETOWN_EX ({type, id}).
+        8 | 9 | 15 | 16 => with(|fs| {
+            fs.fd(fd)?;
+            let slot = fs.fds[fd as usize].as_mut().unwrap();
+            match cmd {
+                8 => slot.owner = if (arg as i32) < 0 { (2, -(arg as i32)) } else { (1, arg as i32) },
+                9 => return Ok(if slot.owner.0 == 2 { -slot.owner.1 } else { slot.owner.1 } as i64),
+                15 => {
+                    let b = crate::syscall::get_guest::<8>(arg)?;
+                    let (ty, id) = (i32::from_le_bytes(b[..4].try_into().unwrap()), i32::from_le_bytes(b[4..].try_into().unwrap()));
+                    if !(0..=2).contains(&ty) {
+                        return Err(EINVAL);
+                    }
+                    slot.owner = (ty, id);
+                }
+                _ => {
+                    let (ty, id) = slot.owner;
+                    crate::syscall::put_guest(arg, &[ty.to_le_bytes(), id.to_le_bytes()].concat())?;
+                }
+            }
+            Ok(0)
+        }),
+        // F_SETLEASE / F_GETLEASE, on regular files: a read lease needs an fd that doesn't write.
+        1024 | 1025 => with(|fs| {
+            let Fd::File { f, .. } = fs.fd(fd)? else { return Err(EINVAL) };
+            let writes = writable_handle(f);
+            let slot = fs.fds[fd as usize].as_mut().unwrap();
+            if cmd == 1025 {
+                return Ok(slot.lease as i64);
+            }
+            match arg {
+                0 if writes => Err(crate::syscall::EAGAIN),
+                0..=2 => { slot.lease = arg as i16; Ok(0) }
+                _ => Err(EINVAL),
+            }
+        }),
         // F_SETSIG / F_GETSIG: which signal SIGIO would be. ponytail: no SIGIO, so it's only checked.
         10 => if arg > 64 { Err(EINVAL) } else { with(|fs| fs.fd(fd).map(|_| 0)) },
         11 => with(|fs| fs.fd(fd).map(|_| 0)),
