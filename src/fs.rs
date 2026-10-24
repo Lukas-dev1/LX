@@ -2151,6 +2151,9 @@ pub fn select(n: u64, rd: u64, wr: u64, ex: u64, timeout_ms: i64) -> R {
 /// sendfile: from the file position (cat), or from `*off` leaving the position alone and advancing
 /// `*off` instead (nginx). ponytail: a bounce buffer, up to 64K per call; TransmitFile would be zero-copy.
 pub fn sendfile(out: u64, inp: u64, off: u64, count: u64) -> R {
+    if off != 0 {
+        crate::syscall::check_guest(off, 8, true)?; // EFAULT for a bad offset pointer, not a fault
+    }
     let mut buf = vec![0u8; count.min(1 << 16) as usize];
     let n = if off != 0 {
         pread(inp, buf.as_mut_ptr() as u64, buf.len() as u64, unsafe { *(off as *const u64) }, false)?
