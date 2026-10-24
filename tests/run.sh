@@ -186,6 +186,7 @@ expect "F_GETFL shows how a file was opened; FIONBIO makes a pipe non-blocking" 
 expect "F_GETLK names the holder of a conflicting lock (type, range, pid)" 0 "holder type=1 start=10 len=5 is_parent=True" -- run -v "$GUEST" python:3.12-alpine python3 /t/getlk.py
 expect "SIGPIPE on a write without a reader (default kills, Python gets EPIPE)" 0 "python EPIPE, default killed by 13" -- run -v "$GUEST" python:3.12-alpine python3 /t/sigpipe.py
 expect "O_PATH fds: no read/write, fstat and fchdir work" 0 "read EBADF, write EBADF, size 4, /tmp" -- run -v "$GUEST" python:3.12-alpine python3 /t/opath.py
+expect "utimensat: atime apart from mtime, directories too, and a read-only file's owner may" 0 "a=2002 m=2003 dir=2001 ro=2004" -- run alpine sh -c 'echo x > /tmp/f; touch -a -d "2002-01-01 00:00:00" /tmp/f; touch -m -d "2003-01-01 00:00:00" /tmp/f; a=$(stat -c %x /tmp/f | cut -c1-4); m=$(stat -c %y /tmp/f | cut -c1-4); touch -d "2001-02-03 04:05:06" /usr; chmod 444 /tmp/f; touch -m -d "2004-01-01 00:00:00" /tmp/f; echo "a=$a m=$m dir=$(stat -c %y /usr | cut -c1-4) ro=$(date -r /tmp/f +%Y)"'
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]

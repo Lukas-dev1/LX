@@ -537,8 +537,15 @@ pub struct Attrs {
     pub len: u64,
     /// Last write time, ns since the Unix epoch.
     pub mtime: u64,
+    /// Last access time, likewise (NTFS updates it lazily, but utimensat sets it).
+    pub atime: u64,
     /// Carries MARKER_ATTR: may be one of our marker files.
     pub marker: bool,
+}
+
+/// A FILETIME (100 ns ticks since 1601) as ns since the Unix epoch.
+fn unix_ns(ft: u64) -> u64 {
+    ft.saturating_sub(116_444_736_000_000_000).saturating_mul(100)
 }
 
 pub fn attrs(p: &Path) -> Option<Attrs> {
@@ -548,11 +555,12 @@ pub fn attrs(p: &Path) -> Option<Attrs> {
     if unsafe { crate::win::GetFileAttributesExW(w.as_ptr(), 0, &mut d) } == 0 {
         return None;
     }
-    let write = (d[6] as u64) << 32 | d[5] as u64; // 100 ns ticks since 1601
+    let (access, write) = ((d[4] as u64) << 32 | d[3] as u64, (d[6] as u64) << 32 | d[5] as u64); // 100 ns ticks since 1601
     Some(Attrs {
         dir: d[0] & 0x10 != 0, // FILE_ATTRIBUTE_DIRECTORY
         len: (d[7] as u64) << 32 | d[8] as u64,
-        mtime: write.saturating_sub(116_444_736_000_000_000).saturating_mul(100),
+        mtime: unix_ns(write),
+        atime: unix_ns(access),
         marker: d[0] & MARKER_ATTR != 0,
     })
 }
@@ -571,8 +579,8 @@ fn lower_attrs(p: &Path) -> Option<Attrs> {
     let listing = cached.unwrap_or_else(|| {
         let entry = |e: fs::DirEntry| {
             let m = e.metadata().ok()?;
-            let mtime = m.last_write_time().saturating_sub(116_444_736_000_000_000).saturating_mul(100);
-            Some((e.file_name(), Attrs { dir: m.is_dir(), len: m.file_size(), mtime, marker: m.file_attributes() & MARKER_ATTR != 0 }))
+            let (mtime, atime) = (unix_ns(m.last_write_time()), unix_ns(m.last_access_time()));
+            Some((e.file_name(), Attrs { dir: m.is_dir(), len: m.file_size(), mtime, atime, marker: m.file_attributes() & MARKER_ATTR != 0 }))
         };
         let l: Listing = Arc::new(fs::read_dir(dir).map(|rd| rd.flatten().filter_map(entry).collect()).unwrap_or_default());
         DIRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(dir.to_path_buf(), l.clone());
@@ -2463,11 +2471,17 @@ pub fn utimensat(dirfd: u64, path: u64, times: u64, flags: u64) -> R {
             };
         }
         let (guest, host) = fs.at(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-        if fs::metadata(&host).map_err(errno)?.is_dir() {
-            return Ok(0); // ponytail: directory times aren't settable through std; nothing relies on them
+        let dir = fs::metadata(&host).map_err(errno)?.is_dir();
+        let target = fs.writable(&comps_of(&guest), !dir)?;
+        if dir && !exists(&target) {
+            fs::create_dir(&target).map_err(errno)?; // an image directory gets its upper copy, mode and owner
+            if let Some(m) = get_meta(&host) {
+                let _ = set_meta(&target, m);
+            }
         }
-        let target = fs.writable(&comps_of(&guest), true)?;
-        OpenOptions::new().write(true).open(target).and_then(|f| f.set_times(t)).map(|_| 0).map_err(errno)
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_WRITE_ATTRIBUTES; FILE_FLAG_BACKUP_SEMANTICS opens a directory.
+        OpenOptions::new().access_mode(0x100).custom_flags(0x0200_0000).open(target).and_then(|f| f.set_times(t)).map(|_| 0).map_err(errno)
     })
 }
 
@@ -3234,7 +3248,6 @@ fn stat_of_attrs(host: &Path, m: Attrs) -> Result<[u64; 18], i64> {
         Some(t) => (0o120777, t.len() as u64, 1),
         None => (0o100755, m.len, 1),
     };
-    let t = std::time::Duration::from_nanos(m.mtime);
     let mut s = [0u64; 18];
     s[0] = 0x803;
     s[1] = ino(host);
@@ -3243,14 +3256,19 @@ fn stat_of_attrs(host: &Path, m: Attrs) -> Result<[u64; 18], i64> {
     s[6] = size;
     s[7] = 4096;
     s[8] = size.div_ceil(512);
-    for i in [9, 11, 13] {
-        (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
-    }
+    put_times(&mut s, m.atime, m.mtime);
     with_meta(&mut s, host);
     if link.is_some() {
         s[3] = (s[3] & !0o7777) | 0o777; // a symlink's own owner (lchown) counts; its mode is always 0777
     }
     Ok(s)
+}
+
+/// struct stat's atime, mtime and ctime (ctime: the mtime; NT has no inode change time to give).
+fn put_times(s: &mut [u64; 18], atime: u64, mtime: u64) {
+    for (i, t) in [(9, atime), (11, mtime), (13, mtime)] {
+        (s[i], s[i + 1]) = (t / 1_000_000_000, t % 1_000_000_000);
+    }
 }
 
 fn put_stat(buf: u64, s: [u64; 18]) -> R {
@@ -3263,13 +3281,11 @@ pub fn fstat(fd: u64, buf: u64) -> R {
         // From the open handle, not the path: the file may have been renamed or deleted since (apt does
         // both to its temp files), and Linux's fstat still answers.
         Fd::File { f, host } => {
+            use std::os::windows::fs::MetadataExt;
             let m = f.metadata().map_err(errno)?;
-            let t = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).unwrap_or_default();
             let mut s = [0u64; 18];
             (s[0], s[1], s[2], s[3], s[6], s[7], s[8]) = (0x803, ino(host), 1, 0o100755, m.len(), 4096, m.len().div_ceil(512));
-            for i in [9, 11, 13] {
-                (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
-            }
+            put_times(&mut s, unix_ns(m.last_access_time()), unix_ns(m.last_write_time()));
             with_meta(&mut s, host);
             // The guest's own hard links, as fstatat counts them: not an image file's (hard-linked between
             // image copies, which the guest must not see).
