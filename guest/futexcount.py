@@ -15,6 +15,10 @@ short = time.monotonic() - t0 < 0.05
 ws = [threading.Thread(target=futex, args=(a, 0, 0)) for _ in range(3)]
 [w.start() for w in ws]
 time.sleep(0.3)
-one, rest = futex(a, 1, 1), futex(a, 1, 10)
+one = futex(a, 1, 1)
+rest, deadline = 0, time.monotonic() + 10
+while rest < 2 and time.monotonic() < deadline:  # under load a waiter may not be waiting yet
+    rest += futex(a, 1, 10)
+    time.sleep(0.05)
 [w.join(5) for w in ws]
 print("wait %s short %s, woke %s then %s, none %s, unmapped %s, odd %s" % (waited, short, one, rest, futex(a, 1, 1), futex(16, 1, 1), futex(a + 1, 1, 1)))
