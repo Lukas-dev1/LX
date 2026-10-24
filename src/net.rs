@@ -597,7 +597,7 @@ fn bind_addr(s: usize, a: &mut [u8]) {
     } else if fam == AF_INET6_WIN && a.len() >= 24 && (a[8..24] == [0; 16] || a[8..24] == LOOPBACK6) {
         // A dual-stack [::] listener answers IPv4 too (php-fpm's `listen = 9000`, clients dial 127.0.0.1):
         // ::ffff:<ip>. An IPV6_V6ONLY one (nginx's [::]:80 next to its 0.0.0.0:80), or one on ::1, takes
-        // ::1 itself (Node and Vite listen on `localhost`, which is ::1 first); the container's clients
+        // ::1 itself (Go's dual-stack servers, anything told to listen on ::1); the container's clients
         // of ::1 go there when something listens on it, else to its IPv4 address (dest_addr).
         // ponytail: ::1 is the host's, shared: two containers can't both listen on ::1 at one port.
         if v6only(s) || a[8..24] == LOOPBACK6 {

@@ -187,7 +187,7 @@ expect "F_GETLK names the holder of a conflicting lock (type, range, pid)" 0 "ho
 expect "SIGPIPE on a write without a reader (default kills, Python gets EPIPE)" 0 "python EPIPE, default killed by 13" -- run -v "$GUEST" python:3.12-alpine python3 /t/sigpipe.py
 expect "O_PATH fds: no read/write, fstat and fchdir work" 0 "read EBADF, write EBADF, size 4, /tmp" -- run -v "$GUEST" python:3.12-alpine python3 /t/opath.py
 expect "RLIMIT_NOFILE: EMFILE at the soft limit, inherited by children" 0 "default 1024, open EMFILE at 50, pipe EMFILE, dup2 EBADF, raise hard refused, child (50, 4096)" -- run -v "$GUEST" python:3.12-alpine python3 /t/nofile.py
-expect "a listener on ::1 is reachable at its own port (Node and Vite listen on localhost = ::1), next to one on 127.0.0.1; ::1 without one reaches the IPv4 listener" 0 "v6 True ok v4 ok fallback ok" -- run python:3.12-alpine python3 -c 'import socket
+expect "a listener on ::1 is reachable at its own port, next to one on 127.0.0.1; ::1 without one reaches the IPv4 listener" 0 "v6 True ok v4 ok fallback ok" -- run python:3.12-alpine python3 -c 'import socket
 def tryc(fam, host, port, srv):
     c = socket.socket(fam); c.settimeout(2)
     try: c.connect((host, port)); srv.settimeout(2); srv.accept(); return "ok"
