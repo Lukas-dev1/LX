@@ -187,7 +187,10 @@ expect "F_GETLK names the holder of a conflicting lock (type, range, pid)" 0 "ho
 expect "SIGPIPE on a write without a reader (default kills, Python gets EPIPE)" 0 "python EPIPE, default killed by 13" -- run -v "$GUEST" python:3.12-alpine python3 /t/sigpipe.py
 expect "splice socket -> non-blocking pipe loses nothing when the pipe fills" 0 "moved True intact True" -- run -v "$GUEST" python:3.12-alpine python3 /t/splicekeep.py
 expect "sendfile with an unmapped offset pointer is EFAULT" 0 "sendfile -1 EFAULT" -- run -v "$GUEST" python:3.12-alpine python3 /t/sendfilefault.py
+expect "MAP_FIXED_NOREPLACE: EEXIST over a mapping, exact at a free address" 0 "over EEXIST free exact" -- run -v "$GUEST" python:3.12-alpine python3 /t/noreplace.py
+expect "mmap, munmap, msync, mremap and sendfile check their arguments" 0 "shared write on rdonly EACCES, read on wronly EACCES, private write on rdonly ok, bad fd EBADF, pipe ENODEV, no type EINVAL, munmap odd EINVAL, munmap 0 EINVAL, msync both EINVAL, msync odd EINVAL, mremap fixed EINVAL, sendfile to rdonly EBADF, huge ENOMEM, after ok" -- run -v "$GUEST" python:3.12-alpine python3 /t/mapchecks.py
 expect "O_PATH fds: no read/write, fstat and fchdir work" 0 "read EBADF, write EBADF, size 4, /tmp" -- run -v "$GUEST" python:3.12-alpine python3 /t/opath.py
+expect "RLIMIT_NOFILE: EMFILE at the soft limit, inherited by children" 0 "default 1024, open EMFILE at 50, pipe EMFILE, dup2 EBADF, raise hard refused, child (50, 4096)" -- run -v "$GUEST" python:3.12-alpine python3 /t/nofile.py
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]
