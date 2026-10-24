@@ -1187,8 +1187,15 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         21 => fs::faccessat(CWD, a[0], a[1]),
         28 => madvise(a[0], a[1], a[2]),
         149..=152 | 325 => Ok(0), // mlock, munlock, mlockall, munlockall, mlock2. ponytail: pages may still be paged out
-        140 => Ok(20), // getpriority: the raw call answers 20 - nice; everyone runs at nice 0 (rpm asks)
-        141 => Ok(0),  // setpriority. ponytail: accepted, not applied
+        // getpriority / setpriority: this process's nice value (the raw call answers 20 - nice). Lowering it
+        // takes CAP_SYS_NICE, which Docker doesn't give. ponytail: kept for asking, not applied; other
+        // processes, groups and users read as nice 0 and setting them is accepted.
+        140 => Ok(if a[0] == 0 && is_self(a[1]) { 20 - NICE.load(Relaxed) } else { 20 }),
+        141 if a[0] == 0 && is_self(a[1]) => {
+            let v = (a[2] as i32).clamp(-20, 19) as i64;
+            if v < NICE.load(Relaxed) { Err(EACCES) } else { NICE.store(v, Relaxed); Ok(0) }
+        }
+        141 => Ok(0),
         32 => fs::dup(a[0], 0, false),
         33 => fs::dup3(a[0], a[1], 0),
         35 => nanosleep(a[0], a[1]),
@@ -1242,7 +1249,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         120 => proc::get_res(&proc::GID, [a[0], a[1], a[2]]), // getresgid
         157 if a[0] == 21 => crate::seccomp::mode(),       // PR_GET_SECCOMP
         157 if a[0] == 22 => crate::seccomp::set(a[1], a[2]), // PR_SET_SECCOMP
-        157 => prctl(a[0], a[1]),
+        157 => prctl(a[0], a[1], a[2]),
+        // personality: PER_LINUX and whatever flags were set (0xffffffff only asks).
+        135 => Ok(if a[0] as u32 == u32::MAX { PERSONA.load(Relaxed) } else { PERSONA.swap(a[0] as u32 as u64, Relaxed) } as i64),
         317 => crate::seccomp::seccomp(a[0], a[1], a[2]),
         115 => proc::getgroups(a[0], a[1]),
         116 => proc::setgroups(a[0], a[1]),
@@ -1939,13 +1948,70 @@ const CAP_LAST_CAP: u64 = 40;
 /// accepted (PR_SET_NAME, PR_SET_DUMPABLE, PR_SET_PDEATHSIG, ...). setpriv and libcap find the highest
 /// capability by asking PR_CAPBSET_READ for 0, 1, 2, ... until EINVAL; answering 0 forever hung the stock
 /// redis image's entrypoint (`setpriv -d`).
-fn prctl(option: u64, arg2: u64) -> R {
+static PERSONA: AtomicU64 = AtomicU64::new(0);
+static NICE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn is_self(who: u64) -> bool {
+    who == 0 || proc::getpid().is_ok_and(|p| p as u64 == who)
+}
+
+/// prctl's per-process settings: [pdeathsig, dumpable, keepcaps, timerslack, no_new_privs, subreaper].
+static PRCTL: Mutex<[u64; 6]> = Mutex::new([0, 1, 0, 50_000, 0, 0]);
+
+thread_local! {
+    /// PR_SET_NAME: this thread's name (comm), 15 bytes and a NUL; None: the program's name.
+    static NAME: std::cell::Cell<Option<[u8; 16]>> = const { std::cell::Cell::new(None) };
+}
+
+fn prctl(option: u64, arg2: u64, arg3: u64) -> R {
     const PR_CAPBSET_READ: u64 = 23;
     const PR_CAP_AMBIENT: u64 = 47;
+    let mut st = PRCTL.lock().unwrap();
+    let put_int = |v: u64| put_guest(arg2, &(v as i32).to_le_bytes());
     match option {
         PR_CAPBSET_READ if arg2 > CAP_LAST_CAP => Err(EINVAL),
         PR_CAPBSET_READ => Ok((arg2 < 32 && DOCKER_CAPS & 1 << arg2 != 0) as i64),
         PR_CAP_AMBIENT => Ok(0), // nothing ambient (IS_SET answers 0; raising one is accepted)
+        1 if arg2 > 64 => Err(EINVAL),                 // PR_SET_PDEATHSIG. ponytail: kept, never sent
+        1 => { st[0] = arg2; Ok(0) }
+        2 => put_int(st[0]),                           // PR_GET_PDEATHSIG
+        3 => Ok(st[1] as i64),                         // PR_GET_DUMPABLE
+        4 if arg2 > 1 => Err(EINVAL),                  // PR_SET_DUMPABLE
+        4 => { st[1] = arg2; Ok(0) }
+        7 => Ok(st[2] as i64),                         // PR_GET_KEEPCAPS
+        8 if arg2 > 1 => Err(EINVAL),                  // PR_SET_KEEPCAPS
+        8 => { st[2] = arg2; Ok(0) }
+        15 => {                                        // PR_SET_NAME: up to 15 bytes
+            let mut name = [0u8; 16];
+            let s = cstr(arg2)?;
+            let n = s.len().min(15);
+            name[..n].copy_from_slice(&s.as_bytes()[..n]);
+            NAME.set(Some(name));
+            Ok(0)
+        }
+        16 => {                                        // PR_GET_NAME
+            let name = NAME.get().unwrap_or_else(|| {
+                let exe = crate::fs::exe_name();
+                let mut b = [0u8; 16];
+                let n = exe.len().min(15);
+                b[..n].copy_from_slice(&exe.as_bytes()[..n]);
+                b
+            });
+            put_guest(arg2, &name)
+        }
+        25 => put_int(1),                              // PR_GET_TSC: PR_TSC_ENABLE
+        26 if !matches!(arg2, 1 | 2) => Err(EINVAL),   // PR_SET_TSC
+        26 => Ok(0),
+        29 => { st[3] = if arg2 == 0 { 50_000 } else { arg2 }; Ok(0) } // PR_SET_TIMERSLACK (0: the default)
+        30 => Ok(st[3] as i64),                        // PR_GET_TIMERSLACK
+        36 => { st[5] = (arg2 != 0) as u64; Ok(0) }    // PR_SET_CHILD_SUBREAPER
+        37 => put_int(st[5]),                          // PR_GET_CHILD_SUBREAPER
+        38 if arg2 != 1 || arg3 != 0 => Err(EINVAL),   // PR_SET_NO_NEW_PRIVS: only ever on
+        38 => { st[4] = 1; Ok(0) }
+        39 => Ok(st[4] as i64),                        // PR_GET_NO_NEW_PRIVS
+        14 if arg2 != 0 => Err(EINVAL),                // PR_SET_TIMING: only statistical timing
+        // Options past the ones Linux has (and not its magic-number ones: PR_SET_VMA, PR_SET_PTRACER).
+        o if o > 100 && o != 0x5356_4d41 && o != 0x5961_6d61 => Err(EINVAL),
         _ => Ok(0),
     }
 }
