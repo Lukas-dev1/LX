@@ -1040,11 +1040,13 @@ impl Fs {
     /// ponytail: an NTFS reparse point placed inside the rootfs by someone else would still be followed by
     /// Windows; the AppContainer boundary (DESIGN.md §7) covers that.
     pub fn resolve(&self, dir: &str, path: &str, follow: bool) -> Result<(String, PathBuf), i64> {
-        self.resolve_attrs(dir, path, follow).map(|(g, h, _)| (g, h))
+        self.resolve_attrs(dir, path, follow, false).map(|(g, h, _)| (g, h))
     }
 
     /// resolve, also giving the result's attributes (None: it doesn't exist), as the lookup found them.
-    fn resolve_attrs(&self, dir: &str, path: &str, follow: bool) -> Result<(String, PathBuf, Option<Attrs>), i64> {
+    /// `jailed`: a path from the guest, resolved inside its chroot; else one of ours (the guest paths this
+    /// returns, which are the container's, chroot included), resolved as it is.
+    fn resolve_attrs(&self, dir: &str, path: &str, follow: bool, jailed: bool) -> Result<(String, PathBuf, Option<Attrs>), i64> {
         if path.is_empty() {
             return Err(ENOENT);
         }
@@ -1057,7 +1059,8 @@ impl Fs {
         let want_dir = path.ends_with('/') && path.trim_end_matches('/') != "" && path.trim_end_matches('/') != ".";
         let follow = follow || want_dir;
         let mut todo = split(path);
-        let mut comps: Vec<String> = if path.starts_with('/') { vec![] } else { split(dir).into() };
+        let jail = if jailed { jail() } else { Vec::new() };
+        let mut comps: Vec<String> = if path.starts_with('/') { jail.clone() } else { split(dir).into() };
         let mut hops = 0;
         let mut last: Option<(PathBuf, Option<Attrs>)> = None; // host_meta(comps), when the loop already worked it out
         // Whether the upper layer has no directory at comps (the parent of the next component): then it
@@ -1072,7 +1075,14 @@ impl Fs {
             last = None;
             match c.as_str() {
                 "." => continue,
-                ".." => { comps.pop(); not_in_upper = false; seen = true; continue }
+                ".." => {
+                    if comps.len() > jail.len() || !comps.starts_with(&jail) {
+                        comps.pop(); // not past a chroot's root
+                    }
+                    not_in_upper = false;
+                    seen = true;
+                    continue
+                }
                 _ if c.contains('\0') => return Err(ENOENT), // `:` and `\` are fine: enc() maps them
                 // Layer bookkeeping names are ours; the guest can't see or forge whiteouts.
                 _ if c.starts_with(WHITEOUT) && self.upper.is_some() => return Err(ENOENT),
@@ -1090,7 +1100,7 @@ impl Fs {
                     }
                     comps.pop();
                     if target.starts_with('/') {
-                        comps.clear();
+                        comps.clone_from(&jail);
                     }
                     not_in_upper = false; // the link's parent may well be in the upper layer
                     seen = true; // and it was seen: it holds the link
@@ -1168,7 +1178,7 @@ impl Fs {
         let path = cstr(path)?;
         // An absolute path ignores dirfd, even an invalid one (mariadb passes -1).
         let dir = if path.starts_with('/') { String::new() } else { self.dir_of(dirfd)? };
-        self.resolve_attrs(&dir, &path, follow)
+        self.resolve_attrs(&dir, &path, follow, true)
     }
 
     fn fd(&mut self, fd: u64) -> Result<&mut Fd, i64> {
@@ -1191,7 +1201,7 @@ impl Fs {
 
 /// Where a guest path lives on the host (symlinks followed): the ELF loader maps program files from it.
 pub fn host_of(guest: &str) -> Option<PathBuf> {
-    with(|fs| fs.resolve("/", guest, true).ok().map(|(_, h)| h))
+    with(|fs| fs.resolve_attrs("/", guest, true, true).ok().map(|(_, h, _)| h))
 }
 
 /// Resolve an executable: relative to cwd when it has a slash, else a PATH search like a shell.
@@ -1199,7 +1209,7 @@ pub fn host_of(guest: &str) -> Option<PathBuf> {
 pub fn find_exe(cmd: &str, path_var: &str) -> Result<(String, Vec<u8>), i64> {
     with(|fs| {
         let dirs: Vec<&str> = if cmd.contains('/') { vec![fs.cwd.as_str()] } else { path_var.split(':').collect() };
-        let found = dirs.iter().filter_map(|d| fs.resolve(d, cmd, true).ok());
+        let found = dirs.iter().filter_map(|d| fs.resolve_attrs(d, cmd, true, true).ok().map(|(g, h, _)| (g, h)));
         let mut err = ENOENT;
         for (guest, host) in found {
             match fs::metadata(&host) {
@@ -3974,11 +3984,51 @@ pub fn fadvise(fd: u64, len: u64, advice: u64) -> R {
 
 pub fn getcwd(buf: u64, size: u64) -> R {
     with(|fs| {
-        let n = fs.cwd.len() + 1;
+        // Inside a chroot, the path from its root.
+        let j = format!("/{}", jail().join("/"));
+        let cwd = match fs.cwd.strip_prefix(j.as_str()) {
+            Some("") if j != "/" => "/",
+            Some(rest) if j != "/" && rest.starts_with('/') => rest,
+            _ => fs.cwd.as_str(),
+        };
+        let n = cwd.len() + 1;
         if (size as usize) < n { return Err(ERANGE) }
-        crate::syscall::put_guest(buf, &[fs.cwd.as_bytes(), &[0]].concat())?;
+        crate::syscall::put_guest(buf, &[cwd.as_bytes(), &[0]].concat())?;
         Ok(n as i64)
     })
+}
+
+// ---- chroot ----
+//
+// The root a process resolves absolute paths (and absolute symlinks) from, as guest path components;
+// ".." stops there. Empty: the container's root. It goes to later lx processes (fork, exec) in
+// LX_CHROOT, in the host environment like LX_IDS. ponytail: the cwd stays where it was, as on Linux,
+// and /proc inside a chroot is only what the chroot itself holds (none, unless the guest made one).
+static JAIL: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+fn jail() -> Vec<String> {
+    static FROM_ENV: std::sync::Once = std::sync::Once::new();
+    FROM_ENV.call_once(|| {
+        if let Ok(j) = std::env::var("LX_CHROOT") {
+            *JAIL.write().unwrap() = split(&j).into();
+        }
+    });
+    JAIL.read().unwrap().clone()
+}
+
+/// chroot(path): root (with CAP_SYS_CHROOT, which Docker gives) only.
+pub fn chroot(path: u64) -> R {
+    let (guest, _, meta) = with(|fs| fs.at_attrs(AT_FDCWD, path, true))?;
+    if !meta.ok_or(ENOENT)?.dir {
+        return Err(ENOTDIR);
+    }
+    if crate::proc::UID.load(Relaxed) != 0 {
+        return Err(crate::syscall::EPERM);
+    }
+    jail(); // the inherited one first, so it can't overwrite this later
+    *JAIL.write().unwrap() = split(&guest).into();
+    unsafe { std::env::set_var("LX_CHROOT", &guest) };
+    Ok(0)
 }
 
 /// Set the starting directory (an image's WorkingDir). It must exist in the rootfs.
@@ -4311,10 +4361,10 @@ fn layer_never_touches_the_image() {
     assert_eq!(f.resolve("/usr/lib", "py/m.py", false).unwrap().1, lower.join("usr/lib/py/m.py"));
     // The lookup's attributes (what stat and open use): there for image files; below a missing dir or
     // a file there's nothing (ENOENT, ENOTDIR), and a trailing slash wants a directory.
-    let meta = |p: &str| f.resolve_attrs("/", p, true).unwrap().2;
+    let meta = |p: &str| f.resolve_attrs("/", p, true, false).unwrap().2;
     assert!(meta("/usr/lib/py/m.py").is_some_and(|m| !m.dir && m.len == 1) && meta("/usr/lib").is_some_and(|m| m.dir));
     assert!(meta("/usr/nope").is_none());
-    let err = |p: &str| f.resolve_attrs("/", p, true).err();
+    let err = |p: &str| f.resolve_attrs("/", p, true, false).err();
     assert_eq!((err("/usr/nope/m.py"), err("/nope/a/b"), err("/usr/lib/py/m.py/x"), err("/usr/lib/py/m.py/")), (Some(ENOENT), Some(ENOENT), Some(ENOTDIR), Some(ENOTDIR)));
     let w = f.writable(&c("/etc/a.conf"), true).unwrap();
     fs::write(&w, "container").unwrap();
