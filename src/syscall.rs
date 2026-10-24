@@ -2195,6 +2195,14 @@ fn munmap(addr: u64, len: u64, rsp: u64) -> R {
 fn madvise(addr: u64, len: u64, advice: u64) -> R {
     const MADV_DONTNEED: u64 = 4;
     const MADV_REMOVE: u64 = 9;
+    // NORMAL..DONTNEED, FREE..COLLAPSE, HWPOISON, SOFT_OFFLINE: anything else is EINVAL, as is an
+    // unaligned start; a range with unmapped pages is ENOMEM.
+    if addr % PAGE != 0 || !matches!(advice, 0..=4 | 8..=25 | 100 | 101) {
+        return Err(EINVAL);
+    }
+    if len != 0 && !each_region(addr, len.next_multiple_of(PAGE), |_, _, state| state != 0x10000) { // MEM_FREE
+        return Err(ENOMEM);
+    }
     if advice != MADV_DONTNEED && advice != MADV_REMOVE {
         return Ok(0);
     }
@@ -2205,7 +2213,9 @@ fn madvise(addr: u64, len: u64, advice: u64) -> R {
         let mut m = MemoryBasicInformation::default();
         unsafe {
             VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>());
-            VirtualFree(p as *mut _, n as usize, MEM_DECOMMIT) != 0
+            // A view of a section (MEM_MAPPED) can't be decommitted; its pages are the file's or the
+            // shared memory's anyway, which dropping them doesn't change.
+            m.ty == 0x40000 || VirtualFree(p as *mut _, n as usize, MEM_DECOMMIT) != 0
                 && !VirtualAlloc(p as *mut _, n as usize, MEM_COMMIT, m.protect).is_null()
         }
     });
@@ -2499,7 +2509,14 @@ fn getcpu(cpu: u64, node: u64) -> R {
 fn mincore(addr: u64, len: u64, vec: u64) -> R {
     const MEM_COMMIT: u32 = 0x1000;
     const MEM_FREE: u32 = 0x10000;
-    let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
+    if addr % PAGE != 0 {
+        return Err(EINVAL);
+    }
+    let Some(end) = addr.checked_add(len).and_then(|e| e.checked_add(0xfff)).map(|e| e & !0xfff).filter(|&e| e <= 0x7fff_ffff_f000) else { // the end of user space
+        return Err(ENOMEM);
+    };
+    let start = addr;
+    check_guest(vec, ((end - start) / 4096) as usize, true)?; // one byte per page
     let mut p = start;
     while p < end {
         let mut m = MemoryBasicInformation::default();
