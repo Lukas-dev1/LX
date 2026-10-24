@@ -486,7 +486,7 @@ fn alloc_ex(fixed: Option<u64>, len: u64, commit: bool) -> Option<u64> {
         },
         None => loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 return None;
             }
             if at(a) == a {
@@ -1075,9 +1075,34 @@ fn dispatch(c: &mut Context) -> i64 {
     r
 }
 
+/// Fixed-size structs these syscalls copy in or out: (syscall, arg, bytes, written, may be NULL). A bad
+/// pointer is EFAULT up front, where the handlers would fault inside lx (LTP's EFAULT cases).
+/// ponytail: only these; other handlers still trust their pointers.
+const STRUCTS: &[(u64, usize, usize, bool, bool)] = &[
+    (13, 1, 32, false, true), (13, 2, 32, true, true), // rt_sigaction: act, oldact
+    (14, 1, 8, false, true), (14, 2, 8, true, true),   // rt_sigprocmask: set, oldset
+    (127, 0, 8, true, false),                          // rt_sigpending
+    (130, 0, 8, false, false),                         // rt_sigsuspend
+    (38, 1, 32, false, true), (38, 2, 32, true, true), // setitimer
+    (36, 1, 32, true, false),                          // getitimer
+    (99, 0, 112, true, false),                         // sysinfo
+    (4, 1, 144, true, false), (5, 1, 144, true, false), (6, 1, 144, true, false), (262, 2, 144, true, false), // stat, fstat, lstat, newfstatat
+    (137, 1, 120, true, false), (138, 1, 120, true, false), // statfs, fstatfs
+    (63, 0, 390, true, false),                         // uname
+    (22, 0, 8, true, false), (293, 0, 8, true, false), // pipe, pipe2
+    (125, 0, 8, true, false), (125, 1, 24, true, true), // capget
+    (46, 1, 56, false, false), (47, 1, 56, true, false), // sendmsg, recvmsg
+    (51, 2, 4, true, false), (52, 2, 4, true, false),  // getsockname, getpeername: addrlen
+];
+
+fn bad_struct(n: u64, a: &[u64; 6]) -> bool {
+    STRUCTS.iter().any(|&(nr, i, len, write, null)| nr == n && !(null && a[i] == 0) && check_guest(a[i], len, write).is_err())
+}
+
 fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
     use fs::{AT_FDCWD as CWD, AT_SYMLINK_NOFOLLOW};
     let r = match c.rax {
+        n if bad_struct(n, &a) => Err(EFAULT),
         0 => fs::read(a[0], a[1], a[2]),
         1 => fs::write(a[0], a[1], a[2]),
         2 => fs::openat(CWD, a[0], a[1], a[2]),
@@ -1102,18 +1127,23 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         30 => shmat(a[0], a[1], a[2]),
         67 => shmdt(a[0], c.rsp),
         31 => shmctl(a[0], a[1], a[2]),
-        25 => mremap(a[0], a[1], a[2], a[3]),
-        26 => msync(a[0], a[1]),
+        25 => mremap(a[0], a[1], a[2], a[3], a[4]),
+        26 => msync(a[0], a[1], a[2]),
         27 => mincore(a[0], a[1], a[2]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
+        13 | 14 if a[3] != 8 => Err(EINVAL), // rt_sigaction, rt_sigprocmask: sigsetsize must be the kernel's
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
         127 => signal::sigpending(a[0], a[1]),
         131 => signal::sigaltstack(a[0], a[1], c.rsp),
         7 => fs::poll(a[0], a[1], a[2] as i32 as i64),
         23 => fs::select(a[0], a[1], a[2], a[3], timeval_ms(a[4])),   // ponytail: the timeout isn't updated
-        270 => fs::select(a[0], a[1], a[2], a[3], timespec_ms(a[4])), // pselect6: signal mask ignored
-        271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
+        // pselect6: the 6th argument is {sigset pointer, its size}
+        270 => (if a[5] != 0 { get_guest::<16>(a[5]) } else { Ok([0; 16]) }).and_then(|b| {
+            let [ss, size] = [0, 8].map(|i| u64::from_le_bytes(b[i..i + 8].try_into().unwrap()));
+            signal::with_mask(ss, size, || fs::select(a[0], a[1], a[2], a[3], timespec_ms(a[4])))
+        }),
+        271 => signal::with_mask(a[3], a[4], || fs::poll(a[0], a[1], timespec_ms(a[2]))), // ppoll
         34 => signal::sigsuspend(0),   // pause
         130 => signal::sigsuspend(a[0]),
         128 => signal::sigtimedwait(a[0], a[1], if a[2] == 0 { -1 } else { let [s, ns] = unsafe { *(a[2] as *const [u64; 2]) }; (s * 1000 + ns.div_ceil(1_000_000)) as i64 }),
@@ -1182,8 +1212,10 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         213 => net::sys_epoll_create(0),
         291 => net::sys_epoll_create(a[0]),
         233 => net::sys_epoll_ctl(a[0], a[1], a[2], a[3]),
-        232 | 281 => net::sys_epoll_wait(a[0], a[1], a[2], a[3] as i32 as i64), // pwait: mask ignored
-        441 => net::sys_epoll_wait(a[0], a[1], a[2], timespec_ms(a[3])),
+        232 => net::sys_epoll_wait(a[0], a[1], a[2], a[3] as i32 as i64),
+        281 => signal::with_mask(a[4], a[5], || net::sys_epoll_wait(a[0], a[1], a[2], a[3] as i32 as i64)), // epoll_pwait
+        441 if a[3] != 0 && !valid_timespec(a[3]) => Err(EINVAL),
+        441 => signal::with_mask(a[4], a[5], || net::sys_epoll_wait(a[0], a[1], a[2], timespec_ms(a[3]))), // epoll_pwait2
         20 => fs::writev(a[0], a[1], a[2]),
         22 => fs::pipe2(a[0], 0),
         21 => fs::faccessat(CWD, a[0], a[1]),
@@ -1258,7 +1290,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         158 if a[0] == 0x1003 => { unsafe { *(a[1] as *mut u64) = ts().fs }; Ok(0) } // ARCH_GET_FS
         158 => Err(EINVAL), // the rest (CET, AMX, CPUID faulting): not supported, as glibc's probes expect
         217 => fs::getdents64(a[0], a[1], a[2]),
-        202 => thread::futex(a[0], a[1], a[2], a[3], a[5]),
+        202 => thread::futex(a[0], a[1], a[2], a[3], a[4], a[5]),
         324 => thread::membarrier(a[0]),
         284 => fs::eventfd(a[0], 0),
         283 => fs::timerfd_create(a[0], a[1]),
@@ -1375,7 +1407,6 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
     let end = addr.checked_add(bytes.len() as u64).ok_or(EFAULT)?;
     // The hot callers (clock_gettime, gettimeofday: lx has no vDSO) write the same page again and again:
     // once checked, it stays writable until the map changes (MAP_GEN), so skip the VirtualQuery.
-    thread_local!(static CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) });
     let page = addr & !(PAGE - 1);
     let same_page = end > addr && (end - 1) & !(PAGE - 1) == page;
     let epoch = MAP_GEN.load(Relaxed);
@@ -1398,6 +1429,8 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
     Ok(0)
 }
+
+thread_local!(static CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) });
 
 /// Bumped by every syscall that changes the address space (see dispatch): put_guest's page cache.
 static MAP_GEN: AtomicU64 = AtomicU64::new(0);
@@ -1428,6 +1461,12 @@ fn readable_end(addr: u64) -> Option<u64> {
 /// work on a guest buffer in place.
 pub fn check_guest(addr: u64, n: usize, write: bool) -> Result<(), i64> {
     let Some(end) = addr.checked_add(n as u64) else { return Err(EFAULT) };
+    // A page put_guest found writable (sigprocmask's oldset is the same stack page call after call).
+    let (page, epoch) = (addr & !(PAGE - 1), MAP_GEN.load(Relaxed));
+    let same_page = end > addr && (end - 1) & !(PAGE - 1) == page;
+    if same_page && CHECKED.get() == (page, epoch) {
+        return Ok(());
+    }
     let mut p = addr;
     while p < end {
         let mut m = MemoryBasicInformation::default();
@@ -1436,6 +1475,9 @@ pub fn check_guest(addr: u64, n: usize, write: bool) -> Result<(), i64> {
             return Err(EFAULT);
         }
         p = (m.base + m.region_size) as u64;
+    }
+    if write && same_page {
+        CHECKED.set((page, epoch));
     }
     Ok(())
 }
@@ -1559,8 +1601,25 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     const MAP_SHARED: u64 = 0x01;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
-    if len == 0 || addr % PAGE != 0 || off % PAGE != 0 {
+    const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+    if len == 0 || addr % PAGE != 0 || off % PAGE != 0 || flags & 3 == 0 { // MAP_SHARED, MAP_PRIVATE or both (_VALIDATE)
         return Err(EINVAL);
+    }
+    if len > USER_END {
+        return Err(ENOMEM); // more than the address space (Go's TestMmapErrorSign)
+    }
+    // MAP_SHARED_VALIDATE: a flag this kernel doesn't know is EOPNOTSUPP rather than ignored.
+    const KNOWN: u64 = 0x3 | 0x10 | 0x20 | 0x40 | 0x100 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x1_0000
+        | 0x2_0000 | 0x4_0000 | 0x10_0000 | 0x400_0000 | 0x3f << 26;
+    if flags & 3 == 3 && flags & !KNOWN != 0 {
+        return Err(95); // EOPNOTSUPP
+    }
+    if flags & MAP_ANONYMOUS == 0 {
+        // A file mapping reads the file; a shared writable one writes it too.
+        let (read, write) = fs::map_access(fd)?;
+        if !read || flags & MAP_SHARED != 0 && prot & 2 != 0 && !write {
+            return Err(EACCES);
+        }
     }
     let len = len.next_multiple_of(PAGE);
     let reserve_only = prot == 0 && flags & MAP_ANONYMOUS != 0; // PROT_NONE: address space, no memory
@@ -1571,7 +1630,10 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     // a MAP_FIXED first cuts any copy-on-write view out of its way.
     let fixed = flags & MAP_FIXED != 0;
     let holes = if fixed { punch_views(addr, len) } else { Vec::new() };
-    let cow = if flags & MAP_ANONYMOUS == 0 { mmap_cow(addr, len, prot, fixed, fd, off, &holes) } else { None };
+    // MAP_FIXED_NOREPLACE: exactly at addr, never over an existing mapping (a private file copy: the
+    // copy-on-write views pick their own place). ponytail: MAP_SHARED ignores it.
+    let noreplace = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) == MAP_FIXED_NOREPLACE;
+    let cow = if flags & MAP_ANONYMOUS == 0 && !noreplace { mmap_cow(addr, len, prot, fixed, fd, off, &holes) } else { None };
     if cow.is_none() {
         for &(a, n) in &holes {
             place_plain(a, n, false); // ordinary reserved memory for the paths below
@@ -1593,6 +1655,9 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     } else {
         // A free hint is honored, like Linux (Go places its heap with hints); otherwise our own window.
         let hinted = (addr != 0).then(|| alloc_ex(Some(addr), len, !reserve_only)).flatten();
+        if noreplace && hinted != Some(addr) {
+            return Err(EEXIST);
+        }
         hinted.or_else(|| alloc_ex(None, len, !reserve_only)).ok_or(ENOMEM)?
     };
     if reserve_only {
@@ -1723,7 +1788,7 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
     } else {
         loop {
             let a = NEXT.fetch_add(vlen.next_multiple_of(0x10000), Relaxed);
-            if a + vlen > WINDOW.1 {
+            if a.checked_add(vlen).is_none_or(|e| e > WINDOW.1) {
                 unsafe { CloseHandle(section) };
                 return Err(ENOMEM);
             }
@@ -1762,7 +1827,7 @@ fn mmap_growable(section: isize, sprot: u32, access: u32, fd: u64, off: u64, vle
     };
     let base = loop {
         let a = NEXT.fetch_add(full.next_multiple_of(0x10000), Relaxed);
-        if a + full > WINDOW.1 {
+        if a.checked_add(full).is_none_or(|e| e > WINDOW.1) {
             return fail(ENOMEM);
         }
         if unsafe { VirtualAlloc2(0, a as *mut _, full as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0) } as u64 == a {
@@ -1866,7 +1931,16 @@ pub fn in_shared_view(addr: u64) -> bool {
     VIEWS.lock().unwrap().iter().any(|v| (v.base..v.base + v.len).contains(&addr))
 }
 
-fn msync(addr: u64, len: u64) -> R {
+fn msync(addr: u64, len: u64, flags: u64) -> R {
+    const MS_ASYNC: u64 = 1;
+    const MS_SYNC: u64 = 4;
+    if addr % PAGE != 0 || flags & !7 != 0 || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC {
+        return Err(EINVAL);
+    }
+    let mut m = MemoryBasicInformation::default();
+    if unsafe { VirtualQuery(addr as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 || m.state == 0x10000 {
+        return Err(ENOMEM); // MEM_FREE: nothing mapped there
+    }
     unsafe { FlushViewOfFile(addr as *const _, len as usize) };
     Ok(0)
 }
@@ -1903,9 +1977,16 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> R {
 }
 
 /// Moves only (MREMAP_MAYMOVE): reservations can't grow in place. Keeps the old protection.
-fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
+fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -> R {
     const MREMAP_MAYMOVE: u64 = 1;
-    if new_len == 0 {
+    const MREMAP_FIXED: u64 = 2;
+    // MREMAP_FIXED needs MAYMOVE, an aligned target and one that doesn't overlap the old mapping.
+    let fixed = flags & MREMAP_FIXED != 0;
+    if new_len > USER_END {
+        return Err(ENOMEM);
+    }
+    if new_len == 0 || old % PAGE != 0 || flags & !7 != 0 || fixed && (flags & MREMAP_MAYMOVE == 0 || new_addr % PAGE != 0
+        || new_addr < old + old_len && old < new_addr + new_len) {
         return Err(EINVAL);
     }
     // Unmapped is EFAULT before anything else: musl's pthread_getattr_np finds the main thread's stack
@@ -1927,7 +2008,9 @@ fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
     let new = alloc(None, new_len).ok_or(ENOMEM)?;
     unsafe { std::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, old_len.min(new_len) as usize) };
     protect(new, new_len.next_multiple_of(PAGE), m.protect);
-    munmap(old, old_len, 0)?;
+    if old_len != 0 {
+        munmap(old, old_len, 0)?;
+    }
     Ok(new as i64)
 }
 
@@ -1957,13 +2040,26 @@ fn prctl(option: u64, arg2: u64) -> R {
 fn capget(header: u64, data: u64) -> R {
     const V3: u32 = 0x2008_0522;
     const DOCKER: u32 = DOCKER_CAPS;
-    if header == 0 {
-        return Err(EFAULT);
+    const V1: u32 = 0x1998_0330;
+    const V2: u32 = 0x2007_1026;
+    // header (checked in dispatch): {version, pid}. An unknown version gets V3 written back and EINVAL
+    // (none at all, without data: the probe libcap does).
+    let [version, pid] = unsafe { *(header as *const [i32; 2]) }.map(|x| x as u32);
+    if ![V1, V2, V3].contains(&version) {
+        unsafe { *(header as *mut u32) = V3 };
+        return if data == 0 { Ok(0) } else { Err(EINVAL) };
     }
-    unsafe { *(header as *mut u32) = V3 };
+    if (pid as i32) < 0 {
+        return Err(EINVAL);
+    }
+    if pid != 0 {
+        crate::proc::kill(pid as i64, 0)?; // ESRCH for a process that isn't there
+    }
     if data != 0 {
         let caps = if crate::proc::UID.load(Relaxed) == 0 { DOCKER } else { 0 };
-        unsafe { *(data as *mut [u32; 6]) = [caps, caps, 0, 0, 0, 0] }; // effective, permitted, inheritable x2
+        // effective, permitted, inheritable: one set for V1, two (64 capabilities) after
+        let n = if version == V1 { 3 } else { 6 };
+        put_guest(data, &[caps, caps, 0, 0, 0, 0][..n].iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>())?;
     }
     Ok(0)
 }
@@ -2024,7 +2120,13 @@ fn shmctl(id: u64, cmd: u64, buf: u64) -> R {
     Ok(0)
 }
 
+/// The end of the user address space (x86-64 TASK_SIZE).
+const USER_END: u64 = 0x7fff_ffff_f000;
+
 fn munmap(addr: u64, len: u64, rsp: u64) -> R {
+    if addr % PAGE != 0 || len == 0 || addr.checked_add(len).is_none_or(|e| e > USER_END) {
+        return Err(EINVAL);
+    }
     let len = len.next_multiple_of(PAGE);
     // A thread unmapping its own stack is about to exit (musl's detached-thread exit does this); NT
     // still needs that stack to dispatch the final exit syscall, so leave it mapped.
@@ -2455,7 +2557,7 @@ pub fn map_image(host: &std::path::Path, segs: &[ImageSeg], fixed: bool, lo: u64
     } else {
         loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 break None;
             }
             if reserve(a) == a {
@@ -2835,7 +2937,7 @@ fn mmap_cow(addr: u64, len: u64, prot: u64, fixed: bool, fd: u64, off: u64, hole
     } else {
         let a = loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 unsafe { CloseHandle(section) };
                 return None;
             }
