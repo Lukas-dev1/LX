@@ -1659,6 +1659,16 @@ pub fn sys_epoll_wait(epfd: u64, out: u64, max: u64, timeout_ms: i64) -> R {
     }
 }
 
+/// Sleep up to `ms` until one of these sockets is ready for its poll events (POLLIN, POLLOUT).
+pub fn wait_sockets(socks: &[(usize, i16)], ms: i32) {
+    let mut p: Vec<WsaPollFd> = socks.iter().map(|&(s, ev)| WsaPollFd {
+        fd: s,
+        events: if ev & 1 != 0 { WSA_POLLRDNORM } else { 0 } | if ev & 4 != 0 { WSA_POLLWRNORM } else { 0 },
+        revents: 0,
+    }).collect();
+    unsafe { WSAPoll(p.as_mut_ptr(), p.len() as u32, ms) };
+}
+
 /// /etc/resolv.conf and /etc/hosts for a container, like Docker writes them: the host's DNS servers.
 pub fn dns_files() -> (String, String) {
     let mut servers = Vec::new();

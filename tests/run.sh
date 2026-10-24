@@ -228,6 +228,16 @@ b = socket.socket(socket.AF_INET6); b.bind(("::1", port)); b.listen()
 d = socket.socket(socket.AF_INET); d.bind(("0.0.0.0", 0)); d.listen()
 print("v6", b.getsockname()[1] == port, tryc(socket.AF_INET6, "::1", port, b), "v4", tryc(socket.AF_INET, "127.0.0.1", port, a), "fallback", tryc(socket.AF_INET6, "::1", d.getsockname()[1], d))'
 expect "fchmodat2 AT_SYMLINK_NOFOLLOW: a symlink is EOPNOTSUPP (its target untouched), a file changes" 0 "link ENOTSUP file 0o600 target 0o644" -- run python:3.12-alpine python3 -c 'import os, ctypes, errno; libc = ctypes.CDLL(None, use_errno=True); libc.syscall.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_char_p, ctypes.c_long, ctypes.c_long]; os.symlink("/etc/hostname", "/tmp/l"); open("/tmp/f", "w").close(); r = libc.syscall(452, -100, b"/tmp/l", 0o600, 0x100); e = ctypes.get_errno(); libc.syscall(452, -100, b"/tmp/f", 0o600, 0x100); print("link", errno.errorcode.get(e) if r < 0 else "ok", "file", oct(os.stat("/tmp/f").st_mode & 0o777), "target", oct(os.stat("/etc/hostname").st_mode & 0o777))'
+expect "poll on sockets sleeps in WSAPoll yet wakes at once for data or a connection, and keeps its timeout" 0 "pollwait timeout True data True accept True" -- run python:3.12-alpine python3 -c 'import select, socket, threading, time
+a, b = socket.socketpair()
+p = select.poll(); p.register(a, select.POLLIN)
+t = time.time(); r = p.poll(300); timeout_ok = r == [] and 0.28 < time.time() - t < 0.45
+threading.Timer(0.1, lambda: b.send(b"x")).start()
+t = time.time(); r = p.poll(5000); woke = time.time() - t
+l = socket.socket(); l.bind(("127.0.0.1", 0)); l.listen()
+threading.Timer(0.1, lambda: socket.create_connection(l.getsockname())).start()
+q = select.poll(); q.register(l, select.POLLIN); t = time.time(); r2 = q.poll(5000); acc = time.time() - t
+print("pollwait timeout", timeout_ok, "data", bool(r) and woke < 0.2, "accept", bool(r2) and acc < 0.2)'
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]
