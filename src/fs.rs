@@ -3276,7 +3276,7 @@ pub fn fstat(fd: u64, buf: u64) -> R {
             if !in_image(host) {
                 let mut info = [0u32; 13];
                 if unsafe { crate::win::GetFileInformationByHandle(f.as_raw_handle() as isize, &mut info) } != 0 {
-                    s[2] = info[10].max(1) as u64; // nNumberOfLinks
+                    link_ino(&mut s, &info);
                 }
             }
             Ok(s)
@@ -3346,21 +3346,29 @@ pub fn fstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> R {
     }
     let mut s = stat_of_attrs(&host, meta.ok_or(ENOENT)?)?;
     if s[3] & 0o170000 == 0o100000 && with(|fs| fs.upper.as_ref().is_some_and(|u| host.starts_with(u)) || fs.mounts.iter().any(|m| host.starts_with(&m.host))) {
-        s[2] = links(&host); // the guest's own hard links (shadow's lock checks for 2)
+        links(&host, &mut s); // the guest's own hard links (shadow's lock checks for 2)
     }
     put_stat(buf, s)
 }
 
-/// A file's NTFS hard links. Only asked in the container's layer and volumes: image files are hard-linked
-/// between image copies, which the guest must not see.
-fn links(host: &Path) -> u64 {
+/// A file's NTFS hard links into stat `s`. Only asked in the container's layer and volumes: image files
+/// are hard-linked between image copies, which the guest must not see.
+fn links(host: &Path, s: &mut [u64; 18]) {
     use std::os::windows::fs::OpenOptionsExt;
-    let Ok(f) = OpenOptions::new().access_mode(0x80).share_mode(7).open(host) else { return 1 }; // FILE_READ_ATTRIBUTES
+    let Ok(f) = OpenOptions::new().access_mode(0x80).share_mode(7).open(host) else { return }; // FILE_READ_ATTRIBUTES
     let mut info = [0u32; 13];
-    if unsafe { crate::win::GetFileInformationByHandle(f.as_raw_handle() as isize, &mut info) } == 0 {
-        return 1;
+    if unsafe { crate::win::GetFileInformationByHandle(f.as_raw_handle() as isize, &mut info) } != 0 {
+        link_ino(s, &info);
     }
-    info[10].max(1) as u64 // nNumberOfLinks
+}
+
+/// nlink from BY_HANDLE_FILE_INFORMATION, and for a hard-linked file the inode from its NTFS file index,
+/// shared by all its names (the path hash isn't: tar, cp -a, du and Go's os.SameFile pair links by ino).
+fn link_ino(s: &mut [u64; 18], info: &[u32; 13]) {
+    s[2] = info[10].max(1) as u64; // nNumberOfLinks
+    if s[2] > 1 {
+        s[1] = (info[11] as u64) << 32 | info[12] as u64; // nFileIndexHigh/Low
+    }
 }
 
 /// statx(dirfd, path, flags, mask, buf): newer coreutils and glibc's stat use it. Filled from the same
