@@ -2158,9 +2158,16 @@ pub fn sendfile(out: u64, inp: u64, off: u64, count: u64) -> R {
     // or a signal comes; an error after some went is that much sent, as on Linux.
     let mut buf = vec![0u8; count.min(1 << 20) as usize];
     let start = if off != 0 { unsafe { *(off as *const u64) } } else { 0 };
+    // What was read from a pipe or socket can't be given back, so it all goes out (below); reading no
+    // more than an output pipe has room for keeps that from waiting (splice: socket -> pipe -> socket).
+    let seekable = off != 0 || with(|fs| matches!(fs.fd(inp), Ok(Fd::File { .. })));
+    let room = with(|fs| match fs.fd(out) {
+        Ok(Fd::Pipe(p)) => p.write_room().filter(|&r| r > 0).map(u64::from),
+        _ => None,
+    });
     let mut total = 0u64;
     while total < count {
-        let want = (count - total).min(buf.len() as u64);
+        let want = (count - total).min(buf.len() as u64).min(if seekable { u64::MAX } else { room.unwrap_or(u64::MAX) });
         let got = if off != 0 {
             pread(inp, buf.as_mut_ptr() as u64, want, start + total, false)
         } else {
@@ -2172,16 +2179,28 @@ pub fn sendfile(out: u64, inp: u64, off: u64, count: u64) -> R {
             Err(e) if total == 0 => return Err(e),
             Err(_) => break,
         };
-        let sent = match write(out, buf.as_ptr() as u64, n as u64) {
-            Ok(s) => s,
-            Err(e) => {
-                if off == 0 {
-                    let _ = lseek(inp, -n, 1); // give back what was read for nothing
+        let mut sent = 0i64;
+        let err = loop {
+            match write(out, buf.as_ptr() as u64 + sent as u64, (n - sent) as u64) {
+                Ok(k) => {
+                    sent += k;
+                    if sent == n || seekable {
+                        break None;
+                    }
                 }
-                if total == 0 { return Err(e) }
-                break;
+                // ponytail: a full non-blocking output briefly blocks this call rather than lose the bytes.
+                Err(crate::syscall::EAGAIN) if !seekable => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(e) => break Some(e),
             }
         };
+        if let Some(e) = err {
+            if off == 0 && seekable {
+                let _ = lseek(inp, sent - n, 1); // give back what was read for nothing
+            }
+            if total == 0 && sent == 0 { return Err(e) }
+            total += sent as u64;
+            break;
+        }
         total += sent as u64;
         if sent < n {
             if off == 0 {
