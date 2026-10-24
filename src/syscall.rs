@@ -953,6 +953,15 @@ unsafe extern "system" fn veh_body(ep: *mut ExceptionPointers) -> i32 {
             if patchlog() { dlog(format_args!("FS-base fault at rip {:#x} rsp {:#x}", c.rip, c.rsp)); }
             resume(c, c.rip)
         }
+        STATUS_BREAKPOINT => {
+            // int3 in guest code: SIGTRAP (SI_KERNEL), with rip past it as Linux reports it, where NT
+            // points at it. Go's debugger-call protocol (debugCallV2) and abort paths rely on it.
+            c.rip += if unsafe { *(c.rip as *const u8) } == 0xcc { 1 } else { 2 }; // int3, or int 3 (cd 03)
+            match signal::fault(c, 5, 0x80, 0) {
+                Some(frame) => enter_handler(c, frame),
+                None => guest_crash(rec, c),
+            }
+        }
         _ => match fault_signal(rec, c).and_then(|(sig, code, addr)| signal::fault(c, sig, code, addr)) {
             Some(frame) => enter_handler(c, frame),
             None => guest_crash(rec, c),
