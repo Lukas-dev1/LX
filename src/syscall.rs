@@ -1323,6 +1323,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         157 if a[0] == 21 => crate::seccomp::mode(),       // PR_GET_SECCOMP
         157 if a[0] == 22 => crate::seccomp::set(a[1], a[2]), // PR_SET_SECCOMP
         157 => prctl(a[0], a[1], a[2]),
+        161 => fs::chroot(a[0]),
         // personality: PER_LINUX and whatever flags were set (0xffffffff only asks).
         135 => Ok(if a[0] as u32 == u32::MAX { PERSONA.load(Relaxed) } else { PERSONA.swap(a[0] as u32 as u64, Relaxed) } as i64),
         317 => crate::seccomp::seccomp(a[0], a[1], a[2]),
