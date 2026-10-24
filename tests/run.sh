@@ -62,6 +62,7 @@ cc_static 2 rootfs/setxid guest/setxid.c
 cc_static 2 rootfs/sitkill guest/sitkill.c
 cc_static 2 rootfs/pidreuse guest/pidreuse.c
 cc_static 2 rootfs/jobctl guest/jobctl.c
+cc_static 2 rootfs/sigsender guest/sigsender.c
 cc_static 1 rootfs/spinsig guest/spinsig.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
 cc_static 2 rootfs/waitidtest guest/waitidtest.c
@@ -119,6 +120,7 @@ expect "setegid with threads blocked in a wait, a sleep and guest code: libc sig
 expect "a tgkill signal's siginfo: SI_TKILL with the sender's pid and uid (glibc's setuid needs it)" 0 "sitkill tkill=1 pid=1 uid=1" -- rootfs /sitkill
 expect "fork never hands out the pid of a child reaped under a minute ago (it may still be a group id)" 0 "pidreuse reused=0" -- rootfs /pidreuse
 expect "job control: SIGSTOP stops a spinning child (WUNTRACED), SIGCONT continues it (WCONTINUED), raise(SIGSTOP) is CLD_STOPPED" 0 "jobctl stopped=1 frozen=1 cont=1 moving=1 killed=1 self=1 after=1" -- rootfs /jobctl
+expect "a kill() signal carries its sender: SI_USER, si_pid, si_uid (from a child and from ourselves)" 0 "sigsender child=1 self=1" -- rootfs /sigsender
 expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
 expect "waitid: P_PID, WNOWAIT, CLD_KILLED, WNOHANG" 0 "peek=1 reap=1 killed=1 none=1" -- rootfs /waitidtest
