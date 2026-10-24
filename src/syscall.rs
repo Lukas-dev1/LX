@@ -985,6 +985,9 @@ fn fault_signal(rec: &ExceptionRecord, c: &Context) -> Option<(u64, u64, u64)> {
 fn lost_fs_base(c: &Context, fault_addr: u64, code_end: u64) -> bool {
     use iced_x86::{Decoder, DecoderOptions, Register as Reg};
     let len = (code_end - c.rip).min(15) as usize;
+    if !readable(c.rip, len) {
+        return false; // the fault is fetching the instruction itself (a jump into a PROT_NONE page)
+    }
     let bytes = unsafe { std::slice::from_raw_parts(c.rip as *const u8, len) };
     let ins = Decoder::with_ip(64, bytes, c.rip, DecoderOptions::NONE).decode();
     if ins.memory_segment() != Reg::FS {
