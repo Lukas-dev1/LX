@@ -1109,8 +1109,12 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         131 => signal::sigaltstack(a[0], a[1], c.rsp),
         7 => fs::poll(a[0], a[1], a[2] as i32 as i64),
         23 => fs::select(a[0], a[1], a[2], a[3], timeval_ms(a[4])),   // ponytail: the timeout isn't updated
-        270 => fs::select(a[0], a[1], a[2], a[3], timespec_ms(a[4])), // pselect6: signal mask ignored
-        271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
+        // pselect6: the 6th argument is {sigset pointer, its size}
+        270 => (if a[5] != 0 { get_guest::<16>(a[5]) } else { Ok([0; 16]) }).and_then(|b| {
+            let [ss, size] = [0, 8].map(|i| u64::from_le_bytes(b[i..i + 8].try_into().unwrap()));
+            signal::with_mask(ss, size, || fs::select(a[0], a[1], a[2], a[3], timespec_ms(a[4])))
+        }),
+        271 => signal::with_mask(a[3], a[4], || fs::poll(a[0], a[1], timespec_ms(a[2]))), // ppoll
         34 => signal::sigsuspend(0),   // pause
         130 => signal::sigsuspend(a[0]),
         128 => signal::sigtimedwait(a[0], a[1], if a[2] == 0 { -1 } else { let [s, ns] = unsafe { *(a[2] as *const [u64; 2]) }; (s * 1000 + ns.div_ceil(1_000_000)) as i64 }),
@@ -1179,8 +1183,10 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         213 => net::sys_epoll_create(0),
         291 => net::sys_epoll_create(a[0]),
         233 => net::sys_epoll_ctl(a[0], a[1], a[2], a[3]),
-        232 | 281 => net::sys_epoll_wait(a[0], a[1], a[2], a[3] as i32 as i64), // pwait: mask ignored
-        441 => net::sys_epoll_wait(a[0], a[1], a[2], timespec_ms(a[3])),
+        232 => net::sys_epoll_wait(a[0], a[1], a[2], a[3] as i32 as i64),
+        281 => signal::with_mask(a[4], a[5], || net::sys_epoll_wait(a[0], a[1], a[2], a[3] as i32 as i64)), // epoll_pwait
+        441 if a[3] != 0 && !valid_timespec(a[3]) => Err(EINVAL),
+        441 => signal::with_mask(a[4], a[5], || net::sys_epoll_wait(a[0], a[1], a[2], timespec_ms(a[3]))), // epoll_pwait2
         20 => fs::writev(a[0], a[1], a[2]),
         22 => fs::pipe2(a[0], 0),
         21 => fs::faccessat(CWD, a[0], a[1]),
