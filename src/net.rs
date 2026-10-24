@@ -1381,6 +1381,13 @@ pub fn sys_setsockopt(fd: u64, level: u64, name: u64, val: u64, len: u64) -> R {
 
 pub fn sys_getsockopt(fd: u64, level: u64, name: u64, val: u64, lenp: u64) -> R {
     let s = fs::sock(fd)?;
+    // *lenp must be readable and >= 0, and that much of val writable.
+    let room = i32::from_le_bytes(crate::syscall::get_guest::<4>(lenp)?);
+    if room < 0 {
+        return Err(EINVAL);
+    }
+    crate::syscall::check_guest(lenp, 4, true)?;
+    crate::syscall::check_guest(val, (room as usize).min(256), true)?;
     let int = |v: i32| unsafe {
         *(val as *mut i32) = v;
         *(lenp as *mut u32) = 4;

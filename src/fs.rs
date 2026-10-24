@@ -1670,6 +1670,29 @@ pub fn ioctl(fd: u64, req: u64, arg: u64) -> R {
     const FIOCLEX: u64 = 0x5451;
     const FIOASYNC: u64 = 0x5452;
     let req = req as u32 as u64; // an int: musl's sign-extends requests with the top bit set (TIOCGPTN)
+    // What the common requests copy out (true) or in: a bad pointer is EFAULT, not a fault in lx.
+    let arg_len = match req {
+        0x5401 => Some((36, true)),                // TCGETS: struct termios
+        0x5402..=0x5404 => Some((36, false)),      // TCSETS, TCSETSW, TCSETSF
+        0x5405 => Some((18, true)),                // TCGETA: struct termio
+        0x5406..=0x5408 => Some((18, false)),      // TCSETA, TCSETAW, TCSETAF
+        0x5413 => Some((8, true)),                 // TIOCGWINSZ
+        0x5414 => Some((8, false)),                // TIOCSWINSZ
+        0x540F | 0x541B => Some((4, true)),        // TIOCGPGRP, FIONREAD
+        0x5410 | 0x5421 => Some((4, false)),       // TIOCSPGRP, FIONBIO
+        _ => None,
+    };
+    if let Some((n, write)) = arg_len {
+        // EBADF first, and ENOTTY for a tty request on something else (below), then the pointer.
+        let tty = match io_target(fd)? {
+            Io::Handle(h) => is_console(h),
+            Io::Pipe(p) => p.pty.is_some(),
+            _ => false,
+        };
+        if tty || matches!(req, FIONREAD | FIONBIO) {
+            crate::syscall::check_guest(arg, n, write)?;
+        }
+    }
     if req == FIOCLEX || req == FIONCLEX {
         return fcntl(fd, 2, (req == FIOCLEX) as u64); // F_SETFD
     }
@@ -1804,7 +1827,7 @@ fn tty_ioctl(h: isize, req: u64, arg: u64) -> R {
             Ok(0)
         }
         TIOCSCTTY | TIOCSPGRP | TIOCSWINSZ => Ok(0),
-        _ => Err(EINVAL),
+        _ => Err(crate::syscall::ENOTTY), // what Linux's tty layer says to a request it doesn't know
     }
 }
 

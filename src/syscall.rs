@@ -1180,7 +1180,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         97 => rlimit(a[0], 0, a[1]),   // getrlimit
         160 => rlimit(a[0], a[1], 0),  // setrlimit
         302 => rlimit(a[1], a[2], a[3]), // prlimit64 (self only)
-        98 => { unsafe { std::ptr::write_bytes(a[1] as *mut u8, 0, 144) }; Ok(0) } // getrusage: zeros
+        // getrusage(RUSAGE_SELF, _CHILDREN or _THREAD): zeros
+        98 => if ![0, -1, 1].contains(&(a[0] as i32)) { Err(EINVAL) } else { put_guest(a[1], &[0; 144]) },
         99 => sysinfo(a[0]),
         100 => times(a[0]),
         309 => getcpu(a[0], a[1]),
@@ -1221,6 +1222,11 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         21 => fs::faccessat(CWD, a[0], a[1]),
         28 => madvise(a[0], a[1], a[2]),
         149..=152 | 325 => Ok(0), // mlock, munlock, mlockall, munlockall, mlock2. ponytail: pages may still be paged out
+        // iopl / ioperm: port I/O needs CAP_SYS_RAWIO, which Docker doesn't give; bad arguments first.
+        172 => Err(if a[0] > 3 { EINVAL } else { EPERM }),
+        173 => Err(if a[0].saturating_add(a[1]) > 0x10000 { EINVAL } else { EPERM }),
+        140 | 141 if a[0] > 2 => Err(EINVAL), // PRIO_PROCESS, PRIO_PGRP, PRIO_USER
+        140 | 141 if (a[1] as i32) < 0 => Err(ESRCH), // no such process, group or user
         140 => Ok(20), // getpriority: the raw call answers 20 - nice; everyone runs at nice 0 (rpm asks)
         141 => Ok(0),  // setpriority. ponytail: accepted, not applied
         32 => fs::dup(a[0], 0, false),
@@ -2315,14 +2321,27 @@ fn sched_getaffinity(pid: u64, len: u64, mask: u64) -> R {
 }
 
 /// setitimer(ITIMER_REAL, {interval, value} as timevals, old).
+/// ITIMER_VIRTUAL and ITIMER_PROF as set ({interval, value} timevals), for getitimer and the old value.
+/// ponytail: CPU-time timers never fire (no SIGVTALRM/SIGPROF), so a profiler that sets them gets no samples.
+static CPU_TIMERS: Mutex<[[u64; 4]; 2]> = Mutex::new([[0; 4]; 2]);
+
 fn setitimer(which: u64, new: u64, old: u64) -> R {
-    if which != 0 {
-        return Err(EINVAL); // ITIMER_VIRTUAL / ITIMER_PROF
+    if which > 2 {
+        return Err(EINVAL);
     }
-    let [is, ius, vs, vus] = if new != 0 { unsafe { *(new as *const [u64; 4]) } } else { [0; 4] }; // NULL disarms
-    let (left, iv) = signal::set_alarm(vs * 1000 + vus.div_ceil(1000), is * 1000 + ius.div_ceil(1000));
+    let v = if new != 0 { get_guest::<32>(new)? } else { [0; 32] }; // NULL disarms
+    let [is, ius, vs, vus] = std::array::from_fn(|i| u64::from_le_bytes(v[i * 8..i * 8 + 8].try_into().unwrap()));
+    if [is, vs].iter().any(|&s| (s as i64) < 0) || [ius, vus].iter().any(|&us| us >= 1_000_000) {
+        return Err(EINVAL);
+    }
+    let was = if which == 0 {
+        let (left, iv) = signal::set_alarm(vs * 1000 + vus.div_ceil(1000), is * 1000 + ius.div_ceil(1000));
+        [iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000]
+    } else {
+        std::mem::replace(&mut CPU_TIMERS.lock().unwrap()[which as usize - 1], [is, ius, vs, vus])
+    };
     if old != 0 {
-        unsafe { *(old as *mut [u64; 4]) = [iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000] };
+        put_guest(old, &as_bytes(&was))?;
     }
     Ok(0)
 }
@@ -2330,7 +2349,7 @@ fn setitimer(which: u64, new: u64, old: u64) -> R {
 fn getitimer(which: u64, cur: u64) -> R {
     let (left, iv) = match which {
         0 => signal::alarm_left(),
-        1 | 2 => (0, 0), // ITIMER_VIRTUAL / ITIMER_PROF: never armed here
+        1 | 2 => return put_guest(cur, &as_bytes(&CPU_TIMERS.lock().unwrap()[which as usize - 1])),
         _ => return Err(EINVAL),
     };
     put_guest(cur, &as_bytes(&[iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000]))
