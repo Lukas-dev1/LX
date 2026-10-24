@@ -628,6 +628,12 @@ fn v6only(s: usize) -> bool {
 /// its other connections to 127.0.0.1 or ::1 to its own loopback address, and host.docker.internal to
 /// the host's 127.0.0.1.
 fn dest_addr(s: usize, a: &mut [u8]) {
+    // The wildcard address as a destination is this host on Linux; Winsock refuses it (WSAEADDRNOTAVAIL).
+    match u16::from_le_bytes([a[0], a[1]]) {
+        AF_INET if a.len() >= 8 && a[4..8] == [0; 4] => a[4..8].copy_from_slice(&[127, 0, 0, 1]),
+        AF_INET6_WIN if a.len() >= 24 && a[8..24] == [0; 16] => a[23] = 1,
+        _ => {}
+    }
     let Some(ports) = published() else { return };
     if a.len() < 8 || !is_loopback(a) {
         return;
