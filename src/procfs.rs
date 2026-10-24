@@ -41,6 +41,7 @@ Pss: {:>16} kB
         "/proc/cmdline" => "BOOT_IMAGE=/boot/vmlinuz-6.6.0-lx root=/dev/sda1 ro quiet\n".into(),
         "/proc/sys/kernel/tainted" => "0\n".into(), // nothing has tainted this kernel
         "/proc/sys/fs/pipe-max-size" => "1048576\n".into(),
+        "/proc/sys/kernel/core_pattern" => "core\n".into(), // see proc::dumps_core
         "/proc/sys/kernel/osrelease" => "6.6.0-lx\n".into(),
         "/proc/sys/kernel/pid_max" => "4194304\n".into(),
         "/proc/sys/kernel/ngroups_max" => "65536\n".into(), // NGROUPS_MAX: setgroups' limit
