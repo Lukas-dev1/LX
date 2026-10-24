@@ -997,6 +997,9 @@ fn fault_signal(rec: &ExceptionRecord, c: &Context) -> Option<(u64, u64, u64)> {
 fn lost_fs_base(c: &Context, fault_addr: u64, code_end: u64) -> bool {
     use iced_x86::{Decoder, DecoderOptions, Register as Reg};
     let len = (code_end - c.rip).min(15) as usize;
+    if !readable(c.rip, len) {
+        return false; // the fault is fetching the instruction itself (a jump into a PROT_NONE page)
+    }
     let bytes = unsafe { std::slice::from_raw_parts(c.rip as *const u8, len) };
     let ins = Decoder::with_ip(64, bytes, c.rip, DecoderOptions::NONE).decode();
     if ins.memory_segment() != Reg::FS {
@@ -1750,9 +1753,12 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
     let delta = off % 0x10000;
     let aoff = off - delta;
     let mut vlen = delta + len;
-    let mut sprot = PAGE_READWRITE;
+    // Views are mapped with all the access the section allows, and the pages then set to `prot`: a view
+    // is never re-mapped, so a later mprotect can only reach what it was mapped with (CoreCLR maps its
+    // double-mapped code PROT_NONE, then mprotects it executable).
+    let mut sprot = 0x40; // PAGE_EXECUTE_READWRITE
     let section = match file {
-        None => unsafe { CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null()) },
+        None => unsafe { CreateFileMappingW(-1, std::ptr::null_mut(), sprot, (len >> 32) as u32, len as u32, std::ptr::null()) },
         Some(fd) => {
             let (h, size) = fs::file_handle(fd)?;
             if size <= aoff {
@@ -1760,14 +1766,28 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
             }
             // NT views can't reach past the file's end (it maps the last partial page whole anyway).
             vlen = vlen.min(size - aoff);
-            let exec = prot & 4 != 0;
-            let rw = if exec { 0x40 } else { PAGE_READWRITE }; // PAGE_EXECUTE_READWRITE
-            sprot = rw;
-            let mut s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), rw, 0, 0, std::ptr::null()) };
-            if s == 0 && !write {
-                // A file opened read-only can still be mapped for reading.
-                sprot = if exec { 0x20 } else { 0x02 };
-                s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) };
+            // An executable section needs FILE_EXECUTE on the handle, which our opens never ask for (Linux
+            // only refuses PROT_EXEC on a noexec mount): map through a reopened handle that has it, with
+            // write access only if the fd has it (an O_RDONLY mapping must not become writable).
+            unsafe extern "system" {
+                fn ReOpenFile(h: isize, access: u32, share: u32, flags: u32) -> isize;
+            }
+            const GENERIC_EXECUTE: u32 = 0x2000_0000;
+            let writable = fs::handle_writable(h);
+            let x = unsafe { ReOpenFile(h, 0x8000_0000 | GENERIC_EXECUTE | if writable { 0x4000_0000 } else { 0 }, 7, 0) };
+            let src = if x != -1 { x } else { h };
+            // Most access first: RWX, RW, RX, R.
+            let tries: &[u32] = if writable { &[0x40, 0x04, 0x20, 0x02] } else { &[0x20, 0x02] };
+            let mut s = 0;
+            for &p in tries {
+                s = unsafe { CreateFileMappingW(src, std::ptr::null_mut(), p, 0, 0, std::ptr::null()) };
+                if s != 0 {
+                    sprot = p;
+                    break;
+                }
+            }
+            if x != -1 {
+                unsafe { CloseHandle(x) }; // the section keeps the file
             }
             if s == 0 {
                 return Err(EACCES);
@@ -1778,7 +1798,12 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
     if section == 0 {
         return Err(ENOMEM);
     }
-    let access = if write { FILE_MAP_WRITE } else { FILE_MAP_READ } | if prot & 4 != 0 { FILE_MAP_EXECUTE } else { 0 };
+    let (can_write, can_exec) = (matches!(sprot, 0x40 | 0x04), matches!(sprot, 0x40 | 0x20));
+    if write && !can_write || prot & 4 != 0 && !can_exec {
+        unsafe { CloseHandle(section) };
+        return Err(EACCES);
+    }
+    let access = if can_write { FILE_MAP_WRITE } else { FILE_MAP_READ } | if can_exec { FILE_MAP_EXECUTE } else { 0 };
     let full = (delta + len).next_multiple_of(PAGE);
     if let Some(fd) = file.filter(|_| !fixed && full > vlen.next_multiple_of(PAGE)) {
         return mmap_growable(section, sprot, access, fd, aoff, vlen, full, prot).map(|base| (base + delta) as i64);
@@ -1822,10 +1847,7 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
             }
         }
     };
-    if prot == 0 {
-        let mut old = 0;
-        unsafe { VirtualProtect(base as *mut _, vlen as usize, 0x01, &mut old) }; // PROT_NONE
-    }
+    protect(base, vlen.next_multiple_of(PAGE), page_prot(prot)); // the view came with all its access
     VIEWS.lock().unwrap().push(View { base, len: vlen, section, off: aoff, access, full: vlen, file: 0, prot: (0, 0) });
     Ok((base + delta) as i64)
 }
@@ -1858,13 +1880,15 @@ fn mmap_growable(section: isize, sprot: u32, access: u32, fd: u64, off: u64, vle
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
         return fail(ENOMEM);
     }
-    if prot == 0 {
-        let mut old = 0;
-        unsafe { VirtualProtect(base as *mut _, vlen as usize, 0x01, &mut old) }; // PROT_NONE
-    }
+    protect(base, vlen.next_multiple_of(PAGE), page_prot(prot)); // the view came with all its access
     let (h, _) = fs::file_handle(fd)?;
-    let mut file = 0isize;
-    unsafe { crate::win::DuplicateHandle(me, h, me, &mut file, 0, 0, 2) }; // DUPLICATE_SAME_ACCESS
+    // grow_view makes a new section like this one from it, so it needs the same access (execute too).
+    let w = if fs::handle_writable(h) { 0x4000_0000 } else { 0 };
+    let mut file = unsafe { crate::win::ReOpenFile(h, 0x8000_0000 | 0x2000_0000 | w, 7, 0) }; // GENERIC_READ | EXECUTE
+    if file == -1 {
+        file = 0;
+        unsafe { crate::win::DuplicateHandle(me, h, me, &mut file, 0, 0, 2) }; // DUPLICATE_SAME_ACCESS
+    }
     VIEWS.lock().unwrap().push(View { base, len: vlen, section, off, access, full, file, prot: (sprot, vprot) });
     Ok(base)
 }
@@ -1986,8 +2010,11 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> R {
     let len = len.next_multiple_of(PAGE);
     if prot & 4 != 0 {
         // Newly executable memory (JITs, ld.so): scan before it can run. Already-patched code rescans clean.
-        // RWX while patching, not RW: another thread may already be running code in this range.
-        protect(addr, len, 0x40);
+        // RWX while patching, not RW: another thread may already be running code in this range. Memory
+        // that can't be made so (a view of a section that may not execute) mustn't be read: EACCES.
+        if !protect(addr, len, 0x40) {
+            return Err(EACCES);
+        }
         patch_code(addr, len as usize);
     }
     mark_views(addr, len, prot & 2 != 0, prot & 4 != 0);
@@ -2851,7 +2878,16 @@ pub fn truncate_mapped(h: isize, size: u64, set: impl FnOnce() -> std::io::Resul
             (false, true) => 0x20,
             (false, false) => 0x02,
         };
-        let section = if len == 0 { 0 } else { unsafe { CreateFileMappingW(h, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) } };
+        // An executable view's section needs a handle that may execute (see mmap_shared).
+        let x = if access & FILE_MAP_EXECUTE != 0 {
+            unsafe { crate::win::ReOpenFile(h, 0x8000_0000 | 0x2000_0000 | if access & FILE_MAP_WRITE != 0 { 0x4000_0000 } else { 0 }, 7, 0) }
+        } else {
+            -1
+        };
+        let section = if len == 0 { 0 } else { unsafe { CreateFileMappingW(if x != -1 { x } else { h }, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) } };
+        if x != -1 {
+            unsafe { CloseHandle(x) }; // the section keeps the file
+        }
         let head = len.next_multiple_of(PAGE).min(full);
         if head > 0 {
             carve(base, head);
