@@ -1073,9 +1073,34 @@ fn dispatch(c: &mut Context) -> i64 {
     r
 }
 
+/// Fixed-size structs these syscalls copy in or out: (syscall, arg, bytes, written, may be NULL). A bad
+/// pointer is EFAULT up front, where the handlers would fault inside lx (LTP's EFAULT cases).
+/// ponytail: only these; other handlers still trust their pointers.
+const STRUCTS: &[(u64, usize, usize, bool, bool)] = &[
+    (13, 1, 32, false, true), (13, 2, 32, true, true), // rt_sigaction: act, oldact
+    (14, 1, 8, false, true), (14, 2, 8, true, true),   // rt_sigprocmask: set, oldset
+    (127, 0, 8, true, false),                          // rt_sigpending
+    (130, 0, 8, false, false),                         // rt_sigsuspend
+    (38, 1, 32, false, true), (38, 2, 32, true, true), // setitimer
+    (36, 1, 32, true, false),                          // getitimer
+    (99, 0, 112, true, false),                         // sysinfo
+    (4, 1, 144, true, false), (5, 1, 144, true, false), (6, 1, 144, true, false), (262, 2, 144, true, false), // stat, fstat, lstat, newfstatat
+    (137, 1, 120, true, false), (138, 1, 120, true, false), // statfs, fstatfs
+    (63, 0, 390, true, false),                         // uname
+    (22, 0, 8, true, false), (293, 0, 8, true, false), // pipe, pipe2
+    (125, 0, 8, true, false), (125, 1, 24, true, true), // capget
+    (46, 1, 56, false, false), (47, 1, 56, true, false), // sendmsg, recvmsg
+    (51, 2, 4, true, false), (52, 2, 4, true, false),  // getsockname, getpeername: addrlen
+];
+
+fn bad_struct(n: u64, a: &[u64; 6]) -> bool {
+    STRUCTS.iter().any(|&(nr, i, len, write, null)| nr == n && !(null && a[i] == 0) && check_guest(a[i], len, write).is_err())
+}
+
 fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
     use fs::{AT_FDCWD as CWD, AT_SYMLINK_NOFOLLOW};
     let r = match c.rax {
+        n if bad_struct(n, &a) => Err(EFAULT),
         0 => fs::read(a[0], a[1], a[2]),
         1 => fs::write(a[0], a[1], a[2]),
         2 => fs::openat(CWD, a[0], a[1], a[2]),
@@ -1104,6 +1129,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         26 => msync(a[0], a[1], a[2]),
         27 => mincore(a[0], a[1], a[2]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
+        13 | 14 if a[3] != 8 => Err(EINVAL), // rt_sigaction, rt_sigprocmask: sigsetsize must be the kernel's
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
         127 => signal::sigpending(a[0], a[1]),
@@ -1373,7 +1399,6 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
     let end = addr.checked_add(bytes.len() as u64).ok_or(EFAULT)?;
     // The hot callers (clock_gettime, gettimeofday: lx has no vDSO) write the same page again and again:
     // once checked, it stays writable until the map changes (MAP_GEN), so skip the VirtualQuery.
-    thread_local!(static CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) });
     let page = addr & !(PAGE - 1);
     let same_page = end > addr && (end - 1) & !(PAGE - 1) == page;
     let epoch = MAP_GEN.load(Relaxed);
@@ -1396,6 +1421,8 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
     Ok(0)
 }
+
+thread_local!(static CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) });
 
 /// Bumped by every syscall that changes the address space (see dispatch): put_guest's page cache.
 static MAP_GEN: AtomicU64 = AtomicU64::new(0);
@@ -1426,6 +1453,12 @@ fn readable_end(addr: u64) -> Option<u64> {
 /// work on a guest buffer in place.
 pub fn check_guest(addr: u64, n: usize, write: bool) -> Result<(), i64> {
     let Some(end) = addr.checked_add(n as u64) else { return Err(EFAULT) };
+    // A page put_guest found writable (sigprocmask's oldset is the same stack page call after call).
+    let (page, epoch) = (addr & !(PAGE - 1), MAP_GEN.load(Relaxed));
+    let same_page = end > addr && (end - 1) & !(PAGE - 1) == page;
+    if same_page && CHECKED.get() == (page, epoch) {
+        return Ok(());
+    }
     let mut p = addr;
     while p < end {
         let mut m = MemoryBasicInformation::default();
@@ -1434,6 +1467,9 @@ pub fn check_guest(addr: u64, n: usize, write: bool) -> Result<(), i64> {
             return Err(EFAULT);
         }
         p = (m.base + m.region_size) as u64;
+    }
+    if write && same_page {
+        CHECKED.set((page, epoch));
     }
     Ok(())
 }
@@ -1996,13 +2032,26 @@ fn prctl(option: u64, arg2: u64) -> R {
 fn capget(header: u64, data: u64) -> R {
     const V3: u32 = 0x2008_0522;
     const DOCKER: u32 = DOCKER_CAPS;
-    if header == 0 {
-        return Err(EFAULT);
+    const V1: u32 = 0x1998_0330;
+    const V2: u32 = 0x2007_1026;
+    // header (checked in dispatch): {version, pid}. An unknown version gets V3 written back and EINVAL
+    // (none at all, without data: the probe libcap does).
+    let [version, pid] = unsafe { *(header as *const [i32; 2]) }.map(|x| x as u32);
+    if ![V1, V2, V3].contains(&version) {
+        unsafe { *(header as *mut u32) = V3 };
+        return if data == 0 { Ok(0) } else { Err(EINVAL) };
     }
-    unsafe { *(header as *mut u32) = V3 };
+    if (pid as i32) < 0 {
+        return Err(EINVAL);
+    }
+    if pid != 0 {
+        crate::proc::kill(pid as i64, 0)?; // ESRCH for a process that isn't there
+    }
     if data != 0 {
         let caps = if crate::proc::UID.load(Relaxed) == 0 { DOCKER } else { 0 };
-        unsafe { *(data as *mut [u32; 6]) = [caps, caps, 0, 0, 0, 0] }; // effective, permitted, inheritable x2
+        // effective, permitted, inheritable: one set for V1, two (64 capabilities) after
+        let n = if version == V1 { 3 } else { 6 };
+        put_guest(data, &[caps, caps, 0, 0, 0, 0][..n].iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>())?;
     }
     Ok(0)
 }

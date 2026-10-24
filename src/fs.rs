@@ -216,27 +216,35 @@ fn timer_of(e: &Arc<EventFd>) -> (u64, Option<std::time::Instant>, std::time::Du
     TIMERS.lock().unwrap().iter().find(|t| t.0 == key).map_or((0, None, Default::default()), |t| (t.1, t.2, t.3))
 }
 
-fn put_itimerspec(p: u64, next: Option<std::time::Instant>, interval: std::time::Duration) {
+fn put_itimerspec(p: u64, next: Option<std::time::Instant>, interval: std::time::Duration) -> R {
     if p == 0 {
-        return;
+        return Ok(0);
     }
     let left = next.map_or(Default::default(), |n| n.saturating_duration_since(std::time::Instant::now()));
-    unsafe { *(p as *mut [u64; 4]) = [interval.as_secs(), interval.subsec_nanos() as u64, left.as_secs(), left.subsec_nanos() as u64] };
+    crate::syscall::put_guest(p, &crate::syscall::as_bytes(&[interval.as_secs(), interval.subsec_nanos() as u64, left.as_secs(), left.subsec_nanos() as u64]))
 }
 
 pub fn timerfd_gettime(fd: u64, cur: u64) -> R {
     let (_, next, interval) = timer_of(&event_of(fd)?);
-    put_itimerspec(cur, next, interval);
-    Ok(0)
+    if cur == 0 {
+        return Err(crate::syscall::EFAULT);
+    }
+    put_itimerspec(cur, next, interval)
 }
 
 /// timerfd_settime(fd, flags, new, old): arm (or with a zero value disarm) the timer.
 pub fn timerfd_settime(fd: u64, flags: u64, new: u64, old: u64) -> R {
     const TFD_TIMER_ABSTIME: u64 = 1;
+    const TFD_TIMER_CANCEL_ON_SET: u64 = 2;
+    // As Linux checks: the new value (EFAULT), flags and nanoseconds (EINVAL), then the fd.
+    let v = crate::syscall::get_guest::<32>(new)?;
+    let [is, ins, vs, vns] = std::array::from_fn(|i| u64::from_le_bytes(v[i * 8..i * 8 + 8].try_into().unwrap()));
+    if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 || ins >= 1_000_000_000 || vns >= 1_000_000_000 {
+        return Err(EINVAL);
+    }
     let e = event_of(fd)?;
     let (epoch, next, interval) = timer_of(&e);
-    put_itimerspec(old, next, interval);
-    let [is, ins, vs, vns] = unsafe { *(new as *const [u64; 4]) };
+    put_itimerspec(old, next, interval)?;
     let interval = std::time::Duration::new(is, ins as u32);
     let mut value = std::time::Duration::new(vs, vns as u32);
     let armed = !value.is_zero();
