@@ -2208,7 +2208,8 @@ pub fn sendfile(out: u64, inp: u64, off: u64, count: u64) -> R {
             }
             break;
         }
-        if crate::signal::deliverable() {
+        // A pipe or socket gives what it has; reading on would wait for more (Linux returns instead).
+        if !seekable || crate::signal::deliverable() {
             break;
         }
     }
