@@ -2286,6 +2286,9 @@ fn scratch_file(fs: &Fs, bytes: &[u8]) -> io::Result<(File, PathBuf)> {
 }
 
 pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
+    const O_PATH: u64 = 0o10000000;
+    // O_PATH ignores everything but these: no creating, truncating or access mode.
+    let flags = if flags & O_PATH != 0 { flags & (O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW) } else { flags };
     let cloexec = flags & O_CLOEXEC != 0;
     let (guest, host, meta) = with(|fs| fs.at_attrs(dirfd, path, flags & O_NOFOLLOW == 0))?;
     if let Some(n) = fd_alias(&guest) {
@@ -2326,7 +2329,6 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
         }
         // An existing entry opens only as its mode allows the caller (O_TRUNC needs write too); O_PATH
         // only names it and needs nothing (fchdir, AT_EMPTY_PATH, a dirfd: Go's os.Root, find -execdir).
-        const O_PATH: u64 = 0o10000000;
         if let Some(m) = &meta && flags & O_PATH == 0 && fs.keeps_meta(&comps_of(&guest)) {
             let want = match flags & 3 { 0 => 4, 1 => 2, _ => 6 } | if flags & O_TRUNC != 0 { 2 } else { 0 };
             if !may_access(&host, m, want) {
@@ -2353,7 +2355,13 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
                 // access, so create it first, then open it read-only below.
                 OpenOptions::new().write(true).create(true).create_new(excl).open(&host).map_err(errno)?;
             }
-            let f = OpenOptions::new()
+            let mut o = OpenOptions::new();
+            if flags & O_PATH != 0 {
+                // Only attributes (fstat), so read and write fail with EBADF as on Linux.
+                use std::os::windows::fs::OpenOptionsExt;
+                o.access_mode(0x80 | 0x8 | 0x10_0000); // FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE
+            }
+            let f = o
                 .read(acc != 1)
                 .write(acc != 0)
                 .append(flags & O_APPEND != 0)
