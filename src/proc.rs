@@ -356,7 +356,13 @@ pub fn wait4(pid: i64, status: u64, options: u64) -> R {
 
 /// The wait status for an lx exit code: WIFSIGNALED with the signal, or WIFEXITED with WEXITSTATUS = code.
 fn wait_status(code: u32) -> u32 {
-    if code & 0xFFFF_0000 == SIGNALED { code & 0x7f } else { (code & 0xff) << 8 }
+    if code & 0xFFFF_0000 == SIGNALED { code & 0x7f | if dumps_core(code & 0x7f) { 0x80 } else { 0 } } else { (code & 0xff) << 8 }
+}
+
+/// Signals whose default action dumps core: WCOREDUMP is set for them, as in a container whose core
+/// limit (unlimited here, see rlimit) lets the kernel dump. ponytail: no core file is written.
+fn dumps_core(sig: u32) -> bool {
+    matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) // QUIT ILL TRAP ABRT BUS FPE SEGV XCPU XFSZ SYS
 }
 
 /// Which children a wait is for.
@@ -395,7 +401,7 @@ pub fn waitid(idtype: u64, id: u64, info: u64, options: u64) -> R {
             let killed = code & 0xFFFF_0000 == SIGNALED;
             let put = |si: &mut [u8; 128], off: usize, v: i32| si[off..off + 4].copy_from_slice(&v.to_le_bytes());
             put(&mut si, 0, signal::SIGCHLD as i32);
-            put(&mut si, 8, if killed { 2 } else { 1 }); // CLD_KILLED, CLD_EXITED
+            put(&mut si, 8, if !killed { 1 } else if dumps_core(code & 0x7f) { 3 } else { 2 }); // CLD_EXITED, _DUMPED, _KILLED
             put(&mut si, 16, guest_pid(pid) as i32);
             put(&mut si, 20, UID.load(Relaxed) as i32);
             put(&mut si, 24, if killed { (code & 0x7f) as i32 } else { (code & 0xff) as i32 });
