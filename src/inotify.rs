@@ -3,7 +3,8 @@
 //! pipe. read, poll, epoll and fork work as on any pipe.
 //! ponytail: changes the image had all along aren't events (only the container's own, in its writable
 //! layer or a volume); IN_ACCESS/IN_OPEN/IN_CLOSE_NOWRITE never come; IN_CLOSE_WRITE comes with every
-//! IN_MODIFY (NT doesn't tell writes from closes); the watching threads live in the process that added
+//! IN_MODIFY (NT doesn't tell writes from closes); a change to only the metadata (chmod, chown, utime)
+//! is IN_ATTRIB, told apart by the change's times; the watching threads live in the process that added
 //! them.
 
 use crate::fs::{self, WHITEOUT};
@@ -121,12 +122,19 @@ struct Ov {
 }
 
 /// Issue the next (overlapped) wait for changes; its result lands in `buf`.
+/// With extended information (FILE_NOTIFY_EXTENDED_INFORMATION records): each change's times tell a
+/// write from a metadata change (see watch).
 fn arm(h: isize, buf: &mut [u32], ov: &mut Ov) -> bool {
-    // FILE_NOTIFY_CHANGE_FILE_NAME | DIR_NAME | ATTRIBUTES | SIZE | LAST_WRITE
-    const FILTER: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10;
+    unsafe extern "system" {
+        fn ReadDirectoryChangesExW(h: isize, buf: *mut std::ffi::c_void, len: u32, subtree: i32, filter: u32, returned: *mut u32,
+            ov: *mut std::ffi::c_void, completion: *mut std::ffi::c_void, class: u32) -> i32;
+    }
+    // FILE_NOTIFY_CHANGE_FILE_NAME | DIR_NAME | ATTRIBUTES | SIZE | LAST_WRITE | EA (our modes and owners)
+    const FILTER: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x80;
+    const READ_DIRECTORY_NOTIFY_EXTENDED_INFORMATION: u32 = 2;
     unsafe {
-        crate::win::ReadDirectoryChangesW(h, buf.as_mut_ptr().cast(), (buf.len() * 4) as u32, 0, FILTER, std::ptr::null_mut(),
-            (ov as *mut Ov).cast(), std::ptr::null_mut()) != 0
+        ReadDirectoryChangesExW(h, buf.as_mut_ptr().cast(), (buf.len() * 4) as u32, 0, FILTER, std::ptr::null_mut(),
+            (ov as *mut Ov).cast(), std::ptr::null_mut(), READ_DIRECTORY_NOTIFY_EXTENDED_INFORMATION) != 0
     }
 }
 
@@ -144,10 +152,16 @@ fn watch(h: isize, mut buf: Vec<u32>, mut ov: Box<Ov>, wd: i32, mask: u32, only:
         let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, n as usize) };
         let mut at = 0usize;
         let mut out = Vec::new();
-        while at + 12 <= bytes.len() {
+        // FILE_NOTIFY_EXTENDED_INFORMATION: next, action, then times (creation, last write at 16, change at
+        // 24, access), sizes, attributes, ids, and the name's length at 80 and the name at 84.
+        while at + 84 <= bytes.len() {
             let word = |o: usize| u32::from_le_bytes(bytes[at + o..at + o + 4].try_into().unwrap());
-            let (next, action, len) = (word(0), word(4), word(8) as usize);
-            let wide: Vec<u16> = bytes[at + 12..at + 12 + len].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let time = |o: usize| i64::from_le_bytes(bytes[at + o..at + o + 8].try_into().unwrap());
+            let (next, action, len) = (word(0), word(4), word(80) as usize);
+            // A write sets the last-write and change times together; chmod, chown and utimensat only the
+            // change time (or set the write time to something else): IN_ATTRIB for those.
+            let written = (time(16) - time(24)).abs() < 10_000; // within 1 ms (100 ns units)
+            let wide: Vec<u16> = bytes[at + 84..at + 84 + len].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
             let name = fs::dec_name(&String::from_utf16_lossy(&wide));
             // A whiteout appearing is the image's entry being deleted; our other bookkeeping is no event.
             let (name, action) = match name.strip_prefix(WHITEOUT) {
@@ -159,7 +173,8 @@ fn watch(h: isize, mut buf: Vec<u32>, mut ov: Box<Ov>, wd: i32, mask: u32, only:
             let events: &[u32] = match action {
                 1 => &[IN_CREATE],                    // FILE_ACTION_ADDED
                 2 => &[IN_DELETE],                    // REMOVED
-                3 => &[IN_MODIFY, IN_CLOSE_WRITE],    // MODIFIED (size, time or attributes)
+                3 if written => &[IN_MODIFY, IN_CLOSE_WRITE], // MODIFIED by a write
+                3 => &[IN_ATTRIB],                    // or only its metadata
                 4 => { moving = COOKIE.fetch_add(1, Relaxed); &[IN_MOVED_FROM] } // RENAMED_OLD_NAME
                 5 => &[IN_MOVED_TO],                  // RENAMED_NEW_NAME
                 _ => &[],
@@ -170,9 +185,6 @@ fn watch(h: isize, mut buf: Vec<u32>, mut ov: Box<Ov>, wd: i32, mask: u32, only:
                 // A watched file's own events carry no name; a directory's name its entry.
                 let shown = if only.is_some() { "" } else { name.as_str() };
                 out.extend(record(wd, e | if isdir { IN_ISDIR } else { 0 }, cookie, shown));
-            }
-            if action == 3 && mask & IN_ATTRIB != 0 && ours && !name.is_empty() {
-                out.extend(record(wd, IN_ATTRIB, 0, if only.is_some() { "" } else { name.as_str() }));
             }
             if next == 0 {
                 break;

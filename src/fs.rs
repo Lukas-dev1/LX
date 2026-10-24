@@ -3499,7 +3499,33 @@ fn chmeta(fs: &Fs, c: &[String], host: &Path, mode: Option<u64>, owner: Option<(
         }
     }
     set_meta(&up, m).map_err(errno)?;
+    touch_ctime(&up);
     Ok(0)
+}
+
+/// chmod and chown change ctime, as on Linux. NT doesn't for an EA write, and doesn't tell directory
+/// watchers about one either; setting the change time (and the write time to what it was, which is what
+/// watchers hear of) does both, and inotify reads the pair as IN_ATTRIB.
+fn touch_ctime(host: &Path) {
+    unsafe extern "system" {
+        fn GetSystemTimeAsFileTime(t: *mut i64);
+        fn GetFileInformationByHandleEx(h: isize, class: u32, info: *mut u8, len: u32) -> i32;
+        fn SetFileInformationByHandle(h: isize, class: u32, info: *const u8, len: u32) -> i32;
+    }
+    let Some(f) = ea_handle(host, 0x80 | 0x100) else { return }; // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+    // FILE_BASIC_INFO { creation, last access, last write, change: i64; attributes: u32 }; 0 leaves one as it is.
+    let mut info = [0u8; 40];
+    let h = f.as_raw_handle() as isize;
+    if unsafe { GetFileInformationByHandleEx(h, 0, info.as_mut_ptr(), 40) } == 0 { // FileBasicInfo
+        return;
+    }
+    let mut now = 0i64;
+    unsafe { GetSystemTimeAsFileTime(&mut now) };
+    info[..8].fill(0);
+    info[8..16].fill(0);
+    info[24..32].copy_from_slice(&now.to_le_bytes());
+    info[32..36].fill(0);
+    unsafe { SetFileInformationByHandle(h, 0, info.as_ptr(), 40) };
 }
 
 /// chmod, fchmodat, chown, lchown, fchownat.
