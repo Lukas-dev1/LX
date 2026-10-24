@@ -342,13 +342,16 @@ pub struct Pipe {
     /// Linux signals an edge on each arrival; we only see states, and a reader that drained it to EAGAIN
     /// while more came in before our next look would wait forever (cgo under go build: 6903 bytes unread).
     pub rearm: AtomicU32,
+    /// A non-blocking write found no room: POLLOUT waits for room again (see write_room for why a bare
+    /// zero quota doesn't mean full).
+    full: std::sync::atomic::AtomicBool,
 }
 
 impl Pipe {
     /// A pipe end from another lx process, `extra` as `extra()` made it.
     fn inherited(h: usize, extra: &str) -> Pipe {
         let pty = extra.get(2..).and_then(|n| n.parse().ok()).map(|n| (n, extra.as_bytes()[1] == b'm'));
-        Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: extra.starts_with('1').into(), pty, rearm: AtomicU32::new(0) }
+        Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: extra.starts_with('1').into(), pty, rearm: AtomicU32::new(0), full: false.into() }
     }
 
     fn extra(&self) -> String {
@@ -375,7 +378,8 @@ impl Pipe {
     }
 
     /// Free room in what this end writes into (FilePipeLocalInformation's WriteQuotaAvailable), if NT
-    /// says: a non-blocking write mustn't wait for the reader.
+    /// says. A pending read counts against it too: a reader blocked in read(>= the quota) shows 0 room in
+    /// an empty pipe, so 0 alone doesn't mean full (pipes get 1 MiB quotas to keep that rare).
     fn write_room(&self) -> Option<u32> {
         unsafe extern "system" {
             fn NtQueryInformationFile(h: isize, iosb: *mut [usize; 2], info: *mut u32, len: u32, class: u32) -> i32;
@@ -391,16 +395,7 @@ impl Pipe {
         const ERROR_IO_PENDING: u32 = 997;
         const ERROR_BROKEN_PIPE: u32 = 109;
         const ERROR_NO_DATA: u32 = 232;
-        let mut len = len.min(u32::MAX as u64) as u32;
-        // Non-blocking, a write takes what fits, all or nothing up to PIPE_BUF, as on Linux, rather than
-        // waiting for the reader (Go's netpoller writes its pipes so and then waits for POLLOUT).
-        if write && self.nonblocking() && let Some(room) = self.write_room() {
-            if room == 0 || (len <= 4096 && room < len) {
-                self.rearm.fetch_or(4, Relaxed); // POLLOUT: an edge-triggered waiter hears when there's room
-                return Err(crate::syscall::EAGAIN);
-            }
-            len = len.min(room); // ponytail: another writer may fill it before WriteFile, which then waits briefly
-        }
+        let len = len.min(u32::MAX as u64) as u32;
         if !write && self.nonblocking() {
             match self.available() {
                 Some(0) => return Err(crate::syscall::EAGAIN),
@@ -416,6 +411,22 @@ impl Pipe {
             if write { WriteFile(self.raw(), buf as *const u8, len, &mut done, op) } else { ReadFile(self.raw(), buf as *mut u8, len, &mut done, op) }
         };
         let mut err = if ok != 0 { 0 } else { unsafe { GetLastError() } };
+        // Non-blocking, a write takes what fits rather than waiting for the reader (Go's netpoller writes
+        // its pipes so, then waits for POLLOUT): one that would wait is cancelled, EAGAIN if nothing went.
+        // ponytail: a write up to PIPE_BUF may go in part (Linux: all or nothing).
+        if err == ERROR_IO_PENDING && write && self.nonblocking() {
+            unsafe { CancelIoEx(self.raw(), op) };
+            err = if unsafe { GetOverlappedResult(self.raw(), op, &mut done, 1) } != 0 { 0 } else { unsafe { GetLastError() } };
+            if done == 0 && err == 995 {
+                unsafe { CloseHandle(ev) };
+                self.full.store(true, Relaxed);
+                self.rearm.fetch_or(4, Relaxed); // POLLOUT: an edge-triggered waiter hears when there's room
+                return Err(crate::syscall::EAGAIN);
+            }
+        }
+        if write {
+            self.full.store(false, Relaxed);
+        }
         if err == ERROR_IO_PENDING {
             let intr = crate::signal::intr_event();
             let waits = if intr != 0 { vec![ev, intr] } else { vec![ev] };
@@ -454,7 +465,11 @@ impl Pipe {
         match self.available() {
             // A write end has no read access, so PeekNamedPipe is denied there: writable if there's room.
             None => match unsafe { crate::win::GetLastError() } {
-                5 => if self.write_room() == Some(0) { 0 } else { events & POLLOUT },
+                5 => match self.write_room() {
+                    Some(0) if self.full.load(Relaxed) => 0,
+                    Some(1..) => { self.full.store(false, Relaxed); events & POLLOUT }
+                    _ => events & POLLOUT,
+                },
                 230 | 536 => 0, // ERROR_BAD_PIPE, ERROR_PIPE_LISTENING: a FIFO reader whose writer hasn't come yet
                 _ => POLLHUP | (events & POLLIN),
             },
@@ -1356,7 +1371,7 @@ pub fn pipe2(fds: u64, flags: u64) -> R {
     let name: Vec<u16> = format!("\\\\.\\pipe\\lx-{}-{n}", unsafe { GetCurrentProcessId() }).encode_utf16().chain([0]).collect();
     let r = unsafe {
         CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            0, 1, 65536, 65536, 0, std::ptr::null_mut()) // PIPE_TYPE_BYTE | PIPE_WAIT, one instance
+            0, 1, 65536, 1 << 20, 0, std::ptr::null_mut()) // PIPE_TYPE_BYTE | PIPE_WAIT, one instance; see write_room
     };
     if r == -1 {
         return Err(EIO);
@@ -1367,7 +1382,7 @@ pub fn pipe2(fds: u64, flags: u64) -> R {
         return Err(EIO);
     }
     let nonblock = flags & O_NONBLOCK != 0;
-    let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0) }));
+    let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0), full: false.into() }));
     let cloexec = flags & O_CLOEXEC != 0;
     let (a, b) = with(|fs| (fs.add(own(r), 0, cloexec), fs.add(own(w), 0, cloexec)));
     unsafe { *(fds as *mut [i32; 2]) = [a as i32, b as i32] };
@@ -1391,7 +1406,7 @@ pub fn internal_pipe(flags: u64) -> Result<(i64, OwnedHandle), i64> {
         unsafe { CloseHandle(r) };
         return Err(EIO);
     }
-    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0) };
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0), full: false.into() };
     Ok((add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0), unsafe { OwnedHandle::from_raw_handle(w as _) }))
 }
 
@@ -1746,7 +1761,7 @@ fn pty_stat(pty: Option<(u32, bool)>) -> [u64; 18] {
 }
 
 fn add_pty(h: isize, n: u32, master: bool, flags: u64) -> R {
-    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: Some((n, master)), rearm: AtomicU32::new(0) };
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: Some((n, master)), rearm: AtomicU32::new(0), full: false.into() };
     Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
 }
 
@@ -1835,7 +1850,7 @@ fn open_fifo(id: u64, flags: u64) -> R {
     } else {
         return fifo_reader(name, flags);
     };
-    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0) };
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0), full: false.into() };
     Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
 }
 
@@ -1905,7 +1920,7 @@ fn fifo_reader(name: Vec<u16>, flags: u64) -> R {
     };
     // Inbound, overlapped, byte mode, unlimited instances: the broker waits for one writer at a time. The
     // first one listens before open returns (s6-supervise opens its control FIFO for writing right after).
-    let listen = move || unsafe { CreateNamedPipeW(name.as_ptr(), 0x1 | 0x4000_0000, 0, 255, 65536, 65536, 0, std::ptr::null_mut()) };
+    let listen = move || unsafe { CreateNamedPipeW(name.as_ptr(), 0x1 | 0x4000_0000, 0, 255, 65536, 1 << 20, 0, std::ptr::null_mut()) };
     let mut next = listen();
     std::thread::spawn(move || loop {
         let inst = std::mem::replace(&mut next, -1);
@@ -1944,7 +1959,7 @@ fn fifo_reader(name: Vec<u16>, flags: u64) -> R {
             }
         });
     });
-    let fd = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0) };
+    let fd = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0), full: false.into() };
     if flags & 3 == 0 && flags & O_NONBLOCK == 0 {
         // Linux's open waits for a writer.
         while first.recv_timeout(std::time::Duration::from_millis(5)).is_err() {
