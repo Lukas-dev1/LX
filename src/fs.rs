@@ -279,8 +279,13 @@ pub fn timerfd_settime(fd: u64, flags: u64, new: u64, old: u64) -> R {
 /// memfd_create(name, flags): an anonymous file, here a scratch file Windows deletes with its last handle,
 /// so it reads, writes, truncates and maps (MAP_SHARED included) like any file. PHP and Chromium use it.
 /// ponytail: sealing (MFD_ALLOW_SEALING, F_ADD_SEALS) is accepted and not enforced.
-pub fn memfd_create(_name: u64, flags: u64) -> R {
+pub fn memfd_create(name: u64, flags: u64) -> R {
     const MFD_CLOEXEC: u64 = 1;
+    // MFD_CLOEXEC, ALLOW_SEALING, HUGETLB (with its size bits), NOEXEC_SEAL, EXEC; a name up to 249 bytes.
+    if flags & !(0x1f | 0x3f << 26) != 0 || flags & 0x18 == 0x18 || flags & 0x3f << 26 != 0 && flags & 4 == 0
+        || crate::syscall::cstr(name)?.len() > 249 { // also: not both EXEC and NOEXEC_SEAL; huge page sizes only with HUGETLB
+        return Err(EINVAL);
+    }
     with(|fs| {
         let (f, host) = scratch_file(fs, b"").map_err(errno)?;
         fs.add(Fd::File { f, host }, 0, flags & MFD_CLOEXEC != 0)
