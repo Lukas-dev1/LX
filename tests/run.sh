@@ -56,6 +56,7 @@ cc_static 2 rootfs/ptimer guest/ptimer.c
 cc_static 2 rootfs/sysvipc guest/sysvipc.c
 cc_static 2 rootfs/epollet guest/epollet.c
 cc_static 2 rootfs/pipenb guest/pipenb.c
+cc_static 2 rootfs/pipewait guest/pipewait.c
 cc_static 1 rootfs/spinsig guest/spinsig.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
 cc_static 2 rootfs/waitidtest guest/waitidtest.c
@@ -107,6 +108,7 @@ expect "POSIX timers: a periodic timer_create timer keeps firing" 0 "ticks=3 arm
 expect "SysV semaphores and message queues across fork" 0 "sysv waiting=1 got=hello n=16 child=0 nowait=EAGAIN/ENOMSG nsems=2 perm=1 info=1 stat=1 key=1 gone=1" -- rootfs /sysvipc
 expect "edge-triggered epoll: data arriving after a drain to EAGAIN is a new edge (pipe, eventfd)" 0 "epollet pipe=1 eventfd=1" -- rootfs /epollet
 expect "non-blocking pipe writes: EAGAIN when full (PIPE_BUF all or nothing), POLLOUT only with room, and its edge re-arms" 0 "pipenb first=1 filled=1 eagain=1 full-pollout=0 small-eagain=1 room=1 edge=1" -- rootfs /pipenb
+expect "a reader blocked in a big read leaves a non-blocking writer room (NT counts it against the quota); FIFOs too" 0 "pipewait blocked-reader=1 drained=1 fifo=1" -- rootfs /pipewait
 expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
 expect "waitid: P_PID, WNOWAIT, CLD_KILLED, WNOHANG" 0 "peek=1 reap=1 killed=1 none=1" -- rootfs /waitidtest
@@ -183,6 +185,7 @@ expect "/proc/<pid>/stat: S for a process blocked in a syscall, R for one runnin
 expect "F_GETFL shows how a file was opened; FIONBIO makes a pipe non-blocking" 0 "rd=0 wr=1 rw=2 ap=1025 nb=True" -- run python:3.12-alpine python3 -c 'import os,fcntl; g=lambda fd: fcntl.fcntl(fd,fcntl.F_GETFL) & 0o3003; r,w=os.pipe(); os.set_blocking(r,False); print("rd=%d wr=%d rw=%d ap=%d nb=%s" % (g(os.open("/etc/hostname",0)), g(os.open("/tmp/a",os.O_WRONLY|os.O_CREAT)), g(os.open("/tmp/a",os.O_RDWR)), g(os.open("/tmp/a",os.O_WRONLY|os.O_APPEND)), not os.get_blocking(r)))'
 expect "F_GETLK names the holder of a conflicting lock (type, range, pid)" 0 "holder type=1 start=10 len=5 is_parent=True" -- run -v "$GUEST" python:3.12-alpine python3 /t/getlk.py
 expect "SIGPIPE on a write without a reader (default kills, Python gets EPIPE)" 0 "python EPIPE, default killed by 13" -- run -v "$GUEST" python:3.12-alpine python3 /t/sigpipe.py
+expect "O_PATH fds: no read/write, fstat and fchdir work" 0 "read EBADF, write EBADF, size 4, /tmp" -- run -v "$GUEST" python:3.12-alpine python3 /t/opath.py
 expect "RLIMIT_NOFILE: EMFILE at the soft limit, inherited by children" 0 "default 1024, open EMFILE at 50, pipe EMFILE, dup2 EBADF, raise hard refused, child (50, 4096)" -- run -v "$GUEST" python:3.12-alpine python3 /t/nofile.py
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
