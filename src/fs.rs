@@ -374,13 +374,33 @@ impl Pipe {
         (ok != 0).then_some(avail) // None: the other end is gone
     }
 
+    /// Free room in what this end writes into (FilePipeLocalInformation's WriteQuotaAvailable), if NT
+    /// says: a non-blocking write mustn't wait for the reader.
+    fn write_room(&self) -> Option<u32> {
+        unsafe extern "system" {
+            fn NtQueryInformationFile(h: isize, iosb: *mut [usize; 2], info: *mut u32, len: u32, class: u32) -> i32;
+        }
+        let (mut iosb, mut info) = ([0usize; 2], [0u32; 10]);
+        // FILE_PIPE_LOCAL_INFORMATION (class 24): ten ULONGs, WriteQuotaAvailable the eighth.
+        (unsafe { NtQueryInformationFile(self.raw(), &mut iosb, info.as_mut_ptr(), 40, 24) } == 0).then_some(info[7])
+    }
+
     /// One overlapped ReadFile/WriteFile, waited for (or EAGAIN when non-blocking and it would wait).
     fn io(&self, buf: u64, len: u64, write: bool) -> R {
         use crate::win::*;
         const ERROR_IO_PENDING: u32 = 997;
         const ERROR_BROKEN_PIPE: u32 = 109;
         const ERROR_NO_DATA: u32 = 232;
-        let len = len.min(u32::MAX as u64) as u32;
+        let mut len = len.min(u32::MAX as u64) as u32;
+        // Non-blocking, a write takes what fits, all or nothing up to PIPE_BUF, as on Linux, rather than
+        // waiting for the reader (Go's netpoller writes its pipes so and then waits for POLLOUT).
+        if write && self.nonblocking() && let Some(room) = self.write_room() {
+            if room == 0 || (len <= 4096 && room < len) {
+                self.rearm.fetch_or(4, Relaxed); // POLLOUT: an edge-triggered waiter hears when there's room
+                return Err(crate::syscall::EAGAIN);
+            }
+            len = len.min(room);
+        }
         if !write && self.nonblocking() {
             match self.available() {
                 Some(0) => return Err(crate::syscall::EAGAIN),
@@ -431,11 +451,10 @@ impl Pipe {
     }
 
     fn ready(&self, events: i16) -> i16 {
-        // ponytail: write ends always report POLLOUT (a full pipe makes the write wait instead).
         match self.available() {
-            // A write end has no read access, so PeekNamedPipe is denied there: it's writable.
+            // A write end has no read access, so PeekNamedPipe is denied there: writable if there's room.
             None => match unsafe { crate::win::GetLastError() } {
-                5 => events & POLLOUT,
+                5 => if self.write_room() == Some(0) { 0 } else { events & POLLOUT },
                 230 | 536 => 0, // ERROR_BAD_PIPE, ERROR_PIPE_LISTENING: a FIFO reader whose writer hasn't come yet
                 _ => POLLHUP | (events & POLLIN),
             },
@@ -1436,7 +1455,7 @@ fn io_target(fd: u64) -> Result<Io, i64> {
 pub fn read(fd: u64, buf: u64, len: u64) -> R {
     let target = io_target(fd)?;
     if let Io::Pipe(p) = &target {
-        p.rearm.store(1, Relaxed); // see Pipe::rearm
+        p.rearm.fetch_or(1, Relaxed); // POLLIN: see Pipe::rearm
     }
     match target {
         Io::Handle(h) if is_console(h) => read_console(h, buf, len),
@@ -1492,7 +1511,8 @@ pub fn is_file(fd: u64) -> bool {
     with(|fs| matches!(fs.fd(fd), Ok(Fd::File { .. } | Fd::Dir { .. })))
 }
 
-/// Whether fd (a pipe or eventfd) was read since the last call: epoll then re-arms its edge.
+/// The poll bits whose edge re-arms on fd (a pipe or eventfd) since the last call: POLLIN after a read,
+/// POLLOUT after a write that found no room.
 pub fn take_rearm(fd: i32) -> u32 {
     with(|fs| match fs.fd(fd as u64) {
         Ok(Fd::Pipe(p)) => p.rearm.swap(0, Relaxed),
