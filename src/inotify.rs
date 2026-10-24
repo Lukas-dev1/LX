@@ -84,7 +84,8 @@ pub fn add_watch(fd: u64, path: u64, mask: u64) -> R {
     let mut buf = vec![0u32; 16384]; // DWORD-aligned, as ReadDirectoryChangesW wants
     let event = unsafe { crate::win::CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
     let mut ov = Box::new(Ov { internal: [0; 2], offset: 0, offset_high: 0, event });
-    if !arm(h, &mut buf, &mut ov) {
+    let mut ext = true;
+    if !arm(h, &mut buf, &mut ov, &mut ext) {
         unsafe { crate::win::CloseHandle(event) };
         unsafe { crate::win::CloseHandle(h) };
         return Err(crate::syscall::ENOENT);
@@ -92,7 +93,7 @@ pub fn add_watch(fd: u64, path: u64, mask: u64) -> R {
     let wd = NEXT_WD.fetch_add(1, Relaxed) as i32;
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
-    std::thread::spawn(move || watch(h, buf, ov, wd, mask, only, &dir, &sink, &stopped));
+    std::thread::spawn(move || watch(h, buf, ov, ext, wd, mask, only, &dir, &sink, &stopped));
     let mut all = INSTANCES.lock().unwrap();
     if let Some(i) = all.iter_mut().find(|i| i.pipe == pipe) {
         i.watches.push(Watch { wd, dir: h, stop });
@@ -122,9 +123,10 @@ struct Ov {
 }
 
 /// Issue the next (overlapped) wait for changes; its result lands in `buf`.
-/// With extended information (FILE_NOTIFY_EXTENDED_INFORMATION records): each change's times tell a
-/// write from a metadata change (see watch).
-fn arm(h: isize, buf: &mut [u32], ov: &mut Ov) -> bool {
+/// With extended information (FILE_NOTIFY_EXTENDED_INFORMATION records) where the filesystem has it
+/// (`ext`; NTFS, ReFS): each change's times tell a write from a metadata change (see watch). Elsewhere
+/// (a FAT or network volume) plain records, and `ext` is cleared.
+fn arm(h: isize, buf: &mut [u32], ov: &mut Ov, ext: &mut bool) -> bool {
     unsafe extern "system" {
         fn ReadDirectoryChangesExW(h: isize, buf: *mut std::ffi::c_void, len: u32, subtree: i32, filter: u32, returned: *mut u32,
             ov: *mut std::ffi::c_void, completion: *mut std::ffi::c_void, class: u32) -> i32;
@@ -132,14 +134,21 @@ fn arm(h: isize, buf: &mut [u32], ov: &mut Ov) -> bool {
     // FILE_NOTIFY_CHANGE_FILE_NAME | DIR_NAME | ATTRIBUTES | SIZE | LAST_WRITE | EA (our modes and owners)
     const FILTER: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x80;
     const READ_DIRECTORY_NOTIFY_EXTENDED_INFORMATION: u32 = 2;
-    unsafe {
+    if *ext && unsafe {
         ReadDirectoryChangesExW(h, buf.as_mut_ptr().cast(), (buf.len() * 4) as u32, 0, FILTER, std::ptr::null_mut(),
             (ov as *mut Ov).cast(), std::ptr::null_mut(), READ_DIRECTORY_NOTIFY_EXTENDED_INFORMATION) != 0
+    } {
+        return true;
+    }
+    *ext = false;
+    unsafe {
+        crate::win::ReadDirectoryChangesW(h, buf.as_mut_ptr().cast(), (buf.len() * 4) as u32, 0, FILTER, std::ptr::null_mut(),
+            (ov as *mut Ov).cast(), std::ptr::null_mut()) != 0
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn watch(h: isize, mut buf: Vec<u32>, mut ov: Box<Ov>, wd: i32, mask: u32, only: Option<String>, dir: &std::path::Path,
+fn watch(h: isize, mut buf: Vec<u32>, mut ov: Box<Ov>, mut ext: bool, wd: i32, mask: u32, only: Option<String>, dir: &std::path::Path,
          sink: &Mutex<OwnedHandle>, stop: &AtomicBool) {
     let mut moving = 0u32;
     loop {
@@ -154,14 +163,18 @@ fn watch(h: isize, mut buf: Vec<u32>, mut ov: Box<Ov>, wd: i32, mask: u32, only:
         let mut out = Vec::new();
         // FILE_NOTIFY_EXTENDED_INFORMATION: next, action, then times (creation, last write at 16, change at
         // 24, access), sizes, attributes, ids, and the name's length at 80 and the name at 84.
-        while at + 84 <= bytes.len() {
+        // Plain FILE_NOTIFY_INFORMATION: next, action, the name's length at 8 and the name at 12.
+        let (len_at, name_at) = if ext { (80, 84) } else { (8, 12) };
+        while at + name_at <= bytes.len() {
             let word = |o: usize| u32::from_le_bytes(bytes[at + o..at + o + 4].try_into().unwrap());
             let time = |o: usize| i64::from_le_bytes(bytes[at + o..at + o + 8].try_into().unwrap());
-            let (next, action, len) = (word(0), word(4), word(80) as usize);
+            let (next, action, len) = (word(0), word(4), word(len_at) as usize);
             // A write sets the last-write and change times together; chmod, chown and utimensat only the
-            // change time (or set the write time to something else): IN_ATTRIB for those.
-            let written = (time(16) - time(24)).abs() < 10_000; // within 1 ms (100 ns units)
-            let wide: Vec<u16> = bytes[at + 84..at + 84 + len].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            // change time (or set the write time to something else): IN_ATTRIB for those. Without the
+            // times, it may be either: both.
+            let written = !ext || (time(16) - time(24)).abs() < 10_000; // within 1 ms (100 ns units)
+            let attrib = !ext || !written;
+            let wide: Vec<u16> = bytes[at + name_at..at + name_at + len].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
             let name = fs::dec_name(&String::from_utf16_lossy(&wide));
             // A whiteout appearing is the image's entry being deleted; our other bookkeeping is no event.
             let (name, action) = match name.strip_prefix(WHITEOUT) {
@@ -173,7 +186,8 @@ fn watch(h: isize, mut buf: Vec<u32>, mut ov: Box<Ov>, wd: i32, mask: u32, only:
             let events: &[u32] = match action {
                 1 => &[IN_CREATE],                    // FILE_ACTION_ADDED
                 2 => &[IN_DELETE],                    // REMOVED
-                3 if written => &[IN_MODIFY, IN_CLOSE_WRITE], // MODIFIED by a write
+                3 if written && attrib => &[IN_MODIFY, IN_CLOSE_WRITE, IN_ATTRIB], // MODIFIED, and we can't tell how
+                3 if written => &[IN_MODIFY, IN_CLOSE_WRITE], // by a write
                 3 => &[IN_ATTRIB],                    // or only its metadata
                 4 => { moving = COOKIE.fetch_add(1, Relaxed); &[IN_MOVED_FROM] } // RENAMED_OLD_NAME
                 5 => &[IN_MOVED_TO],                  // RENAMED_NEW_NAME
@@ -194,7 +208,7 @@ fn watch(h: isize, mut buf: Vec<u32>, mut ov: Box<Ov>, wd: i32, mask: u32, only:
         if !out.is_empty() && !send(sink, &out) {
             break; // the inotify fd is closed
         }
-        if stop.load(Relaxed) || !arm(h, &mut buf, &mut ov) {
+        if stop.load(Relaxed) || !arm(h, &mut buf, &mut ov, &mut ext) {
             break; // (changes in between are kept by NT for the next request)
         }
     }
