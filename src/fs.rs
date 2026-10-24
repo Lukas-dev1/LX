@@ -3233,6 +3233,12 @@ pub fn fchmodat2(dirfd: u64, path: u64, mode: u64, flags: u64) -> R {
     if flags & AT_EMPTY_PATH != 0 && cstr(path)?.is_empty() {
         return fchmeta(dirfd, Some(mode), None);
     }
+    // A symlink's mode can't change (always 0777): Linux says EOPNOTSUPP rather than follow it.
+    if flags & AT_SYMLINK_NOFOLLOW != 0
+        && with(|fs| fs.at_attrs(dirfd, path, false)).is_ok_and(|(_, host, m)| m.is_some_and(|m| link_target(&host, &m).is_some()))
+    {
+        return Err(95);
+    }
     chmeta_at(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0, Some(mode), None)
 }
 
