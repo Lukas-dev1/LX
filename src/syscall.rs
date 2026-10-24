@@ -1797,8 +1797,13 @@ fn mmap_growable(section: isize, sprot: u32, access: u32, fd: u64, off: u64, vle
     }
     protect(base, vlen.next_multiple_of(PAGE), page_prot(prot)); // the view came with all its access
     let (h, _) = fs::file_handle(fd)?;
-    let mut file = 0isize;
-    unsafe { crate::win::DuplicateHandle(me, h, me, &mut file, 0, 0, 2) }; // DUPLICATE_SAME_ACCESS
+    // grow_view makes a new section like this one from it, so it needs the same access (execute too).
+    let w = if fs::handle_writable(h) { 0x4000_0000 } else { 0 };
+    let mut file = unsafe { crate::win::ReOpenFile(h, 0x8000_0000 | 0x2000_0000 | w, 7, 0) }; // GENERIC_READ | EXECUTE
+    if file == -1 {
+        file = 0;
+        unsafe { crate::win::DuplicateHandle(me, h, me, &mut file, 0, 0, 2) }; // DUPLICATE_SAME_ACCESS
+    }
     VIEWS.lock().unwrap().push(View { base, len: vlen, section, off, access, full, file, prot: (sprot, vprot) });
     Ok(base)
 }
