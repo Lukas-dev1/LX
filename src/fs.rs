@@ -2263,7 +2263,11 @@ pub fn readv(fd: u64, iov: u64, cnt: u64) -> R {
 
 /// preadv/pwritev (and the -v2 forms, flags ignored): readv/writev at `off`, or at the file position
 /// when `off` is -1 (only the -v2 forms allow that).
-pub fn preadv(fd: u64, iov: u64, cnt: u64, off: u64, write: bool) -> R {
+/// `noappend`: RWF_NOAPPEND, write at `off` even on an O_APPEND fd (whose NT handle only appends).
+pub fn preadv(fd: u64, iov: u64, cnt: u64, off: u64, write: bool, noappend: bool) -> R {
+    if noappend && off != u64::MAX && let Ok((h, _)) = file_handle(fd) && granted_access(h).is_some_and(|g| g & 2 == 0 && g & 4 != 0) {
+        return pwrite_reopened(h, iov, cnt, off);
+    }
     if off == u64::MAX {
         return if write { writev(fd, iov, cnt) } else { readv(fd, iov, cnt) };
     }
@@ -2283,6 +2287,31 @@ pub fn preadv(fd: u64, iov: u64, cnt: u64, off: u64, write: bool) -> R {
         }
     }
     Ok(total)
+}
+
+/// pwritev at `off` through a handle that may write anywhere, for an append-only one.
+fn pwrite_reopened(h: isize, iov: u64, cnt: u64, off: u64) -> R {
+    use std::os::windows::fs::FileExt;
+    check_iov(iov, cnt)?;
+    if (off as i64) < 0 {
+        return Err(EINVAL);
+    }
+    let w = unsafe { crate::win::ReOpenFile(h, 0x4000_0000, 7, 0) }; // GENERIC_WRITE
+    if w == -1 {
+        return Err(EBADF);
+    }
+    let f = unsafe { File::from_raw_handle(w as _) };
+    let mut total = 0u64;
+    for i in 0..cnt {
+        let [base, len] = unsafe { *((iov + i * 16) as *const [u64; 2]) };
+        let buf = crate::syscall::get_guest_vec(base, len as usize).ok_or(crate::syscall::EFAULT)?;
+        let n = f.seek_write(&buf, off + total).map_err(errno)? as u64;
+        total += n;
+        if n < len {
+            break;
+        }
+    }
+    Ok(total as i64)
 }
 
 pub fn writev(fd: u64, iov: u64, cnt: u64) -> R {
