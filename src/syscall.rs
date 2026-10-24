@@ -76,6 +76,9 @@ pub struct ThreadState {
     /// so a sender can wake it. Read and written by other threads.
     pub tpending: std::sync::atomic::AtomicU64,
     pub futex_addr: std::sync::atomic::AtomicU64,
+    /// A thread other than the main one: its own auto-reset event for signal::intr_event (0 until it
+    /// first waits), so a signal sent to it alone breaks its sleeps and waits too.
+    pub wake: std::sync::atomic::AtomicIsize,
     /// Whether we're running on host_stack right now.
     on_host: bool,
     /// The TEB's own stack fields (StackBase, StackLimit, DeallocationStack) before the guest took over.
@@ -143,9 +146,14 @@ pub fn ts_of(tid: u32) -> Option<&'static ThreadState> {
 /// handling waits for any thread to take the signal; the others just wait again (a spurious wakeup).
 pub fn wake_futex_waiters() {
     for &(_, ts) in THREAD_TS.lock().unwrap().iter() {
-        let addr = unsafe { &*(ts as *const ThreadState) }.futex_addr.load(Relaxed);
+        let ts = unsafe { &*(ts as *const ThreadState) };
+        let addr = ts.futex_addr.load(Relaxed);
         if addr != 0 {
             unsafe { crate::win::WakeByAddressAll(addr as *const _) };
+        }
+        let ev = ts.wake.load(Relaxed);
+        if ev != 0 {
+            unsafe { crate::win::SetEvent(ev) }; // and one in a sleep or a pipe wait
         }
     }
 }
@@ -153,6 +161,10 @@ pub fn wake_futex_waiters() {
 pub fn forget_ts() {
     let me = unsafe { GetCurrentThreadId() };
     THREAD_TS.lock().unwrap().retain(|e| e.0 != me);
+    let ev = ts().wake.swap(0, Relaxed);
+    if ev != 0 {
+        unsafe { CloseHandle(ev) };
+    }
 }
 
 /// This thread's state, created on first use.
@@ -168,7 +180,7 @@ pub fn ts() -> &'static mut ThreadState {
         fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host + HOST_STACK as u64,
         frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None, restart: 0,
         tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
-        on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]), in_direct: false,
+        wake: std::sync::atomic::AtomicIsize::new(0), on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]), in_direct: false,
         kick: Default::default(), kicked: Default::default(), via_kick: 0,
     }));
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
@@ -486,7 +498,7 @@ fn alloc_ex(fixed: Option<u64>, len: u64, commit: bool) -> Option<u64> {
         },
         None => loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 return None;
             }
             if at(a) == a {
@@ -985,6 +997,9 @@ fn fault_signal(rec: &ExceptionRecord, c: &Context) -> Option<(u64, u64, u64)> {
 fn lost_fs_base(c: &Context, fault_addr: u64, code_end: u64) -> bool {
     use iced_x86::{Decoder, DecoderOptions, Register as Reg};
     let len = (code_end - c.rip).min(15) as usize;
+    if !readable(c.rip, len) {
+        return false; // the fault is fetching the instruction itself (a jump into a PROT_NONE page)
+    }
     let bytes = unsafe { std::slice::from_raw_parts(c.rip as *const u8, len) };
     let ins = Decoder::with_ip(64, bytes, c.rip, DecoderOptions::NONE).decode();
     if ins.memory_segment() != Reg::FS {
@@ -1027,7 +1042,9 @@ fn guest_crash(rec: &ExceptionRecord, c: &Context) -> ! {
 ",
         rec.code, c.rip, code_file(c.rip), rec.info[1], m.state, m.protect, m.allocation_base, unsafe { GetCurrentThreadId() }, c.rsp, ts().fs);
     let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
-    proc::exit(139) // 128 + SIGSEGV, like a shell would report
+    // Killed by the fault's signal, so a parent's wait sees WIFSIGNALED (the container's first process
+    // still exits 128 + it, 139 for SIGSEGV).
+    proc::die(fault_signal(rec, c).map_or(11, |f| f.0))
 }
 
 /// The dispatch table. Linux ABI: nr in rax, args rdi rsi rdx r10 r8 r9, result (or -errno) in rax.
@@ -1073,9 +1090,34 @@ fn dispatch(c: &mut Context) -> i64 {
     r
 }
 
+/// Fixed-size structs these syscalls copy in or out: (syscall, arg, bytes, written, may be NULL). A bad
+/// pointer is EFAULT up front, where the handlers would fault inside lx (LTP's EFAULT cases).
+/// ponytail: only these; other handlers still trust their pointers.
+const STRUCTS: &[(u64, usize, usize, bool, bool)] = &[
+    (13, 1, 32, false, true), (13, 2, 32, true, true), // rt_sigaction: act, oldact
+    (14, 1, 8, false, true), (14, 2, 8, true, true),   // rt_sigprocmask: set, oldset
+    (127, 0, 8, true, false),                          // rt_sigpending
+    (130, 0, 8, false, false),                         // rt_sigsuspend
+    (38, 1, 32, false, true), (38, 2, 32, true, true), // setitimer
+    (36, 1, 32, true, false),                          // getitimer
+    (99, 0, 112, true, false),                         // sysinfo
+    (4, 1, 144, true, false), (5, 1, 144, true, false), (6, 1, 144, true, false), (262, 2, 144, true, false), // stat, fstat, lstat, newfstatat
+    (137, 1, 120, true, false), (138, 1, 120, true, false), // statfs, fstatfs
+    (63, 0, 390, true, false),                         // uname
+    (22, 0, 8, true, false), (293, 0, 8, true, false), // pipe, pipe2
+    (125, 0, 8, true, false), (125, 1, 24, true, true), // capget
+    (46, 1, 56, false, false), (47, 1, 56, true, false), // sendmsg, recvmsg
+    (51, 2, 4, true, false), (52, 2, 4, true, false),  // getsockname, getpeername: addrlen
+];
+
+fn bad_struct(n: u64, a: &[u64; 6]) -> bool {
+    STRUCTS.iter().any(|&(nr, i, len, write, null)| nr == n && !(null && a[i] == 0) && check_guest(a[i], len, write).is_err())
+}
+
 fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
     use fs::{AT_FDCWD as CWD, AT_SYMLINK_NOFOLLOW};
     let r = match c.rax {
+        n if bad_struct(n, &a) => Err(EFAULT),
         0 => fs::read(a[0], a[1], a[2]),
         1 => fs::write(a[0], a[1], a[2]),
         2 => fs::openat(CWD, a[0], a[1], a[2]),
@@ -1100,18 +1142,23 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         30 => shmat(a[0], a[1], a[2]),
         67 => shmdt(a[0], c.rsp),
         31 => shmctl(a[0], a[1], a[2]),
-        25 => mremap(a[0], a[1], a[2], a[3]),
-        26 => msync(a[0], a[1]),
+        25 => mremap(a[0], a[1], a[2], a[3], a[4]),
+        26 => msync(a[0], a[1], a[2]),
         27 => mincore(a[0], a[1], a[2]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
+        13 | 14 if a[3] != 8 => Err(EINVAL), // rt_sigaction, rt_sigprocmask: sigsetsize must be the kernel's
         13 => signal::sigaction(a[0], a[1], a[2]),
         14 => signal::sigprocmask(a[0], a[1], a[2]),
         127 => signal::sigpending(a[0], a[1]),
         131 => signal::sigaltstack(a[0], a[1], c.rsp),
         7 => fs::poll(a[0], a[1], a[2] as i32 as i64),
         23 => fs::select(a[0], a[1], a[2], a[3], timeval_ms(a[4])),   // ponytail: the timeout isn't updated
-        270 => fs::select(a[0], a[1], a[2], a[3], timespec_ms(a[4])), // pselect6: signal mask ignored
-        271 => fs::poll(a[0], a[1], timespec_ms(a[2])), // ppoll. ponytail: signal mask ignored
+        // pselect6: the 6th argument is {sigset pointer, its size}
+        270 => (if a[5] != 0 { get_guest::<16>(a[5]) } else { Ok([0; 16]) }).and_then(|b| {
+            let [ss, size] = [0, 8].map(|i| u64::from_le_bytes(b[i..i + 8].try_into().unwrap()));
+            signal::with_mask(ss, size, || fs::select(a[0], a[1], a[2], a[3], timespec_ms(a[4])))
+        }),
+        271 => signal::with_mask(a[3], a[4], || fs::poll(a[0], a[1], timespec_ms(a[2]))), // ppoll
         34 => signal::sigsuspend(0),   // pause
         130 => signal::sigsuspend(a[0]),
         128 => signal::sigtimedwait(a[0], a[1], if a[2] == 0 { -1 } else { let [s, ns] = unsafe { *(a[2] as *const [u64; 2]) }; (s * 1000 + ns.div_ceil(1_000_000)) as i64 }),
@@ -1119,9 +1166,13 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         17 => fs::pread(a[0], a[1], a[2], a[3], false),
         18 => fs::pread(a[0], a[1], a[2], a[3], true),
         19 => fs::readv(a[0], a[1], a[2]),
-        327 | 328 if a[5] & !0x1f != 0 => Err(95), // preadv2/pwritev2: unknown RWF_* flags are EOPNOTSUPP (known ones are hints)
-        295 | 327 => fs::preadv(a[0], a[1], a[2], a[3], false), // preadv, preadv2
-        296 | 328 => fs::preadv(a[0], a[1], a[2], a[3], true),  // pwritev, pwritev2
+        // preadv2/pwritev2: unknown RWF_* flags are EOPNOTSUPP; the known ones are hints (HIPRI, DSYNC, SYNC,
+        // NOWAIT, ATOMIC, DONTCACHE) or about O_APPEND: RWF_APPEND, and RWF_NOAPPEND, which musl's pwrite
+        // passes to get POSIX pwrite on an O_APPEND fd.
+        327 | 328 if a[5] & !0xff != 0 => Err(95),
+        295 | 327 => fs::preadv(a[0], a[1], a[2], a[3], false, false), // preadv, preadv2
+        296 => fs::preadv(a[0], a[1], a[2], a[3], true, false),       // pwritev
+        328 => fs::preadv(a[0], a[1], a[2], a[3], true, a[5] & 0x20 != 0), // pwritev2
         285 => fs::fallocate(a[0], a[1], a[2], a[3]),
         37 => Ok(signal::set_alarm(a[0] * 1000, 0).0.div_ceil(1000) as i64), // alarm: the seconds left of the old one
         38 => setitimer(a[0], a[1], a[2]),
@@ -1148,7 +1199,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         97 => rlimit(a[0], 0, a[1]),   // getrlimit
         160 => rlimit(a[0], a[1], 0),  // setrlimit
         302 => rlimit(a[1], a[2], a[3]), // prlimit64 (self only)
-        98 => { unsafe { std::ptr::write_bytes(a[1] as *mut u8, 0, 144) }; Ok(0) } // getrusage: zeros
+        // getrusage(RUSAGE_SELF, _CHILDREN or _THREAD): zeros
+        98 => if ![0, -1, 1].contains(&(a[0] as i32)) { Err(EINVAL) } else { put_guest(a[1], &[0; 144]) },
         99 => sysinfo(a[0]),
         100 => times(a[0]),
         309 => getcpu(a[0], a[1]),
@@ -1180,15 +1232,34 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         213 => net::sys_epoll_create(0),
         291 => net::sys_epoll_create(a[0]),
         233 => net::sys_epoll_ctl(a[0], a[1], a[2], a[3]),
-        232 | 281 => net::sys_epoll_wait(a[0], a[1], a[2], a[3] as i32 as i64), // pwait: mask ignored
-        441 => net::sys_epoll_wait(a[0], a[1], a[2], timespec_ms(a[3])),
+        232 => net::sys_epoll_wait(a[0], a[1], a[2], a[3] as i32 as i64),
+        281 => signal::with_mask(a[4], a[5], || net::sys_epoll_wait(a[0], a[1], a[2], a[3] as i32 as i64)), // epoll_pwait
+        441 if a[3] != 0 && !valid_timespec(a[3]) => Err(EINVAL),
+        441 => signal::with_mask(a[4], a[5], || net::sys_epoll_wait(a[0], a[1], a[2], timespec_ms(a[3]))), // epoll_pwait2
         20 => fs::writev(a[0], a[1], a[2]),
         22 => fs::pipe2(a[0], 0),
         21 => fs::faccessat(CWD, a[0], a[1]),
         28 => madvise(a[0], a[1], a[2]),
-        149..=152 | 325 => Ok(0), // mlock, munlock, mlockall, munlockall, mlock2. ponytail: pages may still be paged out
-        140 => Ok(20), // getpriority: the raw call answers 20 - nice; everyone runs at nice 0 (rpm asks)
-        141 => Ok(0),  // setpriority. ponytail: accepted, not applied
+        // mlock, munlock, mlockall, munlockall, mlock2: checked, then accepted. ponytail: pages may still be
+        // paged out. A range must be mapped (ENOMEM); mlockall takes MCL_CURRENT/FUTURE (+ONFAULT), mlock2 MLOCK_ONFAULT.
+        151 if a[0] == 0 || a[0] & !7 != 0 || a[0] & 3 == 0 => Err(EINVAL),
+        325 if a[2] & !1 != 0 => Err(EINVAL),
+        149 | 150 | 325 if !each_region(a[0] & !(PAGE - 1), (a[0] % PAGE + a[1]).next_multiple_of(PAGE), |_, _, st| st != 0x10000) => Err(ENOMEM),
+        149..=152 | 325 => Ok(0),
+        // iopl / ioperm: port I/O needs CAP_SYS_RAWIO, which Docker doesn't give; bad arguments first.
+        172 => Err(if a[0] > 3 { EINVAL } else { EPERM }),
+        173 => Err(if a[0].saturating_add(a[1]) > 0x10000 { EINVAL } else { EPERM }),
+        140 | 141 if a[0] > 2 => Err(EINVAL), // PRIO_PROCESS, PRIO_PGRP, PRIO_USER
+        140 | 141 if (a[1] as i32) < 0 => Err(ESRCH), // no such process, group or user
+        // getpriority / setpriority: this process's nice value (the raw call answers 20 - nice). Lowering it
+        // takes CAP_SYS_NICE, which Docker doesn't give. ponytail: kept for asking, not applied; other
+        // processes, groups and users read as nice 0 and setting them is accepted.
+        140 => Ok(if a[0] == 0 && is_self(a[1]) { 20 - NICE.load(Relaxed) } else { 20 }),
+        141 if a[0] == 0 && is_self(a[1]) => {
+            let v = (a[2] as i32).clamp(-20, 19) as i64;
+            if v < NICE.load(Relaxed) { Err(EACCES) } else { NICE.store(v, Relaxed); Ok(0) }
+        }
+        141 => Ok(0),
         32 => fs::dup(a[0], 0, false),
         33 => fs::dup3(a[0], a[1], 0),
         35 => nanosleep(a[0], a[1]),
@@ -1242,7 +1313,9 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         120 => proc::get_res(&proc::GID, [a[0], a[1], a[2]]), // getresgid
         157 if a[0] == 21 => crate::seccomp::mode(),       // PR_GET_SECCOMP
         157 if a[0] == 22 => crate::seccomp::set(a[1], a[2]), // PR_SET_SECCOMP
-        157 => prctl(a[0], a[1]),
+        157 => prctl(a[0], a[1], a[2]),
+        // personality: PER_LINUX and whatever flags were set (0xffffffff only asks).
+        135 => Ok(if a[0] as u32 == u32::MAX { PERSONA.load(Relaxed) } else { PERSONA.swap(a[0] as u32 as u64, Relaxed) } as i64),
         317 => crate::seccomp::seccomp(a[0], a[1], a[2]),
         115 => proc::getgroups(a[0], a[1]),
         116 => proc::setgroups(a[0], a[1]),
@@ -1256,7 +1329,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         158 if a[0] == 0x1003 => { unsafe { *(a[1] as *mut u64) = ts().fs }; Ok(0) } // ARCH_GET_FS
         158 => Err(EINVAL), // the rest (CET, AMX, CPUID faulting): not supported, as glibc's probes expect
         217 => fs::getdents64(a[0], a[1], a[2]),
-        202 => thread::futex(a[0], a[1], a[2], a[3], a[5]),
+        202 => thread::futex(a[0], a[1], a[2], a[3], a[4], a[5]),
         324 => thread::membarrier(a[0]),
         284 => fs::eventfd(a[0], 0),
         283 => fs::timerfd_create(a[0], a[1]),
@@ -1373,7 +1446,6 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
     let end = addr.checked_add(bytes.len() as u64).ok_or(EFAULT)?;
     // The hot callers (clock_gettime, gettimeofday: lx has no vDSO) write the same page again and again:
     // once checked, it stays writable until the map changes (MAP_GEN), so skip the VirtualQuery.
-    thread_local!(static CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) });
     let page = addr & !(PAGE - 1);
     let same_page = end > addr && (end - 1) & !(PAGE - 1) == page;
     let epoch = MAP_GEN.load(Relaxed);
@@ -1396,6 +1468,8 @@ pub fn put_guest(addr: u64, bytes: &[u8]) -> R {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
     Ok(0)
 }
+
+thread_local!(static CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) });
 
 /// Bumped by every syscall that changes the address space (see dispatch): put_guest's page cache.
 static MAP_GEN: AtomicU64 = AtomicU64::new(0);
@@ -1426,6 +1500,12 @@ fn readable_end(addr: u64) -> Option<u64> {
 /// work on a guest buffer in place.
 pub fn check_guest(addr: u64, n: usize, write: bool) -> Result<(), i64> {
     let Some(end) = addr.checked_add(n as u64) else { return Err(EFAULT) };
+    // A page put_guest found writable (sigprocmask's oldset is the same stack page call after call).
+    let (page, epoch) = (addr & !(PAGE - 1), MAP_GEN.load(Relaxed));
+    let same_page = end > addr && (end - 1) & !(PAGE - 1) == page;
+    if same_page && CHECKED.get() == (page, epoch) {
+        return Ok(());
+    }
     let mut p = addr;
     while p < end {
         let mut m = MemoryBasicInformation::default();
@@ -1434,6 +1514,9 @@ pub fn check_guest(addr: u64, n: usize, write: bool) -> Result<(), i64> {
             return Err(EFAULT);
         }
         p = (m.base + m.region_size) as u64;
+    }
+    if write && same_page {
+        CHECKED.set((page, epoch));
     }
     Ok(())
 }
@@ -1557,8 +1640,25 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     const MAP_SHARED: u64 = 0x01;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
-    if len == 0 || addr % PAGE != 0 || off % PAGE != 0 {
+    const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+    if len == 0 || addr % PAGE != 0 || off % PAGE != 0 || flags & 3 == 0 { // MAP_SHARED, MAP_PRIVATE or both (_VALIDATE)
         return Err(EINVAL);
+    }
+    if len > USER_END {
+        return Err(ENOMEM); // more than the address space (Go's TestMmapErrorSign)
+    }
+    // MAP_SHARED_VALIDATE: a flag this kernel doesn't know is EOPNOTSUPP rather than ignored.
+    const KNOWN: u64 = 0x3 | 0x10 | 0x20 | 0x40 | 0x100 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x1_0000
+        | 0x2_0000 | 0x4_0000 | 0x10_0000 | 0x400_0000 | 0x3f << 26;
+    if flags & 3 == 3 && flags & !KNOWN != 0 {
+        return Err(95); // EOPNOTSUPP
+    }
+    if flags & MAP_ANONYMOUS == 0 {
+        // A file mapping reads the file; a shared writable one writes it too.
+        let (read, write) = fs::map_access(fd)?;
+        if !read || flags & MAP_SHARED != 0 && prot & 2 != 0 && !write {
+            return Err(EACCES);
+        }
     }
     let len = len.next_multiple_of(PAGE);
     let reserve_only = prot == 0 && flags & MAP_ANONYMOUS != 0; // PROT_NONE: address space, no memory
@@ -1569,7 +1669,10 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     // a MAP_FIXED first cuts any copy-on-write view out of its way.
     let fixed = flags & MAP_FIXED != 0;
     let holes = if fixed { punch_views(addr, len) } else { Vec::new() };
-    let cow = if flags & MAP_ANONYMOUS == 0 { mmap_cow(addr, len, prot, fixed, fd, off, &holes) } else { None };
+    // MAP_FIXED_NOREPLACE: exactly at addr, never over an existing mapping (a private file copy: the
+    // copy-on-write views pick their own place). ponytail: MAP_SHARED ignores it.
+    let noreplace = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) == MAP_FIXED_NOREPLACE;
+    let cow = if flags & MAP_ANONYMOUS == 0 && !noreplace { mmap_cow(addr, len, prot, fixed, fd, off, &holes) } else { None };
     if cow.is_none() {
         for &(a, n) in &holes {
             place_plain(a, n, false); // ordinary reserved memory for the paths below
@@ -1591,6 +1694,9 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     } else {
         // A free hint is honored, like Linux (Go places its heap with hints); otherwise our own window.
         let hinted = (addr != 0).then(|| alloc_ex(Some(addr), len, !reserve_only)).flatten();
+        if noreplace && hinted != Some(addr) {
+            return Err(EEXIST);
+        }
         hinted.or_else(|| alloc_ex(None, len, !reserve_only)).ok_or(ENOMEM)?
     };
     if reserve_only {
@@ -1665,9 +1771,12 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
     let delta = off % 0x10000;
     let aoff = off - delta;
     let mut vlen = delta + len;
-    let mut sprot = PAGE_READWRITE;
+    // Views are mapped with all the access the section allows, and the pages then set to `prot`: a view
+    // is never re-mapped, so a later mprotect can only reach what it was mapped with (CoreCLR maps its
+    // double-mapped code PROT_NONE, then mprotects it executable).
+    let mut sprot = 0x40; // PAGE_EXECUTE_READWRITE
     let section = match file {
-        None => unsafe { CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null()) },
+        None => unsafe { CreateFileMappingW(-1, std::ptr::null_mut(), sprot, (len >> 32) as u32, len as u32, std::ptr::null()) },
         Some(fd) => {
             let (h, size) = fs::file_handle(fd)?;
             if size <= aoff {
@@ -1675,14 +1784,28 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
             }
             // NT views can't reach past the file's end (it maps the last partial page whole anyway).
             vlen = vlen.min(size - aoff);
-            let exec = prot & 4 != 0;
-            let rw = if exec { 0x40 } else { PAGE_READWRITE }; // PAGE_EXECUTE_READWRITE
-            sprot = rw;
-            let mut s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), rw, 0, 0, std::ptr::null()) };
-            if s == 0 && !write {
-                // A file opened read-only can still be mapped for reading.
-                sprot = if exec { 0x20 } else { 0x02 };
-                s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) };
+            // An executable section needs FILE_EXECUTE on the handle, which our opens never ask for (Linux
+            // only refuses PROT_EXEC on a noexec mount): map through a reopened handle that has it, with
+            // write access only if the fd has it (an O_RDONLY mapping must not become writable).
+            unsafe extern "system" {
+                fn ReOpenFile(h: isize, access: u32, share: u32, flags: u32) -> isize;
+            }
+            const GENERIC_EXECUTE: u32 = 0x2000_0000;
+            let writable = fs::handle_writable(h);
+            let x = unsafe { ReOpenFile(h, 0x8000_0000 | GENERIC_EXECUTE | if writable { 0x4000_0000 } else { 0 }, 7, 0) };
+            let src = if x != -1 { x } else { h };
+            // Most access first: RWX, RW, RX, R.
+            let tries: &[u32] = if writable { &[0x40, 0x04, 0x20, 0x02] } else { &[0x20, 0x02] };
+            let mut s = 0;
+            for &p in tries {
+                s = unsafe { CreateFileMappingW(src, std::ptr::null_mut(), p, 0, 0, std::ptr::null()) };
+                if s != 0 {
+                    sprot = p;
+                    break;
+                }
+            }
+            if x != -1 {
+                unsafe { CloseHandle(x) }; // the section keeps the file
             }
             if s == 0 {
                 return Err(EACCES);
@@ -1693,7 +1816,12 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
     if section == 0 {
         return Err(ENOMEM);
     }
-    let access = if write { FILE_MAP_WRITE } else { FILE_MAP_READ } | if prot & 4 != 0 { FILE_MAP_EXECUTE } else { 0 };
+    let (can_write, can_exec) = (matches!(sprot, 0x40 | 0x04), matches!(sprot, 0x40 | 0x20));
+    if write && !can_write || prot & 4 != 0 && !can_exec {
+        unsafe { CloseHandle(section) };
+        return Err(EACCES);
+    }
+    let access = if can_write { FILE_MAP_WRITE } else { FILE_MAP_READ } | if can_exec { FILE_MAP_EXECUTE } else { 0 };
     let full = (delta + len).next_multiple_of(PAGE);
     if let Some(fd) = file.filter(|_| !fixed && full > vlen.next_multiple_of(PAGE)) {
         return mmap_growable(section, sprot, access, fd, aoff, vlen, full, prot).map(|base| (base + delta) as i64);
@@ -1721,7 +1849,7 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
     } else {
         loop {
             let a = NEXT.fetch_add(vlen.next_multiple_of(0x10000), Relaxed);
-            if a + vlen > WINDOW.1 {
+            if a.checked_add(vlen).is_none_or(|e| e > WINDOW.1) {
                 unsafe { CloseHandle(section) };
                 return Err(ENOMEM);
             }
@@ -1737,10 +1865,7 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
             }
         }
     };
-    if prot == 0 {
-        let mut old = 0;
-        unsafe { VirtualProtect(base as *mut _, vlen as usize, 0x01, &mut old) }; // PROT_NONE
-    }
+    protect(base, vlen.next_multiple_of(PAGE), page_prot(prot)); // the view came with all its access
     VIEWS.lock().unwrap().push(View { base, len: vlen, section, off: aoff, access, full: vlen, file: 0, prot: (0, 0) });
     Ok((base + delta) as i64)
 }
@@ -1760,7 +1885,7 @@ fn mmap_growable(section: isize, sprot: u32, access: u32, fd: u64, off: u64, vle
     };
     let base = loop {
         let a = NEXT.fetch_add(full.next_multiple_of(0x10000), Relaxed);
-        if a + full > WINDOW.1 {
+        if a.checked_add(full).is_none_or(|e| e > WINDOW.1) {
             return fail(ENOMEM);
         }
         if unsafe { VirtualAlloc2(0, a as *mut _, full as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0) } as u64 == a {
@@ -1773,13 +1898,15 @@ fn mmap_growable(section: isize, sprot: u32, access: u32, fd: u64, off: u64, vle
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
         return fail(ENOMEM);
     }
-    if prot == 0 {
-        let mut old = 0;
-        unsafe { VirtualProtect(base as *mut _, vlen as usize, 0x01, &mut old) }; // PROT_NONE
-    }
+    protect(base, vlen.next_multiple_of(PAGE), page_prot(prot)); // the view came with all its access
     let (h, _) = fs::file_handle(fd)?;
-    let mut file = 0isize;
-    unsafe { crate::win::DuplicateHandle(me, h, me, &mut file, 0, 0, 2) }; // DUPLICATE_SAME_ACCESS
+    // grow_view makes a new section like this one from it, so it needs the same access (execute too).
+    let w = if fs::handle_writable(h) { 0x4000_0000 } else { 0 };
+    let mut file = unsafe { crate::win::ReOpenFile(h, 0x8000_0000 | 0x2000_0000 | w, 7, 0) }; // GENERIC_READ | EXECUTE
+    if file == -1 {
+        file = 0;
+        unsafe { crate::win::DuplicateHandle(me, h, me, &mut file, 0, 0, 2) }; // DUPLICATE_SAME_ACCESS
+    }
     VIEWS.lock().unwrap().push(View { base, len: vlen, section, off, access, full, file, prot: (sprot, vprot) });
     Ok(base)
 }
@@ -1864,7 +1991,16 @@ pub fn in_shared_view(addr: u64) -> bool {
     VIEWS.lock().unwrap().iter().any(|v| (v.base..v.base + v.len).contains(&addr))
 }
 
-fn msync(addr: u64, len: u64) -> R {
+fn msync(addr: u64, len: u64, flags: u64) -> R {
+    const MS_ASYNC: u64 = 1;
+    const MS_SYNC: u64 = 4;
+    if addr % PAGE != 0 || flags & !7 != 0 || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC {
+        return Err(EINVAL);
+    }
+    let mut m = MemoryBasicInformation::default();
+    if unsafe { VirtualQuery(addr as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 || m.state == 0x10000 {
+        return Err(ENOMEM); // MEM_FREE: nothing mapped there
+    }
     unsafe { FlushViewOfFile(addr as *const _, len as usize) };
     Ok(0)
 }
@@ -1892,8 +2028,11 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> R {
     let len = len.next_multiple_of(PAGE);
     if prot & 4 != 0 {
         // Newly executable memory (JITs, ld.so): scan before it can run. Already-patched code rescans clean.
-        // RWX while patching, not RW: another thread may already be running code in this range.
-        protect(addr, len, 0x40);
+        // RWX while patching, not RW: another thread may already be running code in this range. Memory
+        // that can't be made so (a view of a section that may not execute) mustn't be read: EACCES.
+        if !protect(addr, len, 0x40) {
+            return Err(EACCES);
+        }
         patch_code(addr, len as usize);
     }
     mark_views(addr, len, prot & 2 != 0, prot & 4 != 0);
@@ -1901,9 +2040,16 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> R {
 }
 
 /// Moves only (MREMAP_MAYMOVE): reservations can't grow in place. Keeps the old protection.
-fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
+fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -> R {
     const MREMAP_MAYMOVE: u64 = 1;
-    if new_len == 0 {
+    const MREMAP_FIXED: u64 = 2;
+    // MREMAP_FIXED needs MAYMOVE, an aligned target and one that doesn't overlap the old mapping.
+    let fixed = flags & MREMAP_FIXED != 0;
+    if new_len > USER_END {
+        return Err(ENOMEM);
+    }
+    if new_len == 0 || old % PAGE != 0 || flags & !7 != 0 || fixed && (flags & MREMAP_MAYMOVE == 0 || new_addr % PAGE != 0
+        || new_addr < old + old_len && old < new_addr + new_len) {
         return Err(EINVAL);
     }
     // Unmapped is EFAULT before anything else: musl's pthread_getattr_np finds the main thread's stack
@@ -1925,7 +2071,9 @@ fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
     let new = alloc(None, new_len).ok_or(ENOMEM)?;
     unsafe { std::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, old_len.min(new_len) as usize) };
     protect(new, new_len.next_multiple_of(PAGE), m.protect);
-    munmap(old, old_len, 0)?;
+    if old_len != 0 {
+        munmap(old, old_len, 0)?;
+    }
     Ok(new as i64)
 }
 
@@ -1939,13 +2087,70 @@ const CAP_LAST_CAP: u64 = 40;
 /// accepted (PR_SET_NAME, PR_SET_DUMPABLE, PR_SET_PDEATHSIG, ...). setpriv and libcap find the highest
 /// capability by asking PR_CAPBSET_READ for 0, 1, 2, ... until EINVAL; answering 0 forever hung the stock
 /// redis image's entrypoint (`setpriv -d`).
-fn prctl(option: u64, arg2: u64) -> R {
+static PERSONA: AtomicU64 = AtomicU64::new(0);
+static NICE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn is_self(who: u64) -> bool {
+    who == 0 || proc::getpid().is_ok_and(|p| p as u64 == who)
+}
+
+/// prctl's per-process settings: [pdeathsig, dumpable, keepcaps, timerslack, no_new_privs, subreaper].
+static PRCTL: Mutex<[u64; 6]> = Mutex::new([0, 1, 0, 50_000, 0, 0]);
+
+thread_local! {
+    /// PR_SET_NAME: this thread's name (comm), 15 bytes and a NUL; None: the program's name.
+    static NAME: std::cell::Cell<Option<[u8; 16]>> = const { std::cell::Cell::new(None) };
+}
+
+fn prctl(option: u64, arg2: u64, arg3: u64) -> R {
     const PR_CAPBSET_READ: u64 = 23;
     const PR_CAP_AMBIENT: u64 = 47;
+    let mut st = PRCTL.lock().unwrap();
+    let put_int = |v: u64| put_guest(arg2, &(v as i32).to_le_bytes());
     match option {
         PR_CAPBSET_READ if arg2 > CAP_LAST_CAP => Err(EINVAL),
         PR_CAPBSET_READ => Ok((arg2 < 32 && DOCKER_CAPS & 1 << arg2 != 0) as i64),
         PR_CAP_AMBIENT => Ok(0), // nothing ambient (IS_SET answers 0; raising one is accepted)
+        1 if arg2 > 64 => Err(EINVAL),                 // PR_SET_PDEATHSIG. ponytail: kept, never sent
+        1 => { st[0] = arg2; Ok(0) }
+        2 => put_int(st[0]),                           // PR_GET_PDEATHSIG
+        3 => Ok(st[1] as i64),                         // PR_GET_DUMPABLE
+        4 if arg2 > 1 => Err(EINVAL),                  // PR_SET_DUMPABLE
+        4 => { st[1] = arg2; Ok(0) }
+        7 => Ok(st[2] as i64),                         // PR_GET_KEEPCAPS
+        8 if arg2 > 1 => Err(EINVAL),                  // PR_SET_KEEPCAPS
+        8 => { st[2] = arg2; Ok(0) }
+        15 => {                                        // PR_SET_NAME: up to 15 bytes
+            let mut name = [0u8; 16];
+            let s = cstr(arg2)?;
+            let n = s.len().min(15);
+            name[..n].copy_from_slice(&s.as_bytes()[..n]);
+            NAME.set(Some(name));
+            Ok(0)
+        }
+        16 => {                                        // PR_GET_NAME
+            let name = NAME.get().unwrap_or_else(|| {
+                let exe = crate::fs::exe_name();
+                let mut b = [0u8; 16];
+                let n = exe.len().min(15);
+                b[..n].copy_from_slice(&exe.as_bytes()[..n]);
+                b
+            });
+            put_guest(arg2, &name)
+        }
+        25 => put_int(1),                              // PR_GET_TSC: PR_TSC_ENABLE
+        26 if !matches!(arg2, 1 | 2) => Err(EINVAL),   // PR_SET_TSC
+        26 => Ok(0),
+        29 => { st[3] = if arg2 == 0 { 50_000 } else { arg2 }; Ok(0) } // PR_SET_TIMERSLACK (0: the default)
+        30 => Ok(st[3] as i64),                        // PR_GET_TIMERSLACK
+        36 => { st[5] = (arg2 != 0) as u64; Ok(0) }    // PR_SET_CHILD_SUBREAPER
+        37 => put_int(st[5]),                          // PR_GET_CHILD_SUBREAPER
+        38 if arg2 != 1 || arg3 != 0 => Err(EINVAL),   // PR_SET_NO_NEW_PRIVS: only ever on
+        38 => { st[4] = 1; Ok(0) }
+        39 => Ok(st[4] as i64),                        // PR_GET_NO_NEW_PRIVS
+        14 if arg2 != 0 => Err(EINVAL),                // PR_SET_TIMING: only statistical timing
+        // Options past the ones Linux has (and not its magic-number ones: PR_SET_VMA, PR_SET_PTRACER).
+        o if o > 100 && o != 0x5356_4d41 && o != 0x5961_6d61 => Err(EINVAL),
         _ => Ok(0),
     }
 }
@@ -1955,13 +2160,26 @@ fn prctl(option: u64, arg2: u64) -> R {
 fn capget(header: u64, data: u64) -> R {
     const V3: u32 = 0x2008_0522;
     const DOCKER: u32 = DOCKER_CAPS;
-    if header == 0 {
-        return Err(EFAULT);
+    const V1: u32 = 0x1998_0330;
+    const V2: u32 = 0x2007_1026;
+    // header (checked in dispatch): {version, pid}. An unknown version gets V3 written back and EINVAL
+    // (none at all, without data: the probe libcap does).
+    let [version, pid] = unsafe { *(header as *const [i32; 2]) }.map(|x| x as u32);
+    if ![V1, V2, V3].contains(&version) {
+        unsafe { *(header as *mut u32) = V3 };
+        return if data == 0 { Ok(0) } else { Err(EINVAL) };
     }
-    unsafe { *(header as *mut u32) = V3 };
+    if (pid as i32) < 0 {
+        return Err(EINVAL);
+    }
+    if pid != 0 {
+        crate::proc::kill(pid as i64, 0)?; // ESRCH for a process that isn't there
+    }
     if data != 0 {
         let caps = if crate::proc::UID.load(Relaxed) == 0 { DOCKER } else { 0 };
-        unsafe { *(data as *mut [u32; 6]) = [caps, caps, 0, 0, 0, 0] }; // effective, permitted, inheritable x2
+        // effective, permitted, inheritable: one set for V1, two (64 capabilities) after
+        let n = if version == V1 { 3 } else { 6 };
+        put_guest(data, &[caps, caps, 0, 0, 0, 0][..n].iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>())?;
     }
     Ok(0)
 }
@@ -2022,7 +2240,13 @@ fn shmctl(id: u64, cmd: u64, buf: u64) -> R {
     Ok(0)
 }
 
+/// The end of the user address space (x86-64 TASK_SIZE).
+const USER_END: u64 = 0x7fff_ffff_f000;
+
 fn munmap(addr: u64, len: u64, rsp: u64) -> R {
+    if addr % PAGE != 0 || len == 0 || addr.checked_add(len).is_none_or(|e| e > USER_END) {
+        return Err(EINVAL);
+    }
     let len = len.next_multiple_of(PAGE);
     // A thread unmapping its own stack is about to exit (musl's detached-thread exit does this); NT
     // still needs that stack to dispatch the final exit syscall, so leave it mapped.
@@ -2046,6 +2270,14 @@ fn munmap(addr: u64, len: u64, rsp: u64) -> R {
 fn madvise(addr: u64, len: u64, advice: u64) -> R {
     const MADV_DONTNEED: u64 = 4;
     const MADV_REMOVE: u64 = 9;
+    // NORMAL..DONTNEED, FREE..COLLAPSE, HWPOISON, SOFT_OFFLINE: anything else is EINVAL, as is an
+    // unaligned start; a range with unmapped pages is ENOMEM.
+    if addr % PAGE != 0 || !matches!(advice, 0..=4 | 8..=25 | 100 | 101) {
+        return Err(EINVAL);
+    }
+    if len != 0 && !each_region(addr, len.next_multiple_of(PAGE), |_, _, state| state != 0x10000) { // MEM_FREE
+        return Err(ENOMEM);
+    }
     if advice != MADV_DONTNEED && advice != MADV_REMOVE {
         return Ok(0);
     }
@@ -2056,7 +2288,9 @@ fn madvise(addr: u64, len: u64, advice: u64) -> R {
         let mut m = MemoryBasicInformation::default();
         unsafe {
             VirtualQuery(p as *const _, &mut m, size_of::<MemoryBasicInformation>());
-            VirtualFree(p as *mut _, n as usize, MEM_DECOMMIT) != 0
+            // A view of a section (MEM_MAPPED) can't be decommitted; its pages are the file's or the
+            // shared memory's anyway, which dropping them doesn't change.
+            m.ty == 0x40000 || VirtualFree(p as *mut _, n as usize, MEM_DECOMMIT) != 0
                 && !VirtualAlloc(p as *mut _, n as usize, MEM_COMMIT, m.protect).is_null()
         }
     });
@@ -2211,14 +2445,27 @@ fn sched_getaffinity(pid: u64, len: u64, mask: u64) -> R {
 }
 
 /// setitimer(ITIMER_REAL, {interval, value} as timevals, old).
+/// ITIMER_VIRTUAL and ITIMER_PROF as set ({interval, value} timevals), for getitimer and the old value.
+/// ponytail: CPU-time timers never fire (no SIGVTALRM/SIGPROF), so a profiler that sets them gets no samples.
+static CPU_TIMERS: Mutex<[[u64; 4]; 2]> = Mutex::new([[0; 4]; 2]);
+
 fn setitimer(which: u64, new: u64, old: u64) -> R {
-    if which != 0 {
-        return Err(EINVAL); // ITIMER_VIRTUAL / ITIMER_PROF
+    if which > 2 {
+        return Err(EINVAL);
     }
-    let [is, ius, vs, vus] = if new != 0 { unsafe { *(new as *const [u64; 4]) } } else { [0; 4] }; // NULL disarms
-    let (left, iv) = signal::set_alarm(vs * 1000 + vus.div_ceil(1000), is * 1000 + ius.div_ceil(1000));
+    let v = if new != 0 { get_guest::<32>(new)? } else { [0; 32] }; // NULL disarms
+    let [is, ius, vs, vus] = std::array::from_fn(|i| u64::from_le_bytes(v[i * 8..i * 8 + 8].try_into().unwrap()));
+    if [is, vs].iter().any(|&s| (s as i64) < 0) || [ius, vus].iter().any(|&us| us >= 1_000_000) {
+        return Err(EINVAL);
+    }
+    let was = if which == 0 {
+        let (left, iv) = signal::set_alarm(vs * 1000 + vus.div_ceil(1000), is * 1000 + ius.div_ceil(1000));
+        [iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000]
+    } else {
+        std::mem::replace(&mut CPU_TIMERS.lock().unwrap()[which as usize - 1], [is, ius, vs, vus])
+    };
     if old != 0 {
-        unsafe { *(old as *mut [u64; 4]) = [iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000] };
+        put_guest(old, &as_bytes(&was))?;
     }
     Ok(0)
 }
@@ -2226,7 +2473,7 @@ fn setitimer(which: u64, new: u64, old: u64) -> R {
 fn getitimer(which: u64, cur: u64) -> R {
     let (left, iv) = match which {
         0 => signal::alarm_left(),
-        1 | 2 => (0, 0), // ITIMER_VIRTUAL / ITIMER_PROF: never armed here
+        1 | 2 => return put_guest(cur, &as_bytes(&CPU_TIMERS.lock().unwrap()[which as usize - 1])),
         _ => return Err(EINVAL),
     };
     put_guest(cur, &as_bytes(&[iv / 1000, iv % 1000 * 1000, left / 1000, left % 1000 * 1000]))
@@ -2337,7 +2584,14 @@ fn getcpu(cpu: u64, node: u64) -> R {
 fn mincore(addr: u64, len: u64, vec: u64) -> R {
     const MEM_COMMIT: u32 = 0x1000;
     const MEM_FREE: u32 = 0x10000;
-    let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
+    if addr % PAGE != 0 {
+        return Err(EINVAL);
+    }
+    let Some(end) = addr.checked_add(len).and_then(|e| e.checked_add(0xfff)).map(|e| e & !0xfff).filter(|&e| e <= 0x7fff_ffff_f000) else { // the end of user space
+        return Err(ENOMEM);
+    };
+    let start = addr;
+    check_guest(vec, ((end - start) / 4096) as usize, true)?; // one byte per page
     let mut p = start;
     while p < end {
         let mut m = MemoryBasicInformation::default();
@@ -2453,7 +2707,7 @@ pub fn map_image(host: &std::path::Path, segs: &[ImageSeg], fixed: bool, lo: u64
     } else {
         loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 break None;
             }
             if reserve(a) == a {
@@ -2716,7 +2970,16 @@ pub fn truncate_mapped(h: isize, size: u64, set: impl FnOnce() -> std::io::Resul
             (false, true) => 0x20,
             (false, false) => 0x02,
         };
-        let section = if len == 0 { 0 } else { unsafe { CreateFileMappingW(h, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) } };
+        // An executable view's section needs a handle that may execute (see mmap_shared).
+        let x = if access & FILE_MAP_EXECUTE != 0 {
+            unsafe { crate::win::ReOpenFile(h, 0x8000_0000 | 0x2000_0000 | if access & FILE_MAP_WRITE != 0 { 0x4000_0000 } else { 0 }, 7, 0) }
+        } else {
+            -1
+        };
+        let section = if len == 0 { 0 } else { unsafe { CreateFileMappingW(if x != -1 { x } else { h }, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) } };
+        if x != -1 {
+            unsafe { CloseHandle(x) }; // the section keeps the file
+        }
         let head = len.next_multiple_of(PAGE).min(full);
         if head > 0 {
             carve(base, head);
@@ -2833,7 +3096,7 @@ fn mmap_cow(addr: u64, len: u64, prot: u64, fixed: bool, fd: u64, off: u64, hole
     } else {
         let a = loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 unsafe { CloseHandle(section) };
                 return None;
             }
