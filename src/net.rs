@@ -1550,8 +1550,8 @@ pub fn sys_epoll_wait(epfd: u64, out: u64, max: u64, timeout_ms: i64) -> R {
                     if let Ok(k) = fs::sock(x.fd as u64) {
                         x.reported &= !k.eagain.swap(0, Relaxed); // EAGAIN re-arms the edge
                     }
-                } else if x.events & EPOLLET != 0 && fs::take_rearm(x.fd) != 0 {
-                    x.reported &= !0x1; // read since we looked: POLLIN may be reported again
+                } else if x.events & EPOLLET != 0 {
+                    x.reported &= !fs::take_rearm(x.fd); // read, or found full, since we looked
                 }
                 if x.disabled || n >= max {
                     continue;
