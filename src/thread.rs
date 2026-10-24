@@ -135,10 +135,42 @@ pub fn stop_others() {
 }
 
 /// futex(2): the subset libc and Go use. Waking reports 0 woken (callers don't rely on the count).
-pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
+/// Waiters per address in this process (registered, and woken but not yet gone): FUTEX_WAKE reports
+/// how many it woke, as Linux does. ponytail: a linear list; it holds only addresses being waited on.
+static WAITERS: Mutex<Vec<(u64, u32, u32)>> = Mutex::new(Vec::new());
+
+fn waiting(uaddr: u64, add: bool) {
+    let mut w = WAITERS.lock().unwrap();
+    match w.iter().position(|e| e.0 == uaddr) {
+        Some(i) if add => w[i].1 += 1,
+        None if add => w.push((uaddr, 1, 0)),
+        Some(i) => {
+            let e = &mut w[i];
+            if e.2 > 0 { e.2 -= 1 } else { e.1 = e.1.saturating_sub(1) }
+            if e.1 == 0 && e.2 == 0 {
+                w.swap_remove(i);
+            }
+        }
+        None => {}
+    }
+}
+
+/// Count up to `n` registered waiters on `uaddr` as woken; how many that was.
+fn claim(uaddr: u64, n: u32) -> u32 {
+    let mut w = WAITERS.lock().unwrap();
+    let Some(e) = w.iter_mut().find(|e| e.0 == uaddr) else { return 0 };
+    let k = e.1.min(n);
+    (e.1, e.2) = (e.1 - k, e.2 + k);
+    k
+}
+
+pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64) -> R {
     const FUTEX_CLOCK_REALTIME: u64 = 256;
     let cmd = op & 0x7f; // without FUTEX_PRIVATE_FLAG / CLOCK_REALTIME
     let cur = || unsafe { std::ptr::read_volatile(uaddr as *const u32) };
+    if uaddr % 4 != 0 {
+        return Err(EINVAL);
+    }
     match cmd {
         0 | 9 => {
             // FUTEX_WAIT (relative timeout), FUTEX_WAIT_BITSET (absolute). ponytail: bitsets ignored.
@@ -150,7 +182,11 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
             let ms = if timeout == 0 {
                 u32::MAX
             } else {
-                let [s, ns] = unsafe { *(timeout as *const [u64; 2]) };
+                let t = syscall::get_guest::<16>(timeout)?;
+                let [s, ns] = [0, 8].map(|i| u64::from_le_bytes(t[i..i + 8].try_into().unwrap()));
+                if (s as i64) < 0 || ns >= 1_000_000_000 {
+                    return Err(EINVAL);
+                }
                 let mut want = std::time::Duration::new(s, ns as u32);
                 if cmd == 9 {
                     let (s, ns) = syscall::now(if op & FUTEX_CLOCK_REALTIME != 0 { 0 } else { 1 });
@@ -170,9 +206,23 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
                 t.futex_addr.store(0, std::sync::atomic::Ordering::SeqCst);
                 return Err(crate::syscall::EINTR);
             }
-            let woke = unsafe { WaitOnAddress(uaddr as *const _, &expect as *const u32 as *const _, 4, ms) };
+            // NT may time a wait out a little early: wait out the rest, so a timeout is never short.
+            let deadline = (ms != u32::MAX).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+            waiting(uaddr, true);
+            let timed_out = loop {
+                // Rounded up, as above: a 0 ms wait would spin.
+                let left = deadline.map_or(u32::MAX, |d| d.saturating_duration_since(std::time::Instant::now()).as_micros().div_ceil(1000).min(u32::MAX as u128 - 1) as u32);
+                let woke = unsafe { WaitOnAddress(uaddr as *const _, &expect as *const u32 as *const _, 4, left) };
+                if woke != 0 || unsafe { GetLastError() } != 1460 || crate::signal::deliverable() || cur() != expect {
+                    break false; // woken, a signal, or a changed value (taken as a wake)
+                }
+                if deadline.is_none_or(|d| std::time::Instant::now() >= d) {
+                    break true;
+                }
+            };
+            waiting(uaddr, false);
             t.futex_addr.store(0, std::sync::atomic::Ordering::SeqCst);
-            if woke == 0 && unsafe { GetLastError() } == 1460 {
+            if timed_out && !crate::signal::deliverable() {
                 Err(ETIMEDOUT) // ERROR_TIMEOUT
             } else if crate::signal::deliverable() {
                 Err(crate::syscall::EINTR)
@@ -182,6 +232,7 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
         }
         1 | 10 => {
             // FUTEX_WAKE, FUTEX_WAKE_BITSET. Waking more than asked is a spurious wakeup, which is allowed.
+            syscall::check_guest(uaddr, 4, false)?; // EFAULT for an unmapped or PROT_NONE word
             if syscall::in_shared_view(uaddr) {
                 return Ok(shared_wake(uaddr, val as u32) as i64);
             }
@@ -190,10 +241,16 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
             } else if val > 1 {
                 unsafe { WakeByAddressAll(uaddr as *const _) };
             }
-            Ok(0)
+            Ok(claim(uaddr, val.min(u32::MAX as u64) as u32) as i64)
         }
         3 | 4 => {
             // FUTEX_REQUEUE / FUTEX_CMP_REQUEUE: wake everyone instead of moving them; they re-check.
+            // The count to wake (val) and to requeue (in the timeout argument) are ints.
+            if (val as i32) < 0 || (timeout as i32) < 0 {
+                return Err(EINVAL);
+            }
+            syscall::check_guest(uaddr, 4, false)?;
+            syscall::check_guest(uaddr2, 4, false)?;
             if cmd == 4 && cur() != val3 as u32 {
                 return Err(EAGAIN);
             }
@@ -201,7 +258,8 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> R {
                 return Ok(shared_wake(uaddr, u32::MAX) as i64);
             }
             unsafe { WakeByAddressAll(uaddr as *const _) };
-            Ok(0)
+            // Woken plus "requeued", as Linux counts them.
+            Ok(claim(uaddr, (val as u32).saturating_add(timeout as u32)) as i64)
         }
         _ => Err(ENOSYS),
     }
