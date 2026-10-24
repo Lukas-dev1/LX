@@ -1099,8 +1099,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         30 => shmat(a[0], a[1], a[2]),
         67 => shmdt(a[0], c.rsp),
         31 => shmctl(a[0], a[1], a[2]),
-        25 => mremap(a[0], a[1], a[2], a[3]),
-        26 => msync(a[0], a[1]),
+        25 => mremap(a[0], a[1], a[2], a[3], a[4]),
+        26 => msync(a[0], a[1], a[2]),
         27 => mincore(a[0], a[1], a[2]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
         13 => signal::sigaction(a[0], a[1], a[2]),
@@ -1556,8 +1556,15 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     const MAP_SHARED: u64 = 0x01;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
-    if len == 0 || addr % PAGE != 0 || off % PAGE != 0 {
+    if len == 0 || addr % PAGE != 0 || off % PAGE != 0 || flags & 3 == 0 { // MAP_SHARED, MAP_PRIVATE or both (_VALIDATE)
         return Err(EINVAL);
+    }
+    if flags & MAP_ANONYMOUS == 0 {
+        // A file mapping reads the file; a shared writable one writes it too.
+        let (read, write) = fs::map_access(fd)?;
+        if !read || flags & MAP_SHARED != 0 && prot & 2 != 0 && !write {
+            return Err(EACCES);
+        }
     }
     let len = len.next_multiple_of(PAGE);
     let reserve_only = prot == 0 && flags & MAP_ANONYMOUS != 0; // PROT_NONE: address space, no memory
@@ -1863,7 +1870,16 @@ pub fn in_shared_view(addr: u64) -> bool {
     VIEWS.lock().unwrap().iter().any(|v| (v.base..v.base + v.len).contains(&addr))
 }
 
-fn msync(addr: u64, len: u64) -> R {
+fn msync(addr: u64, len: u64, flags: u64) -> R {
+    const MS_ASYNC: u64 = 1;
+    const MS_SYNC: u64 = 4;
+    if addr % PAGE != 0 || flags & !7 != 0 || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC {
+        return Err(EINVAL);
+    }
+    let mut m = MemoryBasicInformation::default();
+    if unsafe { VirtualQuery(addr as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 || m.state == 0x10000 {
+        return Err(ENOMEM); // MEM_FREE: nothing mapped there
+    }
     unsafe { FlushViewOfFile(addr as *const _, len as usize) };
     Ok(0)
 }
@@ -1900,9 +1916,13 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> R {
 }
 
 /// Moves only (MREMAP_MAYMOVE): reservations can't grow in place. Keeps the old protection.
-fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
+fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -> R {
     const MREMAP_MAYMOVE: u64 = 1;
-    if new_len == 0 {
+    const MREMAP_FIXED: u64 = 2;
+    // MREMAP_FIXED needs MAYMOVE, an aligned target and one that doesn't overlap the old mapping.
+    let fixed = flags & MREMAP_FIXED != 0;
+    if new_len == 0 || old % PAGE != 0 || flags & !7 != 0 || fixed && (flags & MREMAP_MAYMOVE == 0 || new_addr % PAGE != 0
+        || new_addr < old + old_len && old < new_addr + new_len) {
         return Err(EINVAL);
     }
     // Unmapped is EFAULT before anything else: musl's pthread_getattr_np finds the main thread's stack
@@ -1924,7 +1944,9 @@ fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
     let new = alloc(None, new_len).ok_or(ENOMEM)?;
     unsafe { std::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, old_len.min(new_len) as usize) };
     protect(new, new_len.next_multiple_of(PAGE), m.protect);
-    munmap(old, old_len, 0)?;
+    if old_len != 0 {
+        munmap(old, old_len, 0)?;
+    }
     Ok(new as i64)
 }
 
@@ -2021,7 +2043,13 @@ fn shmctl(id: u64, cmd: u64, buf: u64) -> R {
     Ok(0)
 }
 
+/// The end of the user address space (x86-64 TASK_SIZE).
+const USER_END: u64 = 0x7fff_ffff_f000;
+
 fn munmap(addr: u64, len: u64, rsp: u64) -> R {
+    if addr % PAGE != 0 || len == 0 || addr.checked_add(len).is_none_or(|e| e > USER_END) {
+        return Err(EINVAL);
+    }
     let len = len.next_multiple_of(PAGE);
     // A thread unmapping its own stack is about to exit (musl's detached-thread exit does this); NT
     // still needs that stack to dispatch the final exit syscall, so leave it mapped.

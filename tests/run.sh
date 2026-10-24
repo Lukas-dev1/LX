@@ -183,6 +183,7 @@ expect "/proc/<pid>/stat: S for a process blocked in a syscall, R for one runnin
 expect "F_GETFL shows how a file was opened; FIONBIO makes a pipe non-blocking" 0 "rd=0 wr=1 rw=2 ap=1025 nb=True" -- run python:3.12-alpine python3 -c 'import os,fcntl; g=lambda fd: fcntl.fcntl(fd,fcntl.F_GETFL) & 0o3003; r,w=os.pipe(); os.set_blocking(r,False); print("rd=%d wr=%d rw=%d ap=%d nb=%s" % (g(os.open("/etc/hostname",0)), g(os.open("/tmp/a",os.O_WRONLY|os.O_CREAT)), g(os.open("/tmp/a",os.O_RDWR)), g(os.open("/tmp/a",os.O_WRONLY|os.O_APPEND)), not os.get_blocking(r)))'
 expect "F_GETLK names the holder of a conflicting lock (type, range, pid)" 0 "holder type=1 start=10 len=5 is_parent=True" -- run -v "$GUEST" python:3.12-alpine python3 /t/getlk.py
 expect "SIGPIPE on a write without a reader (default kills, Python gets EPIPE)" 0 "python EPIPE, default killed by 13" -- run -v "$GUEST" python:3.12-alpine python3 /t/sigpipe.py
+expect "mmap, munmap, msync, mremap and sendfile check their arguments" 0 "shared write on rdonly EACCES, read on wronly EACCES, private write on rdonly ok, bad fd EBADF, pipe ENODEV, no type EINVAL, munmap odd EINVAL, munmap 0 EINVAL, msync both EINVAL, msync odd EINVAL, mremap fixed EINVAL, sendfile to rdonly EBADF" -- run -v "$GUEST" python:3.12-alpine python3 /t/mapchecks.py
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]
