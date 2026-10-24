@@ -1186,7 +1186,12 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         22 => fs::pipe2(a[0], 0),
         21 => fs::faccessat(CWD, a[0], a[1]),
         28 => madvise(a[0], a[1], a[2]),
-        149..=152 | 325 => Ok(0), // mlock, munlock, mlockall, munlockall, mlock2. ponytail: pages may still be paged out
+        // mlock, munlock, mlockall, munlockall, mlock2: checked, then accepted. ponytail: pages may still be
+        // paged out. A range must be mapped (ENOMEM); mlockall takes MCL_CURRENT/FUTURE (+ONFAULT), mlock2 MLOCK_ONFAULT.
+        151 if a[0] == 0 || a[0] & !7 != 0 || a[0] & 3 == 0 => Err(EINVAL),
+        325 if a[2] & !1 != 0 => Err(EINVAL),
+        149 | 150 | 325 if !each_region(a[0] & !(PAGE - 1), (a[0] % PAGE + a[1]).next_multiple_of(PAGE), |_, _, st| st != 0x10000) => Err(ENOMEM),
+        149..=152 | 325 => Ok(0),
         140 => Ok(20), // getpriority: the raw call answers 20 - nice; everyone runs at nice 0 (rpm asks)
         141 => Ok(0),  // setpriority. ponytail: accepted, not applied
         32 => fs::dup(a[0], 0, false),
