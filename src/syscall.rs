@@ -1027,7 +1027,9 @@ fn guest_crash(rec: &ExceptionRecord, c: &Context) -> ! {
 ",
         rec.code, c.rip, code_file(c.rip), rec.info[1], m.state, m.protect, m.allocation_base, unsafe { GetCurrentThreadId() }, c.rsp, ts().fs);
     let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
-    proc::exit(139) // 128 + SIGSEGV, like a shell would report
+    // Killed by the fault's signal, so a parent's wait sees WIFSIGNALED (the container's first process
+    // still exits 128 + it, 139 for SIGSEGV).
+    proc::die(fault_signal(rec, c).map_or(11, |f| f.0))
 }
 
 /// The dispatch table. Linux ABI: nr in rax, args rdi rsi rdx r10 r8 r9, result (or -errno) in rax.
