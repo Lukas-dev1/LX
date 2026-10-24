@@ -1166,9 +1166,13 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         17 => fs::pread(a[0], a[1], a[2], a[3], false),
         18 => fs::pread(a[0], a[1], a[2], a[3], true),
         19 => fs::readv(a[0], a[1], a[2]),
-        327 | 328 if a[5] & !0x1f != 0 => Err(95), // preadv2/pwritev2: unknown RWF_* flags are EOPNOTSUPP (known ones are hints)
-        295 | 327 => fs::preadv(a[0], a[1], a[2], a[3], false), // preadv, preadv2
-        296 | 328 => fs::preadv(a[0], a[1], a[2], a[3], true),  // pwritev, pwritev2
+        // preadv2/pwritev2: unknown RWF_* flags are EOPNOTSUPP; the known ones are hints (HIPRI, DSYNC, SYNC,
+        // NOWAIT, ATOMIC, DONTCACHE) or about O_APPEND: RWF_APPEND, and RWF_NOAPPEND, which musl's pwrite
+        // passes to get POSIX pwrite on an O_APPEND fd.
+        327 | 328 if a[5] & !0xff != 0 => Err(95),
+        295 | 327 => fs::preadv(a[0], a[1], a[2], a[3], false, false), // preadv, preadv2
+        296 => fs::preadv(a[0], a[1], a[2], a[3], true, false),       // pwritev
+        328 => fs::preadv(a[0], a[1], a[2], a[3], true, a[5] & 0x20 != 0), // pwritev2
         285 => fs::fallocate(a[0], a[1], a[2], a[3]),
         37 => Ok(signal::set_alarm(a[0] * 1000, 0).0.div_ceil(1000) as i64), // alarm: the seconds left of the old one
         38 => setitimer(a[0], a[1], a[2]),
