@@ -568,12 +568,10 @@ fn bind_addr(s: usize, a: &mut [u8]) {
     if port == 0 {
         // An ephemeral port on loopback (a test server on 127.0.0.1:0) is where the container's clients of
         // 127.0.0.1 go: its own address. One on any address is usually a client's, which must keep
-        // reaching other hosts: left alone.
+        // reaching other hosts: left alone. One on ::1 stays there (see below).
         let Some(ip) = own_ip() else { return };
         if fam == AF_INET && a[4..8] == [127, 0, 0, 1] {
             a[4..8].copy_from_slice(&ip);
-        } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == LOOPBACK6 && !v6only(s) {
-            a[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
         }
         return;
     }
@@ -598,15 +596,12 @@ fn bind_addr(s: usize, a: &mut [u8]) {
         a[4..8].copy_from_slice(&ip);
     } else if fam == AF_INET6_WIN && a.len() >= 24 && (a[8..24] == [0; 16] || a[8..24] == LOOPBACK6) {
         // A dual-stack [::] listener answers IPv4 too (php-fpm's `listen = 9000`, clients dial 127.0.0.1):
-        // ::ffff:<ip>. An IPV6_V6ONLY one (nginx's [::]:80 next to its 0.0.0.0:80), or one on ::1, would
-        // take ::1, which every container shares: it gets a free port there instead, and the container's
-        // clients of ::1 reach its IPv4 address (dest_addr).
-        // ponytail: so a server listening on ::1 alone is unreachable.
+        // ::ffff:<ip>. An IPV6_V6ONLY one (nginx's [::]:80 next to its 0.0.0.0:80), or one on ::1, takes
+        // ::1 itself (Go's dual-stack servers, anything told to listen on ::1); the container's clients
+        // of ::1 go there when something listens on it, else to its IPv4 address (dest_addr).
+        // ponytail: ::1 is the host's, shared: two containers can't both listen on ::1 at one port.
         if v6only(s) || a[8..24] == LOOPBACK6 {
             a[8..24].copy_from_slice(&LOOPBACK6);
-            if own_ip().is_some() {
-                set_port(a, 0);
-            }
         } else {
             a[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
         }
@@ -663,9 +658,31 @@ fn dest_addr(s: usize, a: &mut [u8]) {
     let (Some(ip), false) = (own_ip(), port_of(a) == 53) else { return };
     if fam == AF_INET && a[4..8] == [127, 0, 0, 1] {
         a[4..8].copy_from_slice(&ip);
-    } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == LOOPBACK6 && !v6only(s) {
+    } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == LOOPBACK6 && !v6only(s) && !bound_to_loopback6(s) && !on_loopback6(s, port_of(a)) {
         a[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
     }
+}
+
+/// Whether s is bound to ::1 (Go's dialer binds a local address first): it can only reach ::1 then.
+fn bound_to_loopback6(s: usize) -> bool {
+    let (mut a, mut l) = ([0u8; 28], 28i32);
+    (unsafe { getsockname(s, a.as_mut_ptr(), &mut l) } == 0) && u16::from_le_bytes([a[0], a[1]]) == AF_INET6_WIN && a[8..24] == LOOPBACK6
+}
+
+/// Whether something has [::1]:port (of s's type): then a connection to ::1 goes there, as asked. Asked
+/// by trying to bind it, only for connections to ::1 (rare).
+fn on_loopback6(s: usize, port: u16) -> bool {
+    let probe = unsafe { socket(AF_INET6_WIN as i32, if is_udp(s) { 2 } else { 1 }, 0) };
+    if probe == usize::MAX {
+        return false;
+    }
+    let mut a = [0u8; 28];
+    a[..2].copy_from_slice(&AF_INET6_WIN.to_le_bytes());
+    a[2..4].copy_from_slice(&port.to_be_bytes());
+    a[8..24].copy_from_slice(&LOOPBACK6);
+    let taken = unsafe { bind(probe, a.as_ptr(), 28) } != 0 && unsafe { WSAGetLastError() } == 10048; // WSAEADDRINUSE
+    unsafe { closesocket(probe) };
+    taken
 }
 
 /// getsockname(): show the container port the program asked for.
