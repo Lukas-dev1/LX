@@ -172,7 +172,10 @@ impl EventFd {
         }
         let v = unsafe { *(buf as *const u64) };
         let mut c = self.count.lock().unwrap();
-        if v == u64::MAX || *c > u64::MAX - 1 - v {
+        if v == u64::MAX {
+            return Err(EINVAL); // the one value an eventfd can't hold
+        }
+        if *c > u64::MAX - 1 - v {
             return Err(crate::syscall::EAGAIN); // ponytail: a blocking writer would wait; nobody fills it that far
         }
         *c += v;
@@ -181,8 +184,9 @@ impl EventFd {
     }
 
     fn ready(&self, events: i16) -> i16 {
-        let readable = *self.count.lock().unwrap() > 0;
-        (if readable { events & POLLIN } else { 0 }) | (events & POLLOUT)
+        let c = *self.count.lock().unwrap();
+        // Writable while a write of 1 still fits (the count tops out at u64::MAX - 1).
+        (if c > 0 { events & POLLIN } else { 0 }) | (if c < u64::MAX - 1 { events & POLLOUT } else { 0 })
     }
 }
 
@@ -3145,6 +3149,7 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         // F_GETFL: the access mode (and O_APPEND) a file or pipe end was opened with, plus O_NONBLOCK.
         3 => with(|fs| match fs.fd(fd)? {
             Fd::Socket(s) => Ok(2 | if s.nonblocking() { O_NONBLOCK as i64 } else { 0 }),
+            Fd::Event(e) => Ok(2 | if e.nonblock.load(Relaxed) { O_NONBLOCK as i64 } else { 0 }),
             Fd::Pipe(p) if p.pty.is_some() => Ok(2 | if p.nonblocking() { O_NONBLOCK as i64 } else { 0 }),
             Fd::Pipe(p) => Ok(access_flags(p.raw()) | if p.nonblocking() { O_NONBLOCK as i64 } else { 0 }),
             Fd::File { f, .. } => Ok(access_flags(f.as_raw_handle() as isize)),
