@@ -1083,6 +1083,8 @@ const STRUCTS: &[(u64, usize, usize, bool, bool)] = &[
     (38, 1, 32, false, true), (38, 2, 32, true, true), // setitimer
     (36, 1, 32, true, false),                          // getitimer
     (99, 0, 112, true, false),                         // sysinfo
+    (4, 1, 144, true, false), (5, 1, 144, true, false), (6, 1, 144, true, false), (262, 2, 144, true, false), // stat, fstat, lstat, newfstatat
+    (137, 1, 120, true, false), (138, 1, 120, true, false), // statfs, fstatfs
     (63, 0, 390, true, false),                         // uname
     (22, 0, 8, true, false), (293, 0, 8, true, false), // pipe, pipe2
     (125, 0, 8, true, false), (125, 1, 24, true, true), // capget
