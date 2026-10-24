@@ -2154,22 +2154,49 @@ pub fn sendfile(out: u64, inp: u64, off: u64, count: u64) -> R {
     if off != 0 {
         crate::syscall::check_guest(off, 8, true)?; // EFAULT for a bad offset pointer, not a fault
     }
-    let mut buf = vec![0u8; count.min(1 << 16) as usize];
-    let n = if off != 0 {
-        pread(inp, buf.as_mut_ptr() as u64, buf.len() as u64, unsafe { *(off as *const u64) }, false)?
-    } else {
-        read(inp, buf.as_mut_ptr() as u64, buf.len() as u64)?
-    };
-    if n == 0 {
-        return Ok(0);
+    // Copy in 1 MB pieces until `count` is done, the input ends, the output takes less (a full socket)
+    // or a signal comes; an error after some went is that much sent, as on Linux.
+    let mut buf = vec![0u8; count.min(1 << 20) as usize];
+    let start = if off != 0 { unsafe { *(off as *const u64) } } else { 0 };
+    let mut total = 0u64;
+    while total < count {
+        let want = (count - total).min(buf.len() as u64);
+        let got = if off != 0 {
+            pread(inp, buf.as_mut_ptr() as u64, want, start + total, false)
+        } else {
+            read(inp, buf.as_mut_ptr() as u64, want)
+        };
+        let n = match got {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if total == 0 => return Err(e),
+            Err(_) => break,
+        };
+        let sent = match write(out, buf.as_ptr() as u64, n as u64) {
+            Ok(s) => s,
+            Err(e) => {
+                if off == 0 {
+                    let _ = lseek(inp, -n, 1); // give back what was read for nothing
+                }
+                if total == 0 { return Err(e) }
+                break;
+            }
+        };
+        total += sent as u64;
+        if sent < n {
+            if off == 0 {
+                lseek(inp, sent - n, 1)?; // give back what the socket didn't take
+            }
+            break;
+        }
+        if crate::signal::deliverable() {
+            break;
+        }
     }
-    let sent = write(out, buf.as_ptr() as u64, n as u64)?;
     if off != 0 {
-        unsafe { *(off as *mut u64) += sent as u64 };
-    } else if sent < n {
-        lseek(inp, sent - n, 1)?; // give back what the socket didn't take
+        unsafe { *(off as *mut u64) = start + total };
     }
-    Ok(sent)
+    Ok(total as i64)
 }
 
 /// pread64/pwrite64: I/O at an offset without moving the file position. NT's positioned I/O does
