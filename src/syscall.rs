@@ -1678,11 +1678,22 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
             let exec = prot & 4 != 0;
             let rw = if exec { 0x40 } else { PAGE_READWRITE }; // PAGE_EXECUTE_READWRITE
             sprot = rw;
+            // An executable section needs FILE_EXECUTE on the handle, which our opens never ask for (Linux
+            // only refuses PROT_EXEC on a noexec mount): map through a reopened handle that has it.
+            unsafe extern "system" {
+                fn ReOpenFile(h: isize, access: u32, share: u32, flags: u32) -> isize;
+            }
+            const GENERIC_EXECUTE: u32 = 0x2000_0000;
+            let x = if exec { unsafe { ReOpenFile(h, 0x8000_0000 | GENERIC_EXECUTE | if write { 0x4000_0000 } else { 0 }, 7, 0) } } else { -1 };
+            let h = if x != -1 { x } else { h };
             let mut s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), rw, 0, 0, std::ptr::null()) };
             if s == 0 && !write {
                 // A file opened read-only can still be mapped for reading.
                 sprot = if exec { 0x20 } else { 0x02 };
                 s = unsafe { CreateFileMappingW(h, std::ptr::null_mut(), sprot, 0, 0, std::ptr::null()) };
+            }
+            if x != -1 {
+                unsafe { CloseHandle(x) }; // the section keeps the file
             }
             if s == 0 {
                 return Err(EACCES);
