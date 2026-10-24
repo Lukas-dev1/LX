@@ -55,6 +55,7 @@ cc_static 2 rootfs/restarttest guest/restarttest.c
 cc_static 2 rootfs/ptimer guest/ptimer.c
 cc_static 2 rootfs/sysvipc guest/sysvipc.c
 cc_static 2 rootfs/epollet guest/epollet.c
+cc_static 2 rootfs/sigtrap guest/sigtrap.c
 cc_static 2 rootfs/pipenb guest/pipenb.c
 cc_static 2 rootfs/pipewait guest/pipewait.c
 cc_static 2 rootfs/setxid guest/setxid.c
@@ -109,6 +110,7 @@ expect "SA_RESTART: an interrupted read continues" 0 "read=1" -- rootfs /restart
 expect "POSIX timers: a periodic timer_create timer keeps firing" 0 "ticks=3 armed=1" -- rootfs /ptimer
 expect "SysV semaphores and message queues across fork" 0 "sysv waiting=1 got=hello n=16 child=0 nowait=EAGAIN/ENOMSG nsems=2 perm=1 info=1 stat=1 key=1 gone=1" -- rootfs /sysvipc
 expect "edge-triggered epoll: data arriving after a drain to EAGAIN is a new edge (pipe, eventfd)" 0 "epollet pipe=1 eventfd=1" -- rootfs /epollet
+expect "int3 in guest code: SIGTRAP with SI_KERNEL and rip past it" 0 "sigtrap hit=1 kernel=1 rip=1" -- rootfs /sigtrap
 expect "non-blocking pipe writes: EAGAIN when full (PIPE_BUF all or nothing), POLLOUT only with room, and its edge re-arms" 0 "pipenb first=1 filled=1 eagain=1 full-pollout=0 small-eagain=1 room=1 edge=1" -- rootfs /pipenb
 expect "a reader blocked in a big read leaves a non-blocking writer room (NT counts it against the quota); FIFOs too" 0 "pipewait blocked-reader=1 drained=1 fifo=1" -- rootfs /pipewait
 expect "setegid with threads blocked in a wait, a sleep and guest code: libc signals each, a sleeping one too" 0 "setxid r=0 egid=1 back=0" -- rootfs /setxid
