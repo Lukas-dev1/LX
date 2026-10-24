@@ -1288,7 +1288,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         158 if a[0] == 0x1003 => { unsafe { *(a[1] as *mut u64) = ts().fs }; Ok(0) } // ARCH_GET_FS
         158 => Err(EINVAL), // the rest (CET, AMX, CPUID faulting): not supported, as glibc's probes expect
         217 => fs::getdents64(a[0], a[1], a[2]),
-        202 => thread::futex(a[0], a[1], a[2], a[3], a[5]),
+        202 => thread::futex(a[0], a[1], a[2], a[3], a[4], a[5]),
         324 => thread::membarrier(a[0]),
         284 => fs::eventfd(a[0], 0),
         283 => fs::timerfd_create(a[0], a[1]),
