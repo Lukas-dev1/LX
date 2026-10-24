@@ -23,6 +23,7 @@ pub const ENOEXEC: i64 = 8;
 pub const ECHILD: i64 = 10;
 pub const EAGAIN: i64 = 11;
 pub const EPIPE: i64 = 32;
+pub const EMFILE: i64 = 24;
 pub const EBADF: i64 = 9;
 pub const ENOMEM: i64 = 12;
 pub const EACCES: i64 = 13;
@@ -1145,7 +1146,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         260 if a[4] & 0x1000 != 0 && cstr(a[1]).is_ok_and(|p| p.is_empty()) => fs::fchmeta(a[0], None, Some((a[2], a[3]))), // fchownat(AT_EMPTY_PATH)
         260 => fs::chmeta_at(a[0], a[1], a[4] & AT_SYMLINK_NOFOLLOW == 0, None, Some((a[2], a[3]))), // fchownat
         97 => rlimit(a[0], 0, a[1]),   // getrlimit
-        160 => Ok(0),                  // setrlimit: accepted, not enforced
+        160 => rlimit(a[0], a[1], 0),  // setrlimit
         302 => rlimit(a[1], a[2], a[3]), // prlimit64 (self only)
         98 => { unsafe { std::ptr::write_bytes(a[1] as *mut u8, 0, 144) }; Ok(0) } // getrusage: zeros
         99 => sysinfo(a[0]),
@@ -2213,21 +2214,24 @@ fn nanosleep(ts: u64, rem: u64) -> R {
     r
 }
 
-/// Limits like a Docker container's defaults (8 MB stack, the rest unlimited), except a 1024 soft
-/// open-file limit: without /proc/self/fd, apt and others fcntl every fd number up to it.
-/// ponytail: new limits are accepted but not enforced.
-fn rlimit(resource: u64, _new: u64, old: u64) -> R {
+/// Limits like a Docker container's defaults: 8 MB stack, 1024 open files (fs::nofile), the rest unlimited.
+/// ponytail: only RLIMIT_NOFILE is enforced; other new limits are accepted and ignored.
+fn rlimit(resource: u64, new: u64, old: u64) -> R {
     const INF: u64 = u64::MAX;
     if resource > 15 {
         return Err(EINVAL); // RLIMIT_NLIMITS is 16
     }
     let (cur, max) = match resource {
         3 => (8 << 20, INF),        // RLIMIT_STACK
-        7 => (1024, 1 << 20),       // RLIMIT_NOFILE
+        7 => fs::nofile().into(),   // RLIMIT_NOFILE
         _ => (INF, INF),
     };
     if old != 0 {
         put_guest(old, &as_bytes(&[cur, max]))?;
+    }
+    if new != 0 && resource == 7 {
+        let [cur, max] = unsafe { *(new as *const [u64; 2]) };
+        return fs::set_nofile(cur, max);
     }
     Ok(0)
 }

@@ -191,7 +191,7 @@ pub fn eventfd(init: u64, flags: u64) -> R {
     if flags & !(EFD_CLOEXEC | 0o4000 | 1) != 0 {
         return Err(EINVAL); // EFD_NONBLOCK, EFD_SEMAPHORE
     }
-    Ok(add_fd(Fd::Event(Arc::new(EventFd::new(init, flags))), flags & EFD_CLOEXEC != 0))
+    add_fd(Fd::Event(Arc::new(EventFd::new(init, flags))), flags & EFD_CLOEXEC != 0)
 }
 
 /// timerfd: an eventfd whose count a timer thread raises by the expirations since the last read, which
@@ -283,7 +283,7 @@ pub fn memfd_create(_name: u64, flags: u64) -> R {
     const MFD_CLOEXEC: u64 = 1;
     with(|fs| {
         let (f, host) = scratch_file(fs, b"").map_err(errno)?;
-        Ok(fs.add(Fd::File { f, host }, 0, flags & MFD_CLOEXEC != 0))
+        fs.add(Fd::File { f, host }, 0, flags & MFD_CLOEXEC != 0)
     })
 }
 
@@ -298,7 +298,7 @@ pub fn signalfd(fd: u64, mask: u64, _size: u64, flags: u64) -> R {
         });
     }
     let s = crate::signal::SignalFd { mask: mask.into(), nonblock: (flags & O_NONBLOCK != 0).into() };
-    Ok(add_fd(Fd::Signal(Arc::new(s)), flags & SFD_CLOEXEC != 0))
+    add_fd(Fd::Signal(Arc::new(s)), flags & SFD_CLOEXEC != 0)
 }
 
 #[derive(Clone, Copy)]
@@ -342,13 +342,16 @@ pub struct Pipe {
     /// Linux signals an edge on each arrival; we only see states, and a reader that drained it to EAGAIN
     /// while more came in before our next look would wait forever (cgo under go build: 6903 bytes unread).
     pub rearm: AtomicU32,
+    /// A non-blocking write found no room: POLLOUT waits for room again (see write_room for why a bare
+    /// zero quota doesn't mean full).
+    full: std::sync::atomic::AtomicBool,
 }
 
 impl Pipe {
     /// A pipe end from another lx process, `extra` as `extra()` made it.
     fn inherited(h: usize, extra: &str) -> Pipe {
         let pty = extra.get(2..).and_then(|n| n.parse().ok()).map(|n| (n, extra.as_bytes()[1] == b'm'));
-        Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: extra.starts_with('1').into(), pty, rearm: AtomicU32::new(0) }
+        Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: extra.starts_with('1').into(), pty, rearm: AtomicU32::new(0), full: false.into() }
     }
 
     fn extra(&self) -> String {
@@ -375,7 +378,8 @@ impl Pipe {
     }
 
     /// Free room in what this end writes into (FilePipeLocalInformation's WriteQuotaAvailable), if NT
-    /// says: a non-blocking write mustn't wait for the reader.
+    /// says. A pending read counts against it too: a reader blocked in read(>= the quota) shows 0 room in
+    /// an empty pipe, so 0 alone doesn't mean full (pipes get 1 MiB quotas to keep that rare).
     fn write_room(&self) -> Option<u32> {
         unsafe extern "system" {
             fn NtQueryInformationFile(h: isize, iosb: *mut [usize; 2], info: *mut u32, len: u32, class: u32) -> i32;
@@ -391,16 +395,7 @@ impl Pipe {
         const ERROR_IO_PENDING: u32 = 997;
         const ERROR_BROKEN_PIPE: u32 = 109;
         const ERROR_NO_DATA: u32 = 232;
-        let mut len = len.min(u32::MAX as u64) as u32;
-        // Non-blocking, a write takes what fits, all or nothing up to PIPE_BUF, as on Linux, rather than
-        // waiting for the reader (Go's netpoller writes its pipes so and then waits for POLLOUT).
-        if write && self.nonblocking() && let Some(room) = self.write_room() {
-            if room == 0 || (len <= 4096 && room < len) {
-                self.rearm.fetch_or(4, Relaxed); // POLLOUT: an edge-triggered waiter hears when there's room
-                return Err(crate::syscall::EAGAIN);
-            }
-            len = len.min(room); // ponytail: another writer may fill it before WriteFile, which then waits briefly
-        }
+        let len = len.min(u32::MAX as u64) as u32;
         if !write && self.nonblocking() {
             match self.available() {
                 Some(0) => return Err(crate::syscall::EAGAIN),
@@ -416,6 +411,22 @@ impl Pipe {
             if write { WriteFile(self.raw(), buf as *const u8, len, &mut done, op) } else { ReadFile(self.raw(), buf as *mut u8, len, &mut done, op) }
         };
         let mut err = if ok != 0 { 0 } else { unsafe { GetLastError() } };
+        // Non-blocking, a write takes what fits rather than waiting for the reader (Go's netpoller writes
+        // its pipes so, then waits for POLLOUT): one that would wait is cancelled, EAGAIN if nothing went.
+        // ponytail: a write up to PIPE_BUF may go in part (Linux: all or nothing).
+        if err == ERROR_IO_PENDING && write && self.nonblocking() {
+            unsafe { CancelIoEx(self.raw(), op) };
+            err = if unsafe { GetOverlappedResult(self.raw(), op, &mut done, 1) } != 0 { 0 } else { unsafe { GetLastError() } };
+            if done == 0 && err == 995 {
+                unsafe { CloseHandle(ev) };
+                self.full.store(true, Relaxed);
+                self.rearm.fetch_or(4, Relaxed); // POLLOUT: an edge-triggered waiter hears when there's room
+                return Err(crate::syscall::EAGAIN);
+            }
+        }
+        if write {
+            self.full.store(false, Relaxed);
+        }
         if err == ERROR_IO_PENDING {
             let intr = crate::signal::intr_event();
             let waits = if intr != 0 { vec![ev, intr] } else { vec![ev] };
@@ -454,7 +465,11 @@ impl Pipe {
         match self.available() {
             // A write end has no read access, so PeekNamedPipe is denied there: writable if there's room.
             None => match unsafe { crate::win::GetLastError() } {
-                5 => if self.write_room() == Some(0) { 0 } else { events & POLLOUT },
+                5 => match self.write_room() {
+                    Some(0) if self.full.load(Relaxed) => 0,
+                    Some(1..) => { self.full.store(false, Relaxed); events & POLLOUT }
+                    _ => events & POLLOUT,
+                },
                 230 | 536 => 0, // ERROR_BAD_PIPE, ERROR_PIPE_LISTENING: a FIFO reader whose writer hasn't come yet
                 _ => POLLHUP | (events & POLLIN),
             },
@@ -1112,16 +1127,17 @@ impl Fs {
         self.fds.get_mut(fd as usize).and_then(|f| f.as_mut()).map(|s| &mut s.fd).ok_or(EBADF)
     }
 
-    fn add(&mut self, fd: Fd, min: usize, cloexec: bool) -> i64 {
-        while self.fds.len() <= min {
-            self.fds.push(None);
+    /// The lowest free fd from `min` on; EMFILE past the open-file limit.
+    fn add(&mut self, fd: Fd, min: usize, cloexec: bool) -> R {
+        let i = (min..self.fds.len()).find(|&i| self.fds[i].is_none()).unwrap_or(self.fds.len().max(min));
+        if i as u64 >= nofile()[0] {
+            return Err(crate::syscall::EMFILE);
         }
-        let i = (min..self.fds.len()).find(|&i| self.fds[i].is_none()).unwrap_or_else(|| {
-            self.fds.push(None);
-            self.fds.len() - 1
-        });
+        if self.fds.len() <= i {
+            self.fds.resize_with(i + 1, || None);
+        }
         self.fds[i] = Some(Slot { fd, cloexec });
-        i as i64
+        Ok(i as i64)
     }
 }
 
@@ -1260,7 +1276,7 @@ pub fn import_fd(kind: &str, h: usize, extra: &str, cloexec: bool) -> R {
         "v" | "g" => import_counter(kind, extra).ok_or(EINVAL)?,
         _ => return Err(EINVAL),
     };
-    Ok(add_fd(fd, cloexec))
+    add_fd(fd, cloexec)
 }
 
 /// Rebuild the fd table from `proc_state` fields (in the new lx). Returns the unparsed rest.
@@ -1356,7 +1372,7 @@ pub fn pipe2(fds: u64, flags: u64) -> R {
     let name: Vec<u16> = format!("\\\\.\\pipe\\lx-{}-{n}", unsafe { GetCurrentProcessId() }).encode_utf16().chain([0]).collect();
     let r = unsafe {
         CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            0, 1, 65536, 65536, 0, std::ptr::null_mut()) // PIPE_TYPE_BYTE | PIPE_WAIT, one instance
+            0, 1, 65536, 1 << 20, 0, std::ptr::null_mut()) // PIPE_TYPE_BYTE | PIPE_WAIT, one instance; see write_room
     };
     if r == -1 {
         return Err(EIO);
@@ -1367,9 +1383,13 @@ pub fn pipe2(fds: u64, flags: u64) -> R {
         return Err(EIO);
     }
     let nonblock = flags & O_NONBLOCK != 0;
-    let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0) }));
+    let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0), full: false.into() }));
     let cloexec = flags & O_CLOEXEC != 0;
-    let (a, b) = with(|fs| (fs.add(own(r), 0, cloexec), fs.add(own(w), 0, cloexec)));
+    let (r, w) = (own(r), own(w));
+    let (a, b) = with(|fs| {
+        let a = fs.add(r, 0, cloexec)?;
+        fs.add(w, 0, cloexec).inspect_err(|_| fs.fds[a as usize] = None).map(|b| (a, b))
+    })?;
     unsafe { *(fds as *mut [i32; 2]) = [a as i32, b as i32] };
     Ok(0)
 }
@@ -1391,8 +1411,9 @@ pub fn internal_pipe(flags: u64) -> Result<(i64, OwnedHandle), i64> {
         unsafe { CloseHandle(r) };
         return Err(EIO);
     }
-    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0) };
-    Ok((add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0), unsafe { OwnedHandle::from_raw_handle(w as _) }))
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0), full: false.into() };
+    let w = unsafe { OwnedHandle::from_raw_handle(w as _) };
+    Ok((add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0)?, w))
 }
 
 /// The pipe handle behind `fd` (inotify finds its instance by it).
@@ -1521,7 +1542,33 @@ pub fn take_rearm(fd: i32) -> u32 {
     })
 }
 
-pub fn add_fd(fd: Fd, cloexec: bool) -> i64 {
+/// RLIMIT_NOFILE as [soft, hard]. The default is Docker's 1024 soft limit (apt and others fcntl every fd
+/// number up to it); what setrlimit sets goes to later lx processes (fork, exec) in LX_NOFILE.
+static NOFILE: Mutex<Option<[u64; 2]>> = Mutex::new(None);
+
+pub fn nofile() -> [u64; 2] {
+    *NOFILE.lock().unwrap().get_or_insert_with(|| {
+        let v = std::env::var("LX_NOFILE").unwrap_or_default();
+        match v.split(' ').filter_map(|x| x.parse().ok()).collect::<Vec<u64>>()[..] {
+            [cur, max] => [cur, max],
+            _ => [1024, 1 << 20],
+        }
+    })
+}
+
+pub fn set_nofile(cur: u64, max: u64) -> R {
+    if cur > max {
+        return Err(EINVAL);
+    }
+    if max > nofile()[1] {
+        return Err(crate::syscall::EPERM); // raising the hard limit takes CAP_SYS_RESOURCE, which Docker doesn't give
+    }
+    *NOFILE.lock().unwrap() = Some([cur, max]);
+    unsafe { std::env::set_var("LX_NOFILE", format!("{cur} {max}")) };
+    Ok(0)
+}
+
+pub fn add_fd(fd: Fd, cloexec: bool) -> R {
     with(|fs| fs.add(fd, 0, cloexec))
 }
 
@@ -1746,8 +1793,8 @@ fn pty_stat(pty: Option<(u32, bool)>) -> [u64; 18] {
 }
 
 fn add_pty(h: isize, n: u32, master: bool, flags: u64) -> R {
-    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: Some((n, master)), rearm: AtomicU32::new(0) };
-    Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: Some((n, master)), rearm: AtomicU32::new(0), full: false.into() };
+    add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0)
 }
 
 fn open_ptmx(flags: u64) -> R {
@@ -1773,7 +1820,7 @@ fn open_pts(n: u32, flags: u64) -> R {
         return with(|fs| {
             let mine = fs.fds.iter().flatten().find(|s| matches!(&s.fd, Fd::Pipe(p) if p.pty == Some((n, false))));
             let new = dup_fd(&mine.ok_or(if err == 2 { ENOENT } else { EIO })?.fd)?;
-            Ok(fs.add(new, 0, flags & O_CLOEXEC != 0))
+            fs.add(new, 0, flags & O_CLOEXEC != 0)
         });
     }
     add_pty(h, n, false, flags)
@@ -1835,8 +1882,8 @@ fn open_fifo(id: u64, flags: u64) -> R {
     } else {
         return fifo_reader(name, flags);
     };
-    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0) };
-    Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
+    let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0), full: false.into() };
+    add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0)
 }
 
 /// A FIFO's reader. Writers connect to its named pipe, any number of them: a broker thread keeps an
@@ -1905,7 +1952,7 @@ fn fifo_reader(name: Vec<u16>, flags: u64) -> R {
     };
     // Inbound, overlapped, byte mode, unlimited instances: the broker waits for one writer at a time. The
     // first one listens before open returns (s6-supervise opens its control FIFO for writing right after).
-    let listen = move || unsafe { CreateNamedPipeW(name.as_ptr(), 0x1 | 0x4000_0000, 0, 255, 65536, 65536, 0, std::ptr::null_mut()) };
+    let listen = move || unsafe { CreateNamedPipeW(name.as_ptr(), 0x1 | 0x4000_0000, 0, 255, 65536, 1 << 20, 0, std::ptr::null_mut()) };
     let mut next = listen();
     std::thread::spawn(move || loop {
         let inst = std::mem::replace(&mut next, -1);
@@ -1944,7 +1991,7 @@ fn fifo_reader(name: Vec<u16>, flags: u64) -> R {
             }
         });
     });
-    let fd = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0) };
+    let fd = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0), full: false.into() };
     if flags & 3 == 0 && flags & O_NONBLOCK == 0 {
         // Linux's open waits for a writer.
         while first.recv_timeout(std::time::Duration::from_millis(5)).is_err() {
@@ -1953,7 +2000,7 @@ fn fifo_reader(name: Vec<u16>, flags: u64) -> R {
             }
         }
     }
-    Ok(add_fd(Fd::Pipe(Arc::new(fd)), flags & O_CLOEXEC != 0))
+    add_fd(Fd::Pipe(Arc::new(fd)), flags & O_CLOEXEC != 0)
 }
 
 fn pty_ioctl(p: &Pipe, req: u64, arg: u64) -> R {
@@ -2300,6 +2347,9 @@ fn scratch_file(fs: &Fs, bytes: &[u8]) -> io::Result<(File, PathBuf)> {
 }
 
 pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
+    const O_PATH: u64 = 0o10000000;
+    // O_PATH ignores everything but these: no creating, truncating or access mode.
+    let flags = if flags & O_PATH != 0 { flags & (O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW) } else { flags };
     let cloexec = flags & O_CLOEXEC != 0;
     let (guest, host, meta) = with(|fs| fs.at_attrs(dirfd, path, flags & O_NOFOLLOW == 0))?;
     if let Some(n) = fd_alias(&guest) {
@@ -2323,24 +2373,23 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
     }
     with(|fs| {
         if let Some(d) = Dev::of(&guest) {
-            return Ok(fs.add(Fd::Dev(d), 0, cloexec));
+            return fs.add(Fd::Dev(d), 0, cloexec);
         }
         if let Some(text) = crate::procfs::file(&guest) {
             if flags & 3 != 0 { return Err(EACCES) } // ponytail: /proc/sys is read-only here
             let (f, host) = scratch_file(fs, text.as_bytes()).map_err(errno)?;
-            return Ok(fs.add(Fd::File { f, host }, 0, cloexec));
+            return fs.add(Fd::File { f, host }, 0, cloexec);
         }
         let mut host = host;
         if proc_dir(&guest).is_some() {
             if flags & 3 != 0 { return Err(EISDIR) }
-            return Ok(fs.add(Fd::Dir { guest, pos: 0 }, 0, cloexec));
+            return fs.add(Fd::Dir { guest, pos: 0 }, 0, cloexec);
         }
         if meta.is_none() && flags & O_CREAT == 0 {
             return Err(ENOENT); // the lookup just found nothing: no host open to fail
         }
         // An existing entry opens only as its mode allows the caller (O_TRUNC needs write too); O_PATH
         // only names it and needs nothing (fchdir, AT_EMPTY_PATH, a dirfd: Go's os.Root, find -execdir).
-        const O_PATH: u64 = 0o10000000;
         if let Some(m) = &meta && flags & O_PATH == 0 && fs.keeps_meta(&comps_of(&guest)) {
             let want = match flags & 3 { 0 => 4, 1 => 2, _ => 6 } | if flags & O_TRUNC != 0 { 2 } else { 0 };
             if !may_access(&host, m, want) {
@@ -2367,7 +2416,13 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
                 // access, so create it first, then open it read-only below.
                 OpenOptions::new().write(true).create(true).create_new(excl).open(&host).map_err(errno)?;
             }
-            let f = OpenOptions::new()
+            let mut o = OpenOptions::new();
+            if flags & O_PATH != 0 {
+                // Only attributes (fstat), so read and write fail with EBADF as on Linux.
+                use std::os::windows::fs::OpenOptionsExt;
+                o.access_mode(0x80 | 0x8 | 0x10_0000); // FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE
+            }
+            let f = o
                 .read(acc != 1)
                 .write(acc != 0)
                 .append(flags & O_APPEND != 0)
@@ -2385,7 +2440,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
             }
             Fd::File { f, host }
         };
-        Ok(fs.add(fd, 0, cloexec))
+        fs.add(fd, 0, cloexec)
     })
 }
 
@@ -2924,7 +2979,10 @@ fn dup_fd(fd: &Fd) -> Result<Fd, i64> {
 pub fn dup(fd: u64, min: u64, cloexec: bool) -> R {
     with(|fs| {
         let new = dup_fd(fs.fd(fd)?)?;
-        Ok(fs.add(new, min as usize, cloexec))
+        if min >= nofile()[0] {
+            return Err(EINVAL); // F_DUPFD past the limit
+        }
+        fs.add(new, min as usize, cloexec)
     })
 }
 
@@ -2934,7 +2992,7 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
             return fs.fd(old).map(|_| new as i64); // dup2(fd, fd) is a no-op
         }
         let d = dup_fd(fs.fd(old)?)?;
-        if new > 65535 { return Err(EBADF) }
+        if new >= nofile()[0] { return Err(EBADF) }
         while fs.fds.len() <= new as usize {
             fs.fds.push(None);
         }
