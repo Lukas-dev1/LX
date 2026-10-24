@@ -1033,8 +1033,10 @@ impl Fs {
         if path.is_empty() {
             return Err(ENOENT);
         }
-        if path.len() >= 4096 || path.split('/').any(|c| c.len() > 255) {
-            return Err(ENAMETOOLONG); // PATH_MAX, NAME_MAX
+        // NAME_MAX. PATH_MAX is the guest's argument only (cstr): through a directory fd, a path may be
+        // longer in all (Go's RemoveAll walks 4100 bytes deep), and its getdents resolves it whole.
+        if path.split('/').any(|c| c.len() > 255) {
+            return Err(ENAMETOOLONG);
         }
         // A trailing slash names a directory: a symlink there is followed, and a file is ENOTDIR.
         let want_dir = path.ends_with('/') && path.trim_end_matches('/') != "" && path.trim_end_matches('/') != ".";
