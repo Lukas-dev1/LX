@@ -2193,7 +2193,9 @@ fn read_console(h: isize, buf: u64, len: u64) -> R {
 }
 
 /// poll/ppoll: pipes are checked with PeekNamedPipe, console input by waiting on it, sockets with
-/// WSAPoll, files and devices are always ready. ponytail: re-checks in 1ms steps while nothing is ready.
+/// WSAPoll, files and devices are always ready. While nothing is ready, a set of sockets only (a server's
+/// accept loop: Python's socketserver polls every 0.5 s) sleeps in WSAPoll; others are re-checked in 1 ms
+/// steps. ponytail: that keeps pipes quick (subprocess) at the cost of a busy-ish wait.
 pub fn poll(fds: u64, n: u64, timeout_ms: i64) -> R {
     if n > 1024 {
         return Err(EINVAL);
@@ -2219,7 +2221,18 @@ pub fn poll(fds: u64, n: u64, timeout_ms: i64) -> R {
         if crate::signal::deliverable() {
             return Err(crate::syscall::EINTR);
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        let socks: Option<Vec<(usize, i16)>> = (0..n).map(|i| {
+            let e = unsafe { &*((fds + i * 8) as *const [i16; 4]) };
+            socket_of((e[0] as u16 as u32 | (e[1] as u16 as u32) << 16) as i32).map(|s| (s, e[2]))
+        }).collect();
+        match socks {
+            // Slices of 20 ms, as epoll_wait's: a signal (lx stop) is taken between them.
+            Some(s) if !s.is_empty() => {
+                let left = if timeout_ms < 0 { 20 } else { (timeout_ms - start.elapsed().as_millis() as i64).clamp(1, 20) };
+                crate::net::wait_sockets(&s, left as i32);
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
     }
 }
 
