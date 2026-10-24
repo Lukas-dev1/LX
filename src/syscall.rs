@@ -1559,6 +1559,12 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     if len == 0 || addr % PAGE != 0 || off % PAGE != 0 || flags & 3 == 0 { // MAP_SHARED, MAP_PRIVATE or both (_VALIDATE)
         return Err(EINVAL);
     }
+    // MAP_SHARED_VALIDATE: a flag this kernel doesn't know is EOPNOTSUPP rather than ignored.
+    const KNOWN: u64 = 0x3 | 0x10 | 0x20 | 0x40 | 0x100 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x1_0000
+        | 0x2_0000 | 0x4_0000 | 0x10_0000 | 0x400_0000 | 0x3f << 26;
+    if flags & 3 == 3 && flags & !KNOWN != 0 {
+        return Err(95); // EOPNOTSUPP
+    }
     if flags & MAP_ANONYMOUS == 0 {
         // A file mapping reads the file; a shared writable one writes it too.
         let (read, write) = fs::map_access(fd)?;
