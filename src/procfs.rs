@@ -41,6 +41,7 @@ Pss: {:>16} kB
         "/proc/cmdline" => "BOOT_IMAGE=/boot/vmlinuz-6.6.0-lx root=/dev/sda1 ro quiet\n".into(),
         "/proc/sys/kernel/tainted" => "0\n".into(), // nothing has tainted this kernel
         "/proc/sys/fs/pipe-max-size" => "1048576\n".into(),
+        "/proc/sys/kernel/core_pattern" => "core\n".into(), // see proc::dumps_core
         "/proc/sys/kernel/osrelease" => "6.6.0-lx\n".into(),
         "/proc/sys/kernel/pid_max" => "4194304\n".into(),
         "/proc/sys/kernel/ngroups_max" => "65536\n".into(), // NGROUPS_MAX: setgroups' limit
@@ -80,7 +81,15 @@ fn table_file(pid: u32, rest: &str) -> Option<String> {
 fn self_rest(guest: &str) -> Option<&str> {
     let r = guest.strip_prefix("/proc/")?;
     let (pid, rest) = r.split_once('/')?;
-    (pid == "self" || crate::proc::host_pid(pid.parse().ok()?) == crate::proc::pid()).then_some(rest)
+    (pid == "self" || crate::proc::host_pid(pid.parse().ok()?) == crate::proc::pid()).then_some(in_task(rest))
+}
+
+/// Below one of our process's own directories: `task/<tid>/x` (or `task/<tid>`) as `x`, for a tid of
+/// ours. ponytail: a thread's files are its process's (Go's setuid test compares their Uid lines).
+pub fn in_task(rest: &str) -> &str {
+    let Some(t) = rest.strip_prefix("task/") else { return rest };
+    let (tid, x) = t.split_once('/').unwrap_or((t, ""));
+    if tid.parse().is_ok_and(|n: u32| crate::thread::tids().contains(&n)) { x } else { rest }
 }
 
 /// The machine's CPU times (in 1/100 s ticks) and boot time: ps reads btime, top the cpu lines.
