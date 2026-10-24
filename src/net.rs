@@ -864,13 +864,13 @@ pub fn sys_socket(domain: u64, ty: u64, proto: u64) -> R {
         }
         let mut sock = unix_dgram(ty & SOCK_NONBLOCK != 0)?;
         (sock.udgram, sock.netlink) = (false, true);
-        return Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0));
+        return fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0);
     }
     let af = family(domain)?;
     let base = (ty & 0xf) as i32; // SOCK_STREAM 1, SOCK_DGRAM 2, SOCK_RAW 3: same numbers
     if af == 1 && base == 2 {
         let sock = unix_dgram(ty & SOCK_NONBLOCK != 0)?;
-        return Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0));
+        return fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0);
     }
     if af == 1 && base != 1 {
         return Err(93); // EPROTONOSUPPORT: Windows has stream AF_UNIX sockets only
@@ -884,7 +884,7 @@ pub fn sys_socket(domain: u64, ty: u64, proto: u64) -> R {
         unsafe { setsockopt(s, 41, 27, (&off as *const i32).cast(), 4) };
     }
     let sock = Sock::new(s, ty & SOCK_NONBLOCK != 0);
-    Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0))
+    fs::add_fd(Fd::Socket(Arc::new(sock)), ty & SOCK_CLOEXEC != 0)
 }
 
 /// socketpair: Windows has no AF_UNIX pairs. A stream pair is two native AF_UNIX sockets met through a
@@ -894,8 +894,8 @@ pub fn sys_socketpair(_domain: u64, ty: u64, _proto: u64, out: u64) -> R {
     init();
     let (nb, cx) = (ty & SOCK_NONBLOCK != 0, ty & SOCK_CLOEXEC != 0);
     let (x, y) = if ty & 0xf == 2 { dgram_pair(nb)? } else { stream_pair(nb)? };
-    let a = fs::add_fd(Fd::Socket(Arc::new(x)), cx);
-    let b = fs::add_fd(Fd::Socket(Arc::new(y)), cx);
+    let a = fs::add_fd(Fd::Socket(Arc::new(x)), cx)?;
+    let b = fs::add_fd(Fd::Socket(Arc::new(y)), cx).inspect_err(|_| _ = fs::close(a as u64))?;
     unsafe { *(out as *mut [i32; 2]) = [a as i32, b as i32] };
     Ok(0)
 }
@@ -1029,7 +1029,7 @@ pub fn sys_accept(fd: u64, addr: u64, lenp: u64, flags: u64) -> R {
         addr_out(&new.1, addr, lenp);
     }
     let sock = Sock::new(new.0, flags & SOCK_NONBLOCK != 0);
-    Ok(fs::add_fd(Fd::Socket(Arc::new(sock)), flags & SOCK_CLOEXEC != 0))
+    fs::add_fd(Fd::Socket(Arc::new(sock)), flags & SOCK_CLOEXEC != 0)
 }
 
 fn so_error(s: usize) -> i64 {
@@ -1498,7 +1498,7 @@ pub fn sys_epoll_create(flags: u64) -> R {
     if flags & !0o2000000 != 0 {
         return Err(EINVAL); // only EPOLL_CLOEXEC
     }
-    Ok(fs::add_fd(Fd::Epoll(Arc::new(Mutex::new(Epoll::default()))), flags & 0o2000000 != 0))
+    fs::add_fd(Fd::Epoll(Arc::new(Mutex::new(Epoll::default()))), flags & 0o2000000 != 0)
 }
 
 pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, ev: u64) -> R {

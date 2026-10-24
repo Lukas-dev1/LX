@@ -23,6 +23,7 @@ pub const ENOEXEC: i64 = 8;
 pub const ECHILD: i64 = 10;
 pub const EAGAIN: i64 = 11;
 pub const EPIPE: i64 = 32;
+pub const EMFILE: i64 = 24;
 pub const EBADF: i64 = 9;
 pub const ENOMEM: i64 = 12;
 pub const EACCES: i64 = 13;
@@ -485,7 +486,7 @@ fn alloc_ex(fixed: Option<u64>, len: u64, commit: bool) -> Option<u64> {
         },
         None => loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 return None;
             }
             if at(a) == a {
@@ -1124,8 +1125,8 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         30 => shmat(a[0], a[1], a[2]),
         67 => shmdt(a[0], c.rsp),
         31 => shmctl(a[0], a[1], a[2]),
-        25 => mremap(a[0], a[1], a[2], a[3]),
-        26 => msync(a[0], a[1]),
+        25 => mremap(a[0], a[1], a[2], a[3], a[4]),
+        26 => msync(a[0], a[1], a[2]),
         27 => mincore(a[0], a[1], a[2]),
         12 => Ok(0),                   // brk: always "fails"; musl and glibc fall back to mmap
         13 | 14 if a[3] != 8 => Err(EINVAL), // rt_sigaction, rt_sigprocmask: sigsetsize must be the kernel's
@@ -1171,7 +1172,7 @@ fn dispatch_nr(c: &mut Context, a: [u64; 6]) -> i64 {
         260 if a[4] & 0x1000 != 0 && cstr(a[1]).is_ok_and(|p| p.is_empty()) => fs::fchmeta(a[0], None, Some((a[2], a[3]))), // fchownat(AT_EMPTY_PATH)
         260 => fs::chmeta_at(a[0], a[1], a[4] & AT_SYMLINK_NOFOLLOW == 0, None, Some((a[2], a[3]))), // fchownat
         97 => rlimit(a[0], 0, a[1]),   // getrlimit
-        160 => Ok(0),                  // setrlimit: accepted, not enforced
+        160 => rlimit(a[0], a[1], 0),  // setrlimit
         302 => rlimit(a[1], a[2], a[3]), // prlimit64 (self only)
         98 => { unsafe { std::ptr::write_bytes(a[1] as *mut u8, 0, 144) }; Ok(0) } // getrusage: zeros
         99 => sysinfo(a[0]),
@@ -1592,8 +1593,25 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     const MAP_SHARED: u64 = 0x01;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
-    if len == 0 || addr % PAGE != 0 || off % PAGE != 0 {
+    const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+    if len == 0 || addr % PAGE != 0 || off % PAGE != 0 || flags & 3 == 0 { // MAP_SHARED, MAP_PRIVATE or both (_VALIDATE)
         return Err(EINVAL);
+    }
+    if len > USER_END {
+        return Err(ENOMEM); // more than the address space (Go's TestMmapErrorSign)
+    }
+    // MAP_SHARED_VALIDATE: a flag this kernel doesn't know is EOPNOTSUPP rather than ignored.
+    const KNOWN: u64 = 0x3 | 0x10 | 0x20 | 0x40 | 0x100 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x1_0000
+        | 0x2_0000 | 0x4_0000 | 0x10_0000 | 0x400_0000 | 0x3f << 26;
+    if flags & 3 == 3 && flags & !KNOWN != 0 {
+        return Err(95); // EOPNOTSUPP
+    }
+    if flags & MAP_ANONYMOUS == 0 {
+        // A file mapping reads the file; a shared writable one writes it too.
+        let (read, write) = fs::map_access(fd)?;
+        if !read || flags & MAP_SHARED != 0 && prot & 2 != 0 && !write {
+            return Err(EACCES);
+        }
     }
     let len = len.next_multiple_of(PAGE);
     let reserve_only = prot == 0 && flags & MAP_ANONYMOUS != 0; // PROT_NONE: address space, no memory
@@ -1604,7 +1622,10 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     // a MAP_FIXED first cuts any copy-on-write view out of its way.
     let fixed = flags & MAP_FIXED != 0;
     let holes = if fixed { punch_views(addr, len) } else { Vec::new() };
-    let cow = if flags & MAP_ANONYMOUS == 0 { mmap_cow(addr, len, prot, fixed, fd, off, &holes) } else { None };
+    // MAP_FIXED_NOREPLACE: exactly at addr, never over an existing mapping (a private file copy: the
+    // copy-on-write views pick their own place). ponytail: MAP_SHARED ignores it.
+    let noreplace = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) == MAP_FIXED_NOREPLACE;
+    let cow = if flags & MAP_ANONYMOUS == 0 && !noreplace { mmap_cow(addr, len, prot, fixed, fd, off, &holes) } else { None };
     if cow.is_none() {
         for &(a, n) in &holes {
             place_plain(a, n, false); // ordinary reserved memory for the paths below
@@ -1626,6 +1647,9 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> R {
     } else {
         // A free hint is honored, like Linux (Go places its heap with hints); otherwise our own window.
         let hinted = (addr != 0).then(|| alloc_ex(Some(addr), len, !reserve_only)).flatten();
+        if noreplace && hinted != Some(addr) {
+            return Err(EEXIST);
+        }
         hinted.or_else(|| alloc_ex(None, len, !reserve_only)).ok_or(ENOMEM)?
     };
     if reserve_only {
@@ -1756,7 +1780,7 @@ fn mmap_shared(addr: u64, len: u64, prot: u64, fixed: bool, file: Option<u64>, o
     } else {
         loop {
             let a = NEXT.fetch_add(vlen.next_multiple_of(0x10000), Relaxed);
-            if a + vlen > WINDOW.1 {
+            if a.checked_add(vlen).is_none_or(|e| e > WINDOW.1) {
                 unsafe { CloseHandle(section) };
                 return Err(ENOMEM);
             }
@@ -1795,7 +1819,7 @@ fn mmap_growable(section: isize, sprot: u32, access: u32, fd: u64, off: u64, vle
     };
     let base = loop {
         let a = NEXT.fetch_add(full.next_multiple_of(0x10000), Relaxed);
-        if a + full > WINDOW.1 {
+        if a.checked_add(full).is_none_or(|e| e > WINDOW.1) {
             return fail(ENOMEM);
         }
         if unsafe { VirtualAlloc2(0, a as *mut _, full as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0) } as u64 == a {
@@ -1899,7 +1923,16 @@ pub fn in_shared_view(addr: u64) -> bool {
     VIEWS.lock().unwrap().iter().any(|v| (v.base..v.base + v.len).contains(&addr))
 }
 
-fn msync(addr: u64, len: u64) -> R {
+fn msync(addr: u64, len: u64, flags: u64) -> R {
+    const MS_ASYNC: u64 = 1;
+    const MS_SYNC: u64 = 4;
+    if addr % PAGE != 0 || flags & !7 != 0 || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC {
+        return Err(EINVAL);
+    }
+    let mut m = MemoryBasicInformation::default();
+    if unsafe { VirtualQuery(addr as *const _, &mut m, size_of::<MemoryBasicInformation>()) } == 0 || m.state == 0x10000 {
+        return Err(ENOMEM); // MEM_FREE: nothing mapped there
+    }
     unsafe { FlushViewOfFile(addr as *const _, len as usize) };
     Ok(0)
 }
@@ -1936,9 +1969,16 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> R {
 }
 
 /// Moves only (MREMAP_MAYMOVE): reservations can't grow in place. Keeps the old protection.
-fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
+fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -> R {
     const MREMAP_MAYMOVE: u64 = 1;
-    if new_len == 0 {
+    const MREMAP_FIXED: u64 = 2;
+    // MREMAP_FIXED needs MAYMOVE, an aligned target and one that doesn't overlap the old mapping.
+    let fixed = flags & MREMAP_FIXED != 0;
+    if new_len > USER_END {
+        return Err(ENOMEM);
+    }
+    if new_len == 0 || old % PAGE != 0 || flags & !7 != 0 || fixed && (flags & MREMAP_MAYMOVE == 0 || new_addr % PAGE != 0
+        || new_addr < old + old_len && old < new_addr + new_len) {
         return Err(EINVAL);
     }
     // Unmapped is EFAULT before anything else: musl's pthread_getattr_np finds the main thread's stack
@@ -1960,7 +2000,9 @@ fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) -> R {
     let new = alloc(None, new_len).ok_or(ENOMEM)?;
     unsafe { std::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, old_len.min(new_len) as usize) };
     protect(new, new_len.next_multiple_of(PAGE), m.protect);
-    munmap(old, old_len, 0)?;
+    if old_len != 0 {
+        munmap(old, old_len, 0)?;
+    }
     Ok(new as i64)
 }
 
@@ -2070,7 +2112,13 @@ fn shmctl(id: u64, cmd: u64, buf: u64) -> R {
     Ok(0)
 }
 
+/// The end of the user address space (x86-64 TASK_SIZE).
+const USER_END: u64 = 0x7fff_ffff_f000;
+
 fn munmap(addr: u64, len: u64, rsp: u64) -> R {
+    if addr % PAGE != 0 || len == 0 || addr.checked_add(len).is_none_or(|e| e > USER_END) {
+        return Err(EINVAL);
+    }
     let len = len.next_multiple_of(PAGE);
     // A thread unmapping its own stack is about to exit (musl's detached-thread exit does this); NT
     // still needs that stack to dispatch the final exit syscall, so leave it mapped.
@@ -2222,21 +2270,24 @@ fn nanosleep(ts: u64, rem: u64) -> R {
     r
 }
 
-/// Limits like a Docker container's defaults (8 MB stack, the rest unlimited), except a 1024 soft
-/// open-file limit: without /proc/self/fd, apt and others fcntl every fd number up to it.
-/// ponytail: new limits are accepted but not enforced.
-fn rlimit(resource: u64, _new: u64, old: u64) -> R {
+/// Limits like a Docker container's defaults: 8 MB stack, 1024 open files (fs::nofile), the rest unlimited.
+/// ponytail: only RLIMIT_NOFILE is enforced; other new limits are accepted and ignored.
+fn rlimit(resource: u64, new: u64, old: u64) -> R {
     const INF: u64 = u64::MAX;
     if resource > 15 {
         return Err(EINVAL); // RLIMIT_NLIMITS is 16
     }
     let (cur, max) = match resource {
         3 => (8 << 20, INF),        // RLIMIT_STACK
-        7 => (1024, 1 << 20),       // RLIMIT_NOFILE
+        7 => fs::nofile().into(),   // RLIMIT_NOFILE
         _ => (INF, INF),
     };
     if old != 0 {
         put_guest(old, &as_bytes(&[cur, max]))?;
+    }
+    if new != 0 && resource == 7 {
+        let [cur, max] = unsafe { *(new as *const [u64; 2]) };
+        return fs::set_nofile(cur, max);
     }
     Ok(0)
 }
@@ -2498,7 +2549,7 @@ pub fn map_image(host: &std::path::Path, segs: &[ImageSeg], fixed: bool, lo: u64
     } else {
         loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 break None;
             }
             if reserve(a) == a {
@@ -2878,7 +2929,7 @@ fn mmap_cow(addr: u64, len: u64, prot: u64, fixed: bool, fd: u64, off: u64, hole
     } else {
         let a = loop {
             let a = NEXT.fetch_add(len.next_multiple_of(0x10000), Relaxed);
-            if a + len > WINDOW.1 {
+            if a.checked_add(len).is_none_or(|e| e > WINDOW.1) {
                 unsafe { CloseHandle(section) };
                 return None;
             }

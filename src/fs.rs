@@ -191,7 +191,7 @@ pub fn eventfd(init: u64, flags: u64) -> R {
     if flags & !(EFD_CLOEXEC | 0o4000 | 1) != 0 {
         return Err(EINVAL); // EFD_NONBLOCK, EFD_SEMAPHORE
     }
-    Ok(add_fd(Fd::Event(Arc::new(EventFd::new(init, flags))), flags & EFD_CLOEXEC != 0))
+    add_fd(Fd::Event(Arc::new(EventFd::new(init, flags))), flags & EFD_CLOEXEC != 0)
 }
 
 /// timerfd: an eventfd whose count a timer thread raises by the expirations since the last read, which
@@ -291,7 +291,7 @@ pub fn memfd_create(_name: u64, flags: u64) -> R {
     const MFD_CLOEXEC: u64 = 1;
     with(|fs| {
         let (f, host) = scratch_file(fs, b"").map_err(errno)?;
-        Ok(fs.add(Fd::File { f, host }, 0, flags & MFD_CLOEXEC != 0))
+        fs.add(Fd::File { f, host }, 0, flags & MFD_CLOEXEC != 0)
     })
 }
 
@@ -306,7 +306,7 @@ pub fn signalfd(fd: u64, mask: u64, _size: u64, flags: u64) -> R {
         });
     }
     let s = crate::signal::SignalFd { mask: mask.into(), nonblock: (flags & O_NONBLOCK != 0).into() };
-    Ok(add_fd(Fd::Signal(Arc::new(s)), flags & SFD_CLOEXEC != 0))
+    add_fd(Fd::Signal(Arc::new(s)), flags & SFD_CLOEXEC != 0)
 }
 
 #[derive(Clone, Copy)]
@@ -545,8 +545,15 @@ pub struct Attrs {
     pub len: u64,
     /// Last write time, ns since the Unix epoch.
     pub mtime: u64,
+    /// Last access time, likewise (NTFS updates it lazily, but utimensat sets it).
+    pub atime: u64,
     /// Carries MARKER_ATTR: may be one of our marker files.
     pub marker: bool,
+}
+
+/// A FILETIME (100 ns ticks since 1601) as ns since the Unix epoch.
+fn unix_ns(ft: u64) -> u64 {
+    ft.saturating_sub(116_444_736_000_000_000).saturating_mul(100)
 }
 
 pub fn attrs(p: &Path) -> Option<Attrs> {
@@ -556,11 +563,12 @@ pub fn attrs(p: &Path) -> Option<Attrs> {
     if unsafe { crate::win::GetFileAttributesExW(w.as_ptr(), 0, &mut d) } == 0 {
         return None;
     }
-    let write = (d[6] as u64) << 32 | d[5] as u64; // 100 ns ticks since 1601
+    let (access, write) = ((d[4] as u64) << 32 | d[3] as u64, (d[6] as u64) << 32 | d[5] as u64); // 100 ns ticks since 1601
     Some(Attrs {
         dir: d[0] & 0x10 != 0, // FILE_ATTRIBUTE_DIRECTORY
         len: (d[7] as u64) << 32 | d[8] as u64,
-        mtime: write.saturating_sub(116_444_736_000_000_000).saturating_mul(100),
+        mtime: unix_ns(write),
+        atime: unix_ns(access),
         marker: d[0] & MARKER_ATTR != 0,
     })
 }
@@ -579,8 +587,8 @@ fn lower_attrs(p: &Path) -> Option<Attrs> {
     let listing = cached.unwrap_or_else(|| {
         let entry = |e: fs::DirEntry| {
             let m = e.metadata().ok()?;
-            let mtime = m.last_write_time().saturating_sub(116_444_736_000_000_000).saturating_mul(100);
-            Some((e.file_name(), Attrs { dir: m.is_dir(), len: m.file_size(), mtime, marker: m.file_attributes() & MARKER_ATTR != 0 }))
+            let (mtime, atime) = (unix_ns(m.last_write_time()), unix_ns(m.last_access_time()));
+            Some((e.file_name(), Attrs { dir: m.is_dir(), len: m.file_size(), mtime, atime, marker: m.file_attributes() & MARKER_ATTR != 0 }))
         };
         let l: Listing = Arc::new(fs::read_dir(dir).map(|rd| rd.flatten().filter_map(entry).collect()).unwrap_or_default());
         DIRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(dir.to_path_buf(), l.clone());
@@ -1028,6 +1036,9 @@ impl Fs {
         if path.len() >= 4096 || path.split('/').any(|c| c.len() > 255) {
             return Err(ENAMETOOLONG); // PATH_MAX, NAME_MAX
         }
+        // A trailing slash names a directory: a symlink there is followed, and a file is ENOTDIR.
+        let want_dir = path.ends_with('/') && path.trim_end_matches('/') != "" && path.trim_end_matches('/') != ".";
+        let follow = follow || want_dir;
         let mut todo = split(path);
         let mut comps: Vec<String> = if path.starts_with('/') { vec![] } else { split(dir).into() };
         let mut hops = 0;
@@ -1070,11 +1081,23 @@ impl Fs {
                     next.extend(todo.drain(..));
                     todo = next;
                 } else {
+                    // A path goes on only through a directory (or a mount, or /proc, /sys and /dev, which
+                    // are made up after this): else creating /a/b would quietly make /a in the upper layer.
+                    if !todo.is_empty() && !matches!(comps[0].as_str(), "proc" | "sys" | "dev") && self.mount_of(&comps).is_none() {
+                        match &meta {
+                            None => return Err(ENOENT),
+                            Some(m) if !m.dir => return Err(ENOTDIR),
+                            _ => {}
+                        }
+                    }
                     last = Some((host, meta));
                 }
             }
         }
         let (host, meta) = last.unwrap_or_else(|| self.host_meta_below(&comps, not_in_upper, Some(seen)));
+        if want_dir && meta.as_ref().is_some_and(|m| !m.dir) && self.mount_of(&comps).is_none() {
+            return Err(ENOTDIR);
+        }
         Ok((format!("/{}", comps.join("/")), host, meta))
     }
 
@@ -1135,16 +1158,17 @@ impl Fs {
         self.fds.get_mut(fd as usize).and_then(|f| f.as_mut()).map(|s| &mut s.fd).ok_or(EBADF)
     }
 
-    fn add(&mut self, fd: Fd, min: usize, cloexec: bool) -> i64 {
-        while self.fds.len() <= min {
-            self.fds.push(None);
+    /// The lowest free fd from `min` on; EMFILE past the open-file limit.
+    fn add(&mut self, fd: Fd, min: usize, cloexec: bool) -> R {
+        let i = (min..self.fds.len()).find(|&i| self.fds[i].is_none()).unwrap_or(self.fds.len().max(min));
+        if i as u64 >= nofile()[0] {
+            return Err(crate::syscall::EMFILE);
         }
-        let i = (min..self.fds.len()).find(|&i| self.fds[i].is_none()).unwrap_or_else(|| {
-            self.fds.push(None);
-            self.fds.len() - 1
-        });
+        if self.fds.len() <= i {
+            self.fds.resize_with(i + 1, || None);
+        }
         self.fds[i] = Some(Slot { fd, cloexec });
-        i as i64
+        Ok(i as i64)
     }
 }
 
@@ -1283,7 +1307,7 @@ pub fn import_fd(kind: &str, h: usize, extra: &str, cloexec: bool) -> R {
         "v" | "g" => import_counter(kind, extra).ok_or(EINVAL)?,
         _ => return Err(EINVAL),
     };
-    Ok(add_fd(fd, cloexec))
+    add_fd(fd, cloexec)
 }
 
 /// Rebuild the fd table from `proc_state` fields (in the new lx). Returns the unparsed rest.
@@ -1392,7 +1416,11 @@ pub fn pipe2(fds: u64, flags: u64) -> R {
     let nonblock = flags & O_NONBLOCK != 0;
     let own = |h: isize| Fd::Pipe(Arc::new(Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0), full: false.into() }));
     let cloexec = flags & O_CLOEXEC != 0;
-    let (a, b) = with(|fs| (fs.add(own(r), 0, cloexec), fs.add(own(w), 0, cloexec)));
+    let (r, w) = (own(r), own(w));
+    let (a, b) = with(|fs| {
+        let a = fs.add(r, 0, cloexec)?;
+        fs.add(w, 0, cloexec).inspect_err(|_| fs.fds[a as usize] = None).map(|b| (a, b))
+    })?;
     unsafe { *(fds as *mut [i32; 2]) = [a as i32, b as i32] };
     Ok(0)
 }
@@ -1415,7 +1443,8 @@ pub fn internal_pipe(flags: u64) -> Result<(i64, OwnedHandle), i64> {
         return Err(EIO);
     }
     let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(r as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: None, rearm: AtomicU32::new(0), full: false.into() };
-    Ok((add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0), unsafe { OwnedHandle::from_raw_handle(w as _) }))
+    let w = unsafe { OwnedHandle::from_raw_handle(w as _) };
+    Ok((add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0)?, w))
 }
 
 /// The pipe handle behind `fd` (inotify finds its instance by it).
@@ -1544,7 +1573,33 @@ pub fn take_rearm(fd: i32) -> u32 {
     })
 }
 
-pub fn add_fd(fd: Fd, cloexec: bool) -> i64 {
+/// RLIMIT_NOFILE as [soft, hard]. The default is Docker's 1024 soft limit (apt and others fcntl every fd
+/// number up to it); what setrlimit sets goes to later lx processes (fork, exec) in LX_NOFILE.
+static NOFILE: Mutex<Option<[u64; 2]>> = Mutex::new(None);
+
+pub fn nofile() -> [u64; 2] {
+    *NOFILE.lock().unwrap().get_or_insert_with(|| {
+        let v = std::env::var("LX_NOFILE").unwrap_or_default();
+        match v.split(' ').filter_map(|x| x.parse().ok()).collect::<Vec<u64>>()[..] {
+            [cur, max] => [cur, max],
+            _ => [1024, 1 << 20],
+        }
+    })
+}
+
+pub fn set_nofile(cur: u64, max: u64) -> R {
+    if cur > max {
+        return Err(EINVAL);
+    }
+    if max > nofile()[1] {
+        return Err(crate::syscall::EPERM); // raising the hard limit takes CAP_SYS_RESOURCE, which Docker doesn't give
+    }
+    *NOFILE.lock().unwrap() = Some([cur, max]);
+    unsafe { std::env::set_var("LX_NOFILE", format!("{cur} {max}")) };
+    Ok(0)
+}
+
+pub fn add_fd(fd: Fd, cloexec: bool) -> R {
     with(|fs| fs.add(fd, 0, cloexec))
 }
 
@@ -1770,7 +1825,7 @@ fn pty_stat(pty: Option<(u32, bool)>) -> [u64; 18] {
 
 fn add_pty(h: isize, n: u32, master: bool, flags: u64) -> R {
     let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: (flags & O_NONBLOCK != 0).into(), pty: Some((n, master)), rearm: AtomicU32::new(0), full: false.into() };
-    Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
+    add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0)
 }
 
 fn open_ptmx(flags: u64) -> R {
@@ -1796,7 +1851,7 @@ fn open_pts(n: u32, flags: u64) -> R {
         return with(|fs| {
             let mine = fs.fds.iter().flatten().find(|s| matches!(&s.fd, Fd::Pipe(p) if p.pty == Some((n, false))));
             let new = dup_fd(&mine.ok_or(if err == 2 { ENOENT } else { EIO })?.fd)?;
-            Ok(fs.add(new, 0, flags & O_CLOEXEC != 0))
+            fs.add(new, 0, flags & O_CLOEXEC != 0)
         });
     }
     add_pty(h, n, false, flags)
@@ -1859,7 +1914,7 @@ fn open_fifo(id: u64, flags: u64) -> R {
         return fifo_reader(name, flags);
     };
     let p = Pipe { h: unsafe { OwnedHandle::from_raw_handle(h as _) }, nonblock: nonblock.into(), pty: None, rearm: AtomicU32::new(0), full: false.into() };
-    Ok(add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0))
+    add_fd(Fd::Pipe(Arc::new(p)), flags & O_CLOEXEC != 0)
 }
 
 /// A FIFO's reader. Writers connect to its named pipe, any number of them: a broker thread keeps an
@@ -1976,7 +2031,7 @@ fn fifo_reader(name: Vec<u16>, flags: u64) -> R {
             }
         }
     }
-    Ok(add_fd(Fd::Pipe(Arc::new(fd)), flags & O_CLOEXEC != 0))
+    add_fd(Fd::Pipe(Arc::new(fd)), flags & O_CLOEXEC != 0)
 }
 
 fn pty_ioctl(p: &Pipe, req: u64, arg: u64) -> R {
@@ -2158,23 +2213,87 @@ pub fn select(n: u64, rd: u64, wr: u64, ex: u64, timeout_ms: i64) -> R {
 
 /// sendfile: from the file position (cat), or from `*off` leaving the position alone and advancing
 /// `*off` instead (nginx). ponytail: a bounce buffer, up to 64K per call; TransmitFile would be zero-copy.
+/// What a file mapping of fd may do, as the fd was opened: (read, write). EBADF without an fd, ENODEV
+/// for one that can't be mapped (pipes, sockets, directories).
+pub fn map_access(fd: u64) -> Result<(bool, bool), i64> {
+    with(|fs| match fs.fd(fd)? {
+        Fd::File { f, .. } => Ok(granted_access(f.as_raw_handle() as isize).map_or((true, true), |g| (g & 1 != 0, g & 2 != 0))),
+        Fd::Dev(_) | Fd::Handle(_) => Ok((true, true)),
+        _ => Err(crate::syscall::ENODEV),
+    })
+}
+
 pub fn sendfile(out: u64, inp: u64, off: u64, count: u64) -> R {
-    let mut buf = vec![0u8; count.min(1 << 16) as usize];
-    let n = if off != 0 {
-        pread(inp, buf.as_mut_ptr() as u64, buf.len() as u64, unsafe { *(off as *const u64) }, false)?
-    } else {
-        read(inp, buf.as_mut_ptr() as u64, buf.len() as u64)?
-    };
-    if n == 0 {
-        return Ok(0);
+    // The output must be open for writing even when there's nothing to send.
+    if with(|fs| fs.fd(out).map(|d| matches!(d, Fd::File { f, .. } if !writable_handle(f))))? {
+        return Err(EBADF);
     }
-    let sent = write(out, buf.as_ptr() as u64, n as u64)?;
     if off != 0 {
-        unsafe { *(off as *mut u64) += sent as u64 };
-    } else if sent < n {
-        lseek(inp, sent - n, 1)?; // give back what the socket didn't take
+        crate::syscall::check_guest(off, 8, true)?; // EFAULT for a bad offset pointer, not a fault
     }
-    Ok(sent)
+    // Copy in 1 MB pieces until `count` is done, the input ends, the output takes less (a full socket)
+    // or a signal comes; an error after some went is that much sent, as on Linux.
+    let mut buf = vec![0u8; count.min(1 << 20) as usize];
+    let start = if off != 0 { unsafe { *(off as *const u64) } } else { 0 };
+    // What was read from a pipe or socket can't be given back, so it all goes out (below); reading no
+    // more than an output pipe has room for keeps that from waiting (splice: socket -> pipe -> socket).
+    let seekable = off != 0 || with(|fs| matches!(fs.fd(inp), Ok(Fd::File { .. })));
+    let room = with(|fs| match fs.fd(out) {
+        Ok(Fd::Pipe(p)) => p.write_room().filter(|&r| r > 0).map(u64::from),
+        _ => None,
+    });
+    let mut total = 0u64;
+    while total < count {
+        let want = (count - total).min(buf.len() as u64).min(if seekable { u64::MAX } else { room.unwrap_or(u64::MAX) });
+        let got = if off != 0 {
+            pread(inp, buf.as_mut_ptr() as u64, want, start + total, false)
+        } else {
+            read(inp, buf.as_mut_ptr() as u64, want)
+        };
+        let n = match got {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if total == 0 => return Err(e),
+            Err(_) => break,
+        };
+        let mut sent = 0i64;
+        let err = loop {
+            match write(out, buf.as_ptr() as u64 + sent as u64, (n - sent) as u64) {
+                Ok(k) => {
+                    sent += k;
+                    if sent == n || seekable {
+                        break None;
+                    }
+                }
+                // ponytail: a full non-blocking output briefly blocks this call rather than lose the bytes.
+                Err(crate::syscall::EAGAIN) if !seekable => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(e) => break Some(e),
+            }
+        };
+        if let Some(e) = err {
+            if off == 0 && seekable {
+                let _ = lseek(inp, sent - n, 1); // give back what was read for nothing
+            }
+            if total == 0 && sent == 0 { return Err(e) }
+            total += sent as u64;
+            break;
+        }
+        total += sent as u64;
+        if sent < n {
+            if off == 0 {
+                lseek(inp, sent - n, 1)?; // give back what the socket didn't take
+            }
+            break;
+        }
+        // A pipe or socket gives what it has; reading on would wait for more (Linux returns instead).
+        if !seekable || crate::signal::deliverable() {
+            break;
+        }
+    }
+    if off != 0 {
+        unsafe { *(off as *mut u64) = start + total };
+    }
+    Ok(total as i64)
 }
 
 /// pread64/pwrite64: I/O at an offset without moving the file position. NT's positioned I/O does
@@ -2335,17 +2454,17 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
     }
     with(|fs| {
         if let Some(d) = Dev::of(&guest) {
-            return Ok(fs.add(Fd::Dev(d), 0, cloexec));
+            return fs.add(Fd::Dev(d), 0, cloexec);
         }
         if let Some(text) = crate::procfs::file(&guest) {
             if flags & 3 != 0 { return Err(EACCES) } // ponytail: /proc/sys is read-only here
             let (f, host) = scratch_file(fs, text.as_bytes()).map_err(errno)?;
-            return Ok(fs.add(Fd::File { f, host }, 0, cloexec));
+            return fs.add(Fd::File { f, host }, 0, cloexec);
         }
         let mut host = host;
         if proc_dir(&guest).is_some() {
             if flags & 3 != 0 { return Err(EISDIR) }
-            return Ok(fs.add(Fd::Dir { guest, pos: 0 }, 0, cloexec));
+            return fs.add(Fd::Dir { guest, pos: 0 }, 0, cloexec);
         }
         if meta.is_none() && flags & O_CREAT == 0 {
             return Err(ENOENT); // the lookup just found nothing: no host open to fail
@@ -2402,7 +2521,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> R {
             }
             Fd::File { f, host }
         };
-        Ok(fs.add(fd, 0, cloexec))
+        fs.add(fd, 0, cloexec)
     })
 }
 
@@ -2471,11 +2590,17 @@ pub fn utimensat(dirfd: u64, path: u64, times: u64, flags: u64) -> R {
             };
         }
         let (guest, host) = fs.at(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-        if fs::metadata(&host).map_err(errno)?.is_dir() {
-            return Ok(0); // ponytail: directory times aren't settable through std; nothing relies on them
+        let dir = fs::metadata(&host).map_err(errno)?.is_dir();
+        let target = fs.writable(&comps_of(&guest), !dir)?;
+        if dir && !exists(&target) {
+            fs::create_dir(&target).map_err(errno)?; // an image directory gets its upper copy, mode and owner
+            if let Some(m) = get_meta(&host) {
+                let _ = set_meta(&target, m);
+            }
         }
-        let target = fs.writable(&comps_of(&guest), true)?;
-        OpenOptions::new().write(true).open(target).and_then(|f| f.set_times(t)).map(|_| 0).map_err(errno)
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_WRITE_ATTRIBUTES; FILE_FLAG_BACKUP_SEMANTICS opens a directory.
+        OpenOptions::new().access_mode(0x100).custom_flags(0x0200_0000).open(target).and_then(|f| f.set_times(t)).map(|_| 0).map_err(errno)
     })
 }
 
@@ -2941,7 +3066,10 @@ fn dup_fd(fd: &Fd) -> Result<Fd, i64> {
 pub fn dup(fd: u64, min: u64, cloexec: bool) -> R {
     with(|fs| {
         let new = dup_fd(fs.fd(fd)?)?;
-        Ok(fs.add(new, min as usize, cloexec))
+        if min >= nofile()[0] {
+            return Err(EINVAL); // F_DUPFD past the limit
+        }
+        fs.add(new, min as usize, cloexec)
     })
 }
 
@@ -2951,7 +3079,7 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
             return fs.fd(old).map(|_| new as i64); // dup2(fd, fd) is a no-op
         }
         let d = dup_fd(fs.fd(old)?)?;
-        if new > 65535 { return Err(EBADF) }
+        if new >= nofile()[0] { return Err(EBADF) }
         while fs.fds.len() <= new as usize {
             fs.fds.push(None);
         }
@@ -3242,7 +3370,6 @@ fn stat_of_attrs(host: &Path, m: Attrs) -> Result<[u64; 18], i64> {
         Some(t) => (0o120777, t.len() as u64, 1),
         None => (0o100755, m.len, 1),
     };
-    let t = std::time::Duration::from_nanos(m.mtime);
     let mut s = [0u64; 18];
     s[0] = 0x803;
     s[1] = ino(host);
@@ -3251,14 +3378,19 @@ fn stat_of_attrs(host: &Path, m: Attrs) -> Result<[u64; 18], i64> {
     s[6] = size;
     s[7] = 4096;
     s[8] = size.div_ceil(512);
-    for i in [9, 11, 13] {
-        (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
-    }
+    put_times(&mut s, m.atime, m.mtime);
     with_meta(&mut s, host);
     if link.is_some() {
         s[3] = (s[3] & !0o7777) | 0o777; // a symlink's own owner (lchown) counts; its mode is always 0777
     }
     Ok(s)
+}
+
+/// struct stat's atime, mtime and ctime (ctime: the mtime; NT has no inode change time to give).
+fn put_times(s: &mut [u64; 18], atime: u64, mtime: u64) {
+    for (i, t) in [(9, atime), (11, mtime), (13, mtime)] {
+        (s[i], s[i + 1]) = (t / 1_000_000_000, t % 1_000_000_000);
+    }
 }
 
 fn put_stat(buf: u64, s: [u64; 18]) -> R {
@@ -3271,13 +3403,11 @@ pub fn fstat(fd: u64, buf: u64) -> R {
         // From the open handle, not the path: the file may have been renamed or deleted since (apt does
         // both to its temp files), and Linux's fstat still answers.
         Fd::File { f, host } => {
+            use std::os::windows::fs::MetadataExt;
             let m = f.metadata().map_err(errno)?;
-            let t = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).unwrap_or_default();
             let mut s = [0u64; 18];
             (s[0], s[1], s[2], s[3], s[6], s[7], s[8]) = (0x803, ino(host), 1, 0o100755, m.len(), 4096, m.len().div_ceil(512));
-            for i in [9, 11, 13] {
-                (s[i], s[i + 1]) = (t.as_secs(), t.subsec_nanos() as u64);
-            }
+            put_times(&mut s, unix_ns(m.last_access_time()), unix_ns(m.last_write_time()));
             with_meta(&mut s, host);
             // The guest's own hard links, as fstatat counts them: not an image file's (hard-linked between
             // image copies, which the guest must not see).
@@ -3958,6 +4088,7 @@ fn remove_any(p: &Path) {
 fn resolve_stays_inside_rootfs() {
     let root = std::env::temp_dir().join(format!("lx-test-{}", std::process::id()));
     fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("etc")).unwrap();
     write_link(&root.join("bin/sh"), "busybox").unwrap();
     write_link(&root.join("up"), "../../../..").unwrap();
     write_link(&root.join("loop"), "loop").unwrap();
@@ -4041,10 +4172,13 @@ fn layer_never_touches_the_image() {
     // A deep image path the upper layer has none of resolves through the image alone.
     assert_eq!(f.resolve("/", "/usr/lib/py/m.py", true).unwrap().1, lower.join("usr/lib/py/m.py"));
     assert_eq!(f.resolve("/usr/lib", "py/m.py", false).unwrap().1, lower.join("usr/lib/py/m.py"));
-    // The lookup's attributes (what stat and open use): there for image files, None below a missing dir.
+    // The lookup's attributes (what stat and open use): there for image files; below a missing dir or
+    // a file there's nothing (ENOENT, ENOTDIR), and a trailing slash wants a directory.
     let meta = |p: &str| f.resolve_attrs("/", p, true).unwrap().2;
     assert!(meta("/usr/lib/py/m.py").is_some_and(|m| !m.dir && m.len == 1) && meta("/usr/lib").is_some_and(|m| m.dir));
-    assert!(meta("/usr/nope/m.py").is_none() && meta("/nope/a/b").is_none());
+    assert!(meta("/usr/nope").is_none());
+    let err = |p: &str| f.resolve_attrs("/", p, true).err();
+    assert_eq!((err("/usr/nope/m.py"), err("/nope/a/b"), err("/usr/lib/py/m.py/x"), err("/usr/lib/py/m.py/")), (Some(ENOENT), Some(ENOENT), Some(ENOTDIR), Some(ENOTDIR)));
     let w = f.writable(&c("/etc/a.conf"), true).unwrap();
     fs::write(&w, "container").unwrap();
     assert_eq!(fs::read_to_string(f.host(&c("/etc/a.conf"))).unwrap(), "container");
@@ -4058,8 +4192,8 @@ fn layer_never_touches_the_image() {
     // Deleting an image entry is a whiteout: hidden in the container, still in the image.
     f.remove(&c("/etc/conf.d"), true).unwrap();
     assert!(!exists(&f.host(&c("/etc/conf.d/x"))));
-    assert!(!exists(&f.resolve("/", "/etc/conf.d/x", true).unwrap().1));
-    assert!(meta("/etc/conf.d").is_none() && meta("/etc/conf.d/x").is_none());
+    assert_eq!(f.resolve("/", "/etc/conf.d/x", true).err(), Some(ENOENT));
+    assert!(meta("/etc/conf.d").is_none());
     assert_eq!(names("/etc"), ["a.conf", "new"]);
     assert!(lower.join("etc/conf.d/x").exists());
 
