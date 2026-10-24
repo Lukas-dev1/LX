@@ -2182,7 +2182,21 @@ pub fn select(n: u64, rd: u64, wr: u64, ex: u64, timeout_ms: i64) -> R {
 
 /// sendfile: from the file position (cat), or from `*off` leaving the position alone and advancing
 /// `*off` instead (nginx). ponytail: a bounce buffer, up to 64K per call; TransmitFile would be zero-copy.
+/// What a file mapping of fd may do, as the fd was opened: (read, write). EBADF without an fd, ENODEV
+/// for one that can't be mapped (pipes, sockets, directories).
+pub fn map_access(fd: u64) -> Result<(bool, bool), i64> {
+    with(|fs| match fs.fd(fd)? {
+        Fd::File { f, .. } => Ok(granted_access(f.as_raw_handle() as isize).map_or((true, true), |g| (g & 1 != 0, g & 2 != 0))),
+        Fd::Dev(_) | Fd::Handle(_) => Ok((true, true)),
+        _ => Err(crate::syscall::ENODEV),
+    })
+}
+
 pub fn sendfile(out: u64, inp: u64, off: u64, count: u64) -> R {
+    // The output must be open for writing even when there's nothing to send.
+    if with(|fs| fs.fd(out).map(|d| matches!(d, Fd::File { f, .. } if !writable_handle(f))))? {
+        return Err(EBADF);
+    }
     let mut buf = vec![0u8; count.min(1 << 16) as usize];
     let n = if off != 0 {
         pread(inp, buf.as_mut_ptr() as u64, buf.len() as u64, unsafe { *(off as *const u64) }, false)?
