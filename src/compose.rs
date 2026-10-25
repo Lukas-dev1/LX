@@ -356,10 +356,42 @@ fn flow(s: &str) -> Value {
         let m = split_flow(inner).iter().filter_map(|x| key_value(x).map(|(k, v)| (k, flow(&v)))).collect();
         return Value::Object(m);
     }
-    if s.len() >= 2 && (s.starts_with('"') && s.ends_with('"') || s.starts_with('\'') && s.ends_with('\'')) {
-        return json!(s[1..s.len() - 1]);
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        return json!(unescape(&s[1..s.len() - 1]));
+    }
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        return json!(s[1..s.len() - 1].replace("''", "'")); // single quotes: '' is the only escape
     }
     json!(s)
+}
+
+/// A double-quoted YAML scalar's escapes: \n \t \r \" \\ \/ \0 and \xNN \uNNNN (a `python -c` script in
+/// a command list). Unknown ones stay as they are.
+fn unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let hex = |it: &mut std::str::Chars, n: usize| {
+            let h: String = it.by_ref().take(n).collect();
+            u32::from_str_radix(&h, 16).ok().and_then(char::from_u32)
+        };
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some(c @ ('"' | '\\' | '/')) => out.push(c),
+            Some('x') => out.extend(hex(&mut it, 2)),
+            Some('u') => out.extend(hex(&mut it, 4)),
+            Some(other) => out.extend(['\\', other]),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn split_flow(s: &str) -> Vec<String> {
@@ -403,4 +435,11 @@ fn volumes_take_windows_paths() {
     assert_eq!(volume("C:/data:/data:ro", dir, "p").unwrap(), "C:/data:/data:ro");
     assert_eq!(volume(r"D:\x y:/srv", dir, "p").unwrap(), r"D:\x y:/srv");
     assert_eq!(volume("./src:/app", dir, "p").unwrap(), format!("{}:/app", dir.join("./src").display()));
+}
+
+#[test]
+fn quoted_scalars_unescape() {
+    assert_eq!(flow(r#""a\nb\t\"c\"\\""#), json!("a\nb\t\"c\"\\"));
+    assert_eq!(flow(r#"'it''s \n'"#), json!(r"it's \n"));
+    assert_eq!(flow(r#""é\x41""#), json!("éA"));
 }
