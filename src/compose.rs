@@ -245,10 +245,16 @@ fn env_list(v: &Value) -> Vec<String> {
     }
 }
 
-/// `./data:/data[:ro]` (relative to the compose file) or `name:/path` (a named volume, created once).
+/// `./data:/data[:ro]` (relative to the compose file), `C:\data:/data` (a Windows path), or `name:/path`
+/// (a named volume, created once).
 fn volume(spec: &str, dir: &Path, project: &str) -> Result<String, String> {
-    let (src, rest) = spec.split_once(':').ok_or(format!("bad volume {spec:?}"))?;
-    let host = if src.starts_with('.') || src.starts_with('/') || src.contains('\\') {
+    // A drive letter's colon isn't the separator.
+    let b = spec.as_bytes();
+    let drive = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\');
+    let skip = if drive { 2 } else { 0 };
+    let at = spec[skip..].find(':').map(|i| i + skip).ok_or(format!("bad volume {spec:?}"))?;
+    let (src, rest) = (&spec[..at], &spec[at + 1..]);
+    let host = if drive || src.starts_with('.') || src.starts_with('/') || src.contains('\\') {
         dir.join(src)
     } else {
         let p = Path::new("rootfs/volumes").join(format!("{project}_{src}"));
@@ -389,4 +395,12 @@ fn compose_yaml() {
     assert_eq!(words(&doc["services"]["db"]["command"]), ["postgres", "-c", "fsync=off"]);
     assert_eq!(words(&json!("redis-server --save \"\" --x 'a b'")), ["redis-server", "--save", "", "--x", "a b"]);
     assert_eq!(list(&doc["services"]["db"]["volumes"]), ["data:/var/lib/postgresql/data"]);
+}
+
+#[test]
+fn volumes_take_windows_paths() {
+    let dir = Path::new("C:/proj");
+    assert_eq!(volume("C:/data:/data:ro", dir, "p").unwrap(), "C:/data:/data:ro");
+    assert_eq!(volume(r"D:\x y:/srv", dir, "p").unwrap(), r"D:\x y:/srv");
+    assert_eq!(volume("./src:/app", dir, "p").unwrap(), format!("{}:/app", dir.join("./src").display()));
 }
