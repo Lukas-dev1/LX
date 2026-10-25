@@ -42,8 +42,8 @@ Docker on Windows means a hidden Linux VM. It holds gigabytes of RAM, runs a who
 Build it with a Rust toolchain:
 
 ```console
-> git clone https://github.com/Lukas-dev1/docker_but_better
-> cd docker_but_better
+> git clone https://github.com/Lukas-dev1/LX
+> cd LX
 > cargo build --release
 ```
 
