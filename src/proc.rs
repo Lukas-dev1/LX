@@ -578,12 +578,37 @@ pub fn kill(pid: i64, sig: u64) -> R {
             return Err(ESRCH);
         }
         let mine = members.contains(&unsafe { GetCurrentProcessId() }) || members.contains(&self::pid());
-        for p in members.into_iter().filter(|&p| p != unsafe { GetCurrentProcessId() } && p != self::pid()) {
+        let others: Vec<u32> = members.into_iter().filter(|&p| p != unsafe { GetCurrentProcessId() } && p != self::pid()).collect();
+        for &p in &others {
             let _ = send(p, sig);
+        }
+        if sig == 9 {
+            make_sure_killed(&others);
         }
         return if mine && sig != 0 { signal::raise(sig) } else { Ok(0) }; // ourselves last, as we may die of it
     }
-    send(pid as u32, sig)
+    let r = send(pid as u32, sig);
+    if sig == 9 && r.is_ok() {
+        make_sure_killed(&[pid as u32]);
+    }
+    r
+}
+
+/// SIGKILL needs nothing of its target, on Linux. Ours takes it in its signal thread, which a process can
+/// fail to run: a fork child still holding its signals while it rebuilds the guest, one stuck on the way
+/// out. Whatever hasn't died 300 ms after the signal is terminated, as if by it. (The signal goes first:
+/// an exec'd program's predecessor passes it on to the successor, which terminating it wouldn't.)
+fn make_sure_killed(pids: &[u32]) {
+    const SYNCHRONIZE_TERMINATE: u32 = 0x0010_0000 | 0x0001;
+    let hs: Vec<isize> = pids.iter().map(|&p| unsafe { OpenProcess(SYNCHRONIZE_TERMINATE, 0, p) }).filter(|&h| h != 0).collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    for &h in &hs {
+        let left = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u32;
+        if unsafe { WaitForMultipleObjects(1, &h, 0, left) } != 0 {
+            unsafe { TerminateProcess(h, SIGNALED | 9) };
+        }
+        unsafe { CloseHandle(h) };
+    }
 }
 
 /// setpgid(pid, pgid): 0 means the caller / the target's own pid.

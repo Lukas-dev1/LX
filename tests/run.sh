@@ -61,6 +61,7 @@ cc_static 2 rootfs/pipewait guest/pipewait.c
 cc_static 2 rootfs/setxid guest/setxid.c
 cc_static 2 rootfs/sitkill guest/sitkill.c
 cc_static 2 rootfs/pidreuse guest/pidreuse.c
+cc_static 2 rootfs/groupkill guest/groupkill.c
 cc_static 2 rootfs/jobctl guest/jobctl.c
 cc_static 1 rootfs/spinsig guest/spinsig.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
@@ -118,6 +119,7 @@ expect "a reader blocked in a big read leaves a non-blocking writer room (NT cou
 expect "setegid with threads blocked in a wait, a sleep and guest code: libc signals each, a sleeping one too" 0 "setxid r=0 egid=1 back=0" -- rootfs /setxid
 expect "a tgkill signal's siginfo: SI_TKILL with the sender's pid and uid (glibc's setuid needs it)" 0 "sitkill tkill=1 pid=1 uid=1" -- rootfs /sitkill
 expect "fork never hands out the pid of a child reaped under a minute ago (it may still be a group id)" 0 "pidreuse reused=0" -- rootfs /pidreuse
+expect "kill(-pgid, SIGKILL) reaches every member, an orphaned grandchild too" 0 "groupkill alive=0" -- rootfs /groupkill
 expect "job control: SIGSTOP stops a spinning child (WUNTRACED), SIGCONT continues it (WCONTINUED), raise(SIGSTOP) is CLD_STOPPED" 0 "jobctl stopped=1 frozen=1 cont=1 moving=1 killed=1 self=1 after=1" -- rootfs /jobctl
 expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
