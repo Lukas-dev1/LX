@@ -665,8 +665,12 @@ pub fn precise_sleep(d: std::time::Duration) -> R {
         fn CreateWaitableTimerExW(attr: *mut std::ffi::c_void, name: *const u16, flags: u32, access: u32) -> isize;
         fn SetWaitableTimer(t: isize, due: *const i64, period: i32, f: *mut std::ffi::c_void, a: *mut std::ffi::c_void, resume: i32) -> i32;
     }
-    thread_local!(static TIMER: isize = unsafe { CreateWaitableTimerExW(std::ptr::null_mut(), std::ptr::null(), 2, 0x1F_0003) }); // HIGH_RESOLUTION, TIMER_ALL_ACCESS
-    let t = TIMER.with(|t| *t);
+    // One per thread state, which a later thread inherits with it (see syscall::reuse_ts).
+    let ts = crate::syscall::ts();
+    if ts.timer == 0 {
+        ts.timer = unsafe { CreateWaitableTimerExW(std::ptr::null_mut(), std::ptr::null(), 2, 0x1F_0003) }; // HIGH_RESOLUTION, TIMER_ALL_ACCESS
+    }
+    let t = ts.timer;
     if t == 0 || d >= std::time::Duration::from_millis(50) {
         // Long sleeps don't need it (nor older Windows, which lacks the flag).
         return interruptible_sleep(d.as_nanos().div_ceil(1_000_000).min(u32::MAX as u128 - 1) as u32);
