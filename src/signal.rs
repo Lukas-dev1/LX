@@ -386,8 +386,52 @@ fn mailbox(pid: u32, create: bool) -> Option<(&'static Mailbox, isize)> {
             return None;
         }
         let view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, MAILBOX_SIZE as usize);
-        // ponytail: sender-side handles and views are never closed; senders are short-lived.
+        // Kept for good: our own, and an exec'd program's predecessor's. Others' go through `Remote`.
         (!view.is_null()).then(|| (&*(view as *const Mailbox), ev))
+    }
+}
+
+/// Another process's mailbox, let go when dropped: a long-lived sender (a supervisor, a shell waiting
+/// for stopped jobs) opens one per signal or wait.
+struct Remote {
+    view: *mut std::ffi::c_void,
+    map: isize,
+    ev: isize,
+}
+
+impl Remote {
+    fn open(pid: u32) -> Option<Remote> {
+        use crate::win::*;
+        let (map_name, ev_name) = (wide(&format!("Local\\lx-sig-{pid}")), wide(&format!("Local\\lx-sigev-{pid}")));
+        unsafe {
+            let map = OpenFileMappingW(FILE_MAP_WRITE, 0, map_name.as_ptr());
+            if map == 0 {
+                return None;
+            }
+            let ev = OpenEventW(EVENT_MODIFY_STATE, 0, ev_name.as_ptr());
+            let view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, MAILBOX_SIZE as usize);
+            let r = Remote { view, map, ev };
+            (ev != 0 && !view.is_null()).then_some(r)
+        }
+    }
+
+    fn b(&self) -> &Mailbox {
+        unsafe { &*(self.view as *const Mailbox) }
+    }
+}
+
+impl Drop for Remote {
+    fn drop(&mut self) {
+        use crate::win::*;
+        unsafe {
+            if !self.view.is_null() {
+                UnmapViewOfFile(self.view);
+            }
+            if self.ev != 0 {
+                CloseHandle(self.ev);
+            }
+            CloseHandle(self.map);
+        }
     }
 }
 
@@ -396,7 +440,8 @@ pub fn send(pid: u32, sig: u64) -> R {
     if sig == 0 || sig > 64 {
         return Err(EINVAL);
     }
-    let (b, ev) = mailbox(pid, false).ok_or(crate::syscall::ESRCH)?;
+    let r = Remote::open(pid).ok_or(crate::syscall::ESRCH)?;
+    let (b, ev) = (r.b(), r.ev);
     b[3 + sig as usize].store(proc::getpid().unwrap_or(0) as u64 | (proc::UID.load(SeqCst) as u64) << 32, SeqCst);
     b[0].fetch_or(bit(sig), SeqCst);
     unsafe { crate::win::SetEvent(ev) };
@@ -445,11 +490,11 @@ pub fn ids(pid: Option<u32>) -> Option<(u32, u32)> {
 
 /// Set the (process group, session) of host process `pid`, or ours for None.
 pub fn set_ids(pid: Option<u32>, pgid: u32, sid: u32) -> R {
-    let b = match pid {
-        None => unsafe { OWN.load(SeqCst).as_ref() }.ok_or(crate::syscall::ESRCH)?,
-        Some(pid) => mailbox(pid, false).ok_or(crate::syscall::ESRCH)?.0,
-    };
-    b[1].store(pgid as u64 | (sid as u64) << 32, SeqCst);
+    let v = pgid as u64 | (sid as u64) << 32;
+    match pid {
+        None => unsafe { OWN.load(SeqCst).as_ref() }.ok_or(crate::syscall::ESRCH)?[1].store(v, SeqCst),
+        Some(pid) => Remote::open(pid).ok_or(crate::syscall::ESRCH)?.b()[1].store(v, SeqCst),
+    }
     Ok(0)
 }
 
@@ -988,7 +1033,8 @@ fn report(status: u64) {
 /// A child's unreported stop or continue: its wait status (0x7f | sig << 8, or 0xffff), cleared unless
 /// `keep` (WNOWAIT).
 pub fn child_state(pid: u32, keep: bool) -> Option<u32> {
-    let (b, _) = mailbox(pid, false)?;
+    let r = Remote::open(pid)?;
+    let b = r.b();
     let v = b[2].load(SeqCst);
     if v & 1 << 32 == 0 {
         return None;
