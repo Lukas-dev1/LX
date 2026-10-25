@@ -3,6 +3,7 @@ import ctypes, os, select, struct, time
 libc = ctypes.CDLL(None, use_errno=True)
 IN_MODIFY, IN_ATTRIB = 0x2, 0x4
 os.makedirs("/srv/w"); open("/srv/w/f", "w").close()
+time.sleep(0.1)  # a metadata change within 1 ms of a write reads as a write (the times can't tell)
 fd = libc.inotify_init1(os.O_NONBLOCK)
 libc.inotify_add_watch(fd, b"/srv/w", IN_MODIFY | IN_ATTRIB)
 def masks():
