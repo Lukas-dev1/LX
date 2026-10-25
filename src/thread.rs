@@ -27,6 +27,11 @@ pub fn tids() -> Vec<u32> {
     v
 }
 
+/// Our other guest threads: (tid, handle).
+pub fn others() -> Vec<(u32, isize)> {
+    THREADS.lock().unwrap().clone()
+}
+
 pub fn set_main() {
     MAIN_TID.store(unsafe { GetCurrentThreadId() }, Relaxed);
 }

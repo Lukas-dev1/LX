@@ -127,6 +127,17 @@ static OWN: AtomicPtr<Slot> = AtomicPtr::new(std::ptr::null_mut());
 
 /// The main thread enters (true) or leaves (false) a syscall: what /proc/<pid>/stat's state is made of
 /// (LTP waits for a child to show S before it signals it, so S must mean blocked, not just in lx).
+/// sys_ms of a process stopped by a signal (shown as T).
+const STOPPED: u32 = u32::MAX;
+
+/// This process is stopped (SIGSTOP and co.) or goes on again.
+pub fn set_stopped(stopped: bool) {
+    let p = OWN.load(Relaxed);
+    if !p.is_null() {
+        unsafe { (*p).sys_ms.store(if stopped { STOPPED } else { 0 }, Relaxed) };
+    }
+}
+
 pub fn syscall_state(entering: bool) {
     let p = OWN.load(Relaxed);
     if !p.is_null() {
@@ -211,7 +222,7 @@ fn info(s: &Slot) -> Info {
     // In one syscall for 16 ms or more (a tick or two): blocked there, as far as a reader can tell.
     let sys = s.sys_ms.load(Relaxed);
     let sleeping = sys != 0 && (unsafe { crate::win::GetTickCount64() } as u32).wrapping_sub(sys) >= 16;
-    Info { state: if sleeping { 'S' } else { 'R' }, nocldwait: s.nocldwait.load(Relaxed) != 0, pid: s.pid.load(SeqCst), ppid: s.ppid, uid: s.uid, gid: s.gid, start_ms: s.start_ms,
+    Info { state: if sys == STOPPED { 'T' } else if sleeping { 'S' } else { 'R' }, nocldwait: s.nocldwait.load(Relaxed) != 0, pid: s.pid.load(SeqCst), ppid: s.ppid, uid: s.uid, gid: s.gid, start_ms: s.start_ms,
            comm: text(&s.comm), exe: text(&s.exe), cmdline: s.cmdline[..end].to_vec() }
 }
 

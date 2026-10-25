@@ -62,6 +62,7 @@ cc_static 2 rootfs/setxid guest/setxid.c
 cc_static 2 rootfs/sitkill guest/sitkill.c
 cc_static 2 rootfs/pidreuse guest/pidreuse.c
 cc_static 2 rootfs/groupkill guest/groupkill.c
+cc_static 2 rootfs/jobctl guest/jobctl.c
 cc_static 1 rootfs/spinsig guest/spinsig.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
 cc_static 2 rootfs/waitidtest guest/waitidtest.c
@@ -119,6 +120,7 @@ expect "setegid with threads blocked in a wait, a sleep and guest code: libc sig
 expect "a tgkill signal's siginfo: SI_TKILL with the sender's pid and uid (glibc's setuid needs it)" 0 "sitkill tkill=1 pid=1 uid=1" -- rootfs /sitkill
 expect "fork never hands out the pid of a child reaped under a minute ago (it may still be a group id)" 0 "pidreuse reused=0" -- rootfs /pidreuse
 expect "kill(-pgid, SIGKILL) reaches every member, an orphaned grandchild too" 0 "groupkill alive=0" -- rootfs /groupkill
+expect "job control: SIGSTOP stops a spinning child (WUNTRACED), SIGCONT continues it (WCONTINUED), raise(SIGSTOP) is CLD_STOPPED" 0 "jobctl stopped=1 frozen=1 cont=1 moving=1 killed=1 self=1 after=1" -- rootfs /jobctl
 expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
 expect "waitid: P_PID, WNOWAIT, CLD_KILLED, WNOHANG" 0 "peek=1 reap=1 killed=1 none=1" -- rootfs /waitidtest
@@ -196,6 +198,7 @@ expect "/proc/self/task lists our threads (the main one is the pid), each a dire
 expect "F_GETFL shows how a file was opened; FIONBIO makes a pipe non-blocking" 0 "rd=0 wr=1 rw=2 ap=1025 nb=True" -- run python:3.12-alpine python3 -c 'import os,fcntl; g=lambda fd: fcntl.fcntl(fd,fcntl.F_GETFL) & 0o3003; r,w=os.pipe(); os.set_blocking(r,False); print("rd=%d wr=%d rw=%d ap=%d nb=%s" % (g(os.open("/etc/hostname",0)), g(os.open("/tmp/a",os.O_WRONLY|os.O_CREAT)), g(os.open("/tmp/a",os.O_RDWR)), g(os.open("/tmp/a",os.O_WRONLY|os.O_APPEND)), not os.get_blocking(r)))'
 expect "F_GETLK names the holder of a conflicting lock (type, range, pid)" 0 "holder type=1 start=10 len=5 is_parent=True" -- run -v "$GUEST" python:3.12-alpine python3 /t/getlk.py
 expect "SIGPIPE on a write without a reader (default kills, Python gets EPIPE)" 0 "python EPIPE, default killed by 13" -- run -v "$GUEST" python:3.12-alpine python3 /t/sigpipe.py
+expect "inotify: chmod and utime are IN_ATTRIB, a write IN_MODIFY" 0 "chmod attrib write modify utime attrib" -- run -v "$GUEST" python:3.12-alpine python3 /t/inotifyattr.py
 expect "chroot: absolute paths, symlinks and .. stay inside; exec inside" 0 "pwd /, x inside, link inside, up bin etc lib link" -- run -v "$GUEST" alpine sh /t/chroot.sh
 expect "pwrite (musl: pwritev2 RWF_NOAPPEND) writes at the offset; sqlite" 0 "bad EBADF, append XbcY, sqlite 4950" -- run -v "$GUEST" python:3.12-alpine python3 /t/noappend.py
 expect "prctl keeps names and settings; personality and nice are kept" 0 "name worker-thread-n, other thread True, pdeathsig 10, bad sig EINVAL, dumpable 2 EINVAL, slack 1000, nnp 1, option 999 EINVAL, personality 0x40000, nice 5, lower EACCES" -- run -v "$GUEST" python:3.12-alpine python3 /t/prctlstate.py
