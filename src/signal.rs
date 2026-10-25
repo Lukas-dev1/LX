@@ -1005,13 +1005,26 @@ fn stop(sig: u64) {
     }
     unsafe { ResetEvent(run_event()) };
     crate::ptable::set_stopped(true);
-    report(0x7f | sig << 8); // WIFSTOPPED, WSTOPSIG
+    // Stopped once no guest thread runs guest code: each is in lx (a syscall, parked, a handler of ours),
+    // and goes back only through park_if_stopped. A spinning one is kicked, again if a kick got lost
+    // (under load it can take a while), and only then does the parent hear of the stop: on Linux the
+    // child doesn't run any more once waitpid says it stopped. ponytail: given up on after 500 ms.
     let me = unsafe { crate::win::GetCurrentThreadId() };
-    for (tid, h) in std::iter::once((crate::thread::MAIN_TID.load(SeqCst), GUEST_THREAD.load(SeqCst))).chain(crate::thread::others()) {
-        if tid != me && let Some(t) = crate::syscall::ts_of(tid) {
-            kick(h, t);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let mut running = 0;
+        for (tid, h) in std::iter::once((crate::thread::MAIN_TID.load(SeqCst), GUEST_THREAD.load(SeqCst))).chain(crate::thread::others()) {
+            if tid != me && let Some(t) = crate::syscall::ts_of(tid) && !t.on_host() {
+                running += 1;
+                kick(h, t);
+            }
         }
+        if running == 0 || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    report(0x7f | sig << 8); // WIFSTOPPED, WSTOPSIG
 }
 
 fn cont() {
