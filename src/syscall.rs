@@ -79,6 +79,8 @@ pub struct ThreadState {
     /// A thread other than the main one: its own auto-reset event for signal::intr_event (0 until it
     /// first waits), so a signal sent to it alone breaks its sleeps and waits too.
     pub wake: std::sync::atomic::AtomicIsize,
+    /// signal::precise_sleep's high-resolution timer (0 until a short sleep): kept for the next thread.
+    pub timer: isize,
     /// Whether we're running on host_stack right now.
     on_host: bool,
     /// The TEB's own stack fields (StackBase, StackLimit, DeallocationStack) before the guest took over.
@@ -161,9 +163,45 @@ pub fn wake_futex_waiters() {
 pub fn forget_ts() {
     let me = unsafe { GetCurrentThreadId() };
     THREAD_TS.lock().unwrap().retain(|e| e.0 != me);
-    let ev = ts().wake.swap(0, Relaxed);
+    let t = ts();
+    let ev = t.wake.swap(0, Relaxed);
     if ev != 0 {
         unsafe { CloseHandle(ev) };
+    }
+    // Its state, host stack and timer go to the next thread, once this one has really ended (it's still on that
+    // stack now): a server starting a thread per connection kept 0.5 MB of each.
+    let mut h = 0isize;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    if unsafe { DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &mut h, SYNCHRONIZE, 0, 0) } != 0 {
+        SPARE.lock().unwrap().push((t as *mut ThreadState as usize, h));
+    }
+}
+
+/// Exited threads' states, with a handle to tell when each thread is gone: (state, thread).
+static SPARE: Mutex<Vec<(usize, isize)>> = Mutex::new(Vec::new());
+
+fn fresh_ts(host_top: u64, timer: isize) -> ThreadState {
+    ThreadState {
+        fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host_top, timer,
+        frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None, restart: 0,
+        tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
+        wake: std::sync::atomic::AtomicIsize::new(0), on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]), in_direct: false,
+        kick: Default::default(), kicked: Default::default(), via_kick: 0,
+    }
+}
+
+/// A state (and its host stack) an ended thread left, made fresh.
+fn reuse_ts() -> Option<&'static mut ThreadState> {
+    let mut spare = SPARE.lock().unwrap();
+    let i = spare.iter().position(|&(_, h)| unsafe { WaitForMultipleObjects(1, &h, 0, 0) } == 0)?;
+    let (p, h) = spare.swap_remove(i);
+    drop(spare);
+    unsafe { CloseHandle(h) };
+    let p = p as *mut ThreadState;
+    unsafe {
+        let (host, timer) = ((*p).host_stack, (*p).timer);
+        std::ptr::write(p, fresh_ts(host, timer));
+        Some(&mut *p)
     }
 }
 
@@ -174,15 +212,11 @@ pub fn ts() -> &'static mut ThreadState {
     if !p.is_null() {
         return unsafe { &mut *p };
     }
-    let host = unsafe { VirtualAlloc(std::ptr::null_mut(), HOST_STACK, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
-    assert!(host != 0, "no memory for a thread's lx stack");
-    let st = Box::leak(Box::new(ThreadState {
-        fs: 0, resume: 0, frame_len: 0, guest_rsp: 0, host_stack: host + HOST_STACK as u64,
-        frame: [0; signal::FRAME_MAX], stack: (0, 0), clear_tid: 0, altstack: None, sigmask: 0, suspended_mask: None, restart: 0,
-        tpending: std::sync::atomic::AtomicU64::new(0), futex_addr: std::sync::atomic::AtomicU64::new(0),
-        wake: std::sync::atomic::AtomicIsize::new(0), on_host: false, host_teb: None, xsave: Xsave([0; XSAVE_MAX]), in_direct: false,
-        kick: Default::default(), kicked: Default::default(), via_kick: 0,
-    }));
+    let st = reuse_ts().unwrap_or_else(|| {
+        let host = unsafe { VirtualAlloc(std::ptr::null_mut(), HOST_STACK, MEM_COMMIT_RESERVE, PAGE_READWRITE) } as u64;
+        assert!(host != 0, "no memory for a thread's lx stack");
+        Box::leak(Box::new(fresh_ts(host + HOST_STACK as u64, 0)))
+    });
     unsafe { TlsSetValue(idx, st as *mut ThreadState as *mut _) };
     THREAD_TS.lock().unwrap().push((unsafe { GetCurrentThreadId() }, st as *const ThreadState as usize));
     st
@@ -2827,7 +2861,7 @@ fn release_span(base: u64, len: u64) {
 struct CowView {
     base: u64,
     len: u64,
-    section: isize, // kept open for re-mapping parts; ponytail: never closed
+    section: isize, // kept open for re-mapping parts while any view (piece) maps it
     off: u64,
     fsize: u64,     // the file's size: a view may not reach past its end
     code: Vec<(u64, u64)>, // file ranges (offset, len) whose syscall sites were patched: re-done after a
@@ -3038,6 +3072,7 @@ fn punch_views(addr: u64, len: u64) -> Vec<(u64, u64)> {
             place_plain(vb, v.len, true);
             unsafe { std::ptr::copy_nonoverlapping(copy.as_ptr(), vb as *mut u8, copy.len()) };
             reprotect(&prots, |_| true);
+            close_section_unless_used(&views, v.section);
             continue;
         }
         unsafe { UnmapViewOfFile2(me, vb as *mut _, MEM_PRESERVE_PLACEHOLDER) };
@@ -3063,8 +3098,17 @@ fn punch_views(addr: u64, len: u64) -> Vec<(u64, u64)> {
         }
         reprotect(&prots, |p| p < cut0 || p >= cut1);
         holes.push((cut0, cut1 - cut0));
+        close_section_unless_used(&views, v.section);
     }
     holes
+}
+
+/// A view's section, once no view (the pieces of a split one share it) maps it any more: else every
+/// mmap of a file left a handle behind (10,000 mmaps: 2,000+ handles).
+fn close_section_unless_used(views: &[CowView], section: isize) {
+    if !views.iter().any(|w| w.section == section) {
+        unsafe { CloseHandle(section) };
+    }
 }
 
 /// mprotect on views: writable means their pages may now hold the guest's changes, executable means

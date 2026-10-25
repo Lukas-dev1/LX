@@ -64,6 +64,7 @@ cc_static 2 rootfs/pidreuse guest/pidreuse.c
 cc_static 2 rootfs/groupkill guest/groupkill.c
 cc_static 2 rootfs/jobctl guest/jobctl.c
 cc_static 2 rootfs/sigsender guest/sigsender.c
+cc_static 2 rootfs/threadleak guest/threadleak.c
 cc_static 1 rootfs/spinsig guest/spinsig.c
 cc_static 2 rootfs/pgrptest guest/pgrptest.c
 cc_static 2 rootfs/waitidtest guest/waitidtest.c
@@ -123,6 +124,7 @@ expect "fork never hands out the pid of a child reaped under a minute ago (it ma
 expect "kill(-pgid, SIGKILL) reaches every member, an orphaned grandchild too" 0 "groupkill alive=0" -- rootfs /groupkill
 expect "job control: SIGSTOP stops a spinning child (WUNTRACED), SIGCONT continues it (WCONTINUED), raise(SIGSTOP) is CLD_STOPPED" 0 "jobctl stopped=1 frozen=1 cont=1 moving=1 killed=1 self=1 after=1" -- rootfs /jobctl
 expect "a kill() signal carries its sender: SI_USER, si_pid, si_uid (from a child and from ourselves)" 0 "sigsender child=1 self=1" -- rootfs /sigsender
+expect "threads that end give back their lx stack and state (1000 threads, VmSize flat)" 0 "bounded=1" -- rootfs /threadleak
 expect "a handled signal interrupts a thread spinning in guest code" 0 "main=1 worker=1" -- rootfs /spinsig
 expect "kill(-pgid) reaches the whole process group" 0 "pgid=1 eof=1" -- rootfs /pgrptest
 expect "waitid: P_PID, WNOWAIT, CLD_KILLED, WNOHANG" 0 "peek=1 reap=1 killed=1 none=1" -- rootfs /waitidtest
@@ -258,6 +260,7 @@ p2 = serve(socket.AF_INET6, ("::", 3306), b"lx-my")
 def ask(port):
     c = socket.create_connection(("127.0.0.1", port), timeout=3); return c.recv(10)
 print("bound", p1, p2, "pg", ask(5432), "my", ask(3306))'
+print("pollwait timeout", timeout_ok, "data", bool(r) and woke < 1.0, "accept", bool(r2) and acc < 1.0)'
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]
