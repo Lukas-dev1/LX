@@ -657,6 +657,8 @@ fn dest_addr(s: usize, a: &mut [u8]) {
         if let Some(m) = ports_at(at).and_then(|p| p.into_iter().find(|m| m.udp == udp && m.container == port_of(a))) {
             set_port(a, m.host);
             a[4..8].copy_from_slice(&m.host_ip.unwrap_or([127, 0, 0, 1]));
+        } else if let Some(h) = remap_lookup(at, udp, port_of(a)) {
+            set_port(a, h);
         }
         return;
     }
@@ -671,6 +673,9 @@ fn dest_addr(s: usize, a: &mut [u8]) {
         a[4..8].copy_from_slice(&ip);
     } else if fam == AF_INET6_WIN && a.len() >= 24 && a[8..24] == LOOPBACK6 && !v6only(s) && !bound_to_loopback6(s) && !on_loopback6(s, port_of(a)) {
         a[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
+    }
+    if is_own(a, ip) && let Some(h) = remap_lookup(ip, udp, port_of(a)) {
+        set_port(a, h);
     }
 }
 
@@ -705,6 +710,14 @@ fn local_addr(s: usize, a: &mut [u8]) {
     let udp = is_udp(s);
     if let Some(m) = ports.iter().find(|m| m.udp == udp && m.host == port_of(a)) {
         set_port(a, m.container);
+    } else if own_ip().is_some_and(|ip| is_own(a, ip)) {
+        // A remapped port shows as the one the program asked for.
+        let h = port_of(a);
+        let found = own_remap().and_then(|t| t.iter().map(|s| s.load(std::sync::atomic::Ordering::SeqCst)).take_while(|&v| v != 0)
+            .find(|&v| v >> 32 & 1 == udp as u64 && v as u16 == h));
+        if let Some(v) = found {
+            set_port(a, (v >> 16) as u16);
+        }
     }
 }
 
@@ -984,7 +997,95 @@ pub fn sys_bind(fd: u64, addr: u64, len: u64) -> R {
     }
     let mut a = addr_in(addr, len)?;
     bind_addr(s.s, &mut a);
-    if unsafe { bind(s.s, a.as_ptr(), a.len() as i32) } != 0 { Err(last_err()) } else { Ok(0) }
+    if unsafe { bind(s.s, a.as_ptr(), a.len() as i32) } == 0 {
+        return Ok(0);
+    }
+    let e = last_err();
+    // The host has that port already (a Windows PostgreSQL on 5432 binds it exclusively, so even our own
+    // loopback address is refused): the container gets a free one, which its clients are sent to (remap).
+    let cport = port_of(&a);
+    let own = own_ip().filter(|&ip| is_own(&a, ip));
+    if matches!(e, 98 | 13) && cport != 0 && own.is_some() // EADDRINUSE, EACCES
+        && !published().is_some_and(|p| p.iter().any(|m| m.udp == is_udp(s.s) && m.container == cport))
+    {
+        set_port(&mut a, 0);
+        if unsafe { bind(s.s, a.as_ptr(), a.len() as i32) } == 0 {
+            let (mut got, mut l) = ([0u8; 128], 128i32);
+            unsafe { getsockname(s.s, got.as_mut_ptr(), &mut l) };
+            remap_record(is_udp(s.s), cport, port_of(&got));
+            return Ok(0);
+        }
+    }
+    Err(e)
+}
+
+/// The address is the container's own loopback address (IPv4, or IPv4-mapped).
+fn is_own(a: &[u8], ip: [u8; 4]) -> bool {
+    match u16::from_le_bytes([a[0], a[1]]) {
+        AF_INET => a.len() >= 8 && a[4..8] == ip,
+        AF_INET6_WIN => a.len() >= 24 && a[8..20] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] && a[20..24] == ip,
+        _ => false,
+    }
+}
+
+// ---- remapped ports ----
+//
+// A port the host holds already is bound as a free one instead (sys_bind). The container's processes and
+// other containers find it in a small table named after the container's address: entries of
+// 1 << 40 | udp << 32 | container port << 16 | host port. ponytail: 256 entries, never removed (a later
+// bind of the same container port replaces its entry).
+const REMAP_SLOTS: usize = 256;
+
+fn remap_name(ip: [u8; 4]) -> Vec<u16> {
+    format!("Local\\lx-remap-{}", std::net::Ipv4Addr::from(ip)).encode_utf16().chain([0]).collect()
+}
+
+/// Our own table, made on first use and kept while this process lives.
+fn own_remap() -> Option<&'static [std::sync::atomic::AtomicU64; REMAP_SLOTS]> {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let p = *T.get_or_init(|| {
+        let Some(ip) = own_ip() else { return 0 };
+        unsafe {
+            let map = crate::win::CreateFileMappingW(-1, std::ptr::null_mut(), 0x04, 0, (REMAP_SLOTS * 8) as u32, remap_name(ip).as_ptr());
+            if map == 0 { 0 } else { crate::win::MapViewOfFile(map, 0x0002, 0, 0, REMAP_SLOTS * 8) as usize } // PAGE_READWRITE, FILE_MAP_WRITE
+        }
+    });
+    (p != 0).then(|| unsafe { &*(p as *const [std::sync::atomic::AtomicU64; REMAP_SLOTS]) })
+}
+
+fn remap_record(udp: bool, cport: u16, hport: u16) {
+    let Some(t) = own_remap() else { return };
+    let key = |v: u64| v >> 16 & 0x1_ffff; // udp, container port
+    let v = 1 << 40 | (udp as u64) << 32 | (cport as u64) << 16 | hport as u64;
+    for slot in t {
+        let cur = slot.load(std::sync::atomic::Ordering::SeqCst);
+        if cur == 0 && slot.compare_exchange(0, v, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() || cur != 0 && key(cur) == key(v) {
+            slot.store(v, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+    }
+}
+
+/// The container at `ip`'s host port for its `cport`, if it was remapped.
+fn remap_lookup(ip: [u8; 4], udp: bool, cport: u16) -> Option<u16> {
+    let find = |t: &[std::sync::atomic::AtomicU64; REMAP_SLOTS]| t.iter().map(|s| s.load(std::sync::atomic::Ordering::SeqCst)).take_while(|&v| v != 0)
+        .find(|&v| v >> 32 & 1 == udp as u64 && (v >> 16) as u16 == cport).map(|v| v as u16);
+    if Some(ip) == own_ip() {
+        return own_remap().and_then(find);
+    }
+    unsafe {
+        let map = crate::win::OpenFileMappingW(0x0004, 0, remap_name(ip).as_ptr()); // FILE_MAP_READ
+        if map == 0 {
+            return None;
+        }
+        let view = crate::win::MapViewOfFile(map, 0x0004, 0, 0, REMAP_SLOTS * 8);
+        let r = (!view.is_null()).then(|| find(&*(view as *const [std::sync::atomic::AtomicU64; REMAP_SLOTS]))).flatten();
+        if !view.is_null() {
+            crate::win::UnmapViewOfFile(view);
+        }
+        crate::win::CloseHandle(map);
+        r
+    }
 }
 
 pub fn sys_listen(fd: u64, backlog: u64) -> R {

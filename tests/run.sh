@@ -248,6 +248,16 @@ l = socket.socket(); l.bind(("127.0.0.1", 0)); l.listen()
 threading.Timer(0.1, lambda: socket.create_connection(l.getsockname())).start()
 q = select.poll(); q.register(l, select.POLLIN); t = time.time(); r2 = q.poll(5000); acc = time.time() - t
 print("pollwait timeout", timeout_ok, "data", bool(r) and woke < 0.2, "accept", bool(r2) and acc < 0.2)'
+expect "a port the host holds (a local PostgreSQL/MySQL) is remapped for the container: bind works, getsockname and clients see the port asked for" 0 "bound 5432 3306 pg b'lx-pg' my b'lx-my'" -- run python:3.12-alpine python3 -c 'import socket, threading
+def serve(fam, addr, tag):
+    s = socket.socket(fam); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(addr); s.listen()
+    threading.Thread(target=lambda: [c.sendall(tag) or c.close() for c in iter(lambda: s.accept()[0], None)], daemon=True).start()
+    return s.getsockname()[1]
+p1 = serve(socket.AF_INET, ("0.0.0.0", 5432), b"lx-pg")
+p2 = serve(socket.AF_INET6, ("::", 3306), b"lx-my")
+def ask(port):
+    c = socket.create_connection(("127.0.0.1", port), timeout=3); return c.recv(10)
+print("bound", p1, p2, "pg", ask(5432), "my", ask(3306))'
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]
