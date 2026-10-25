@@ -291,8 +291,14 @@ pub fn fork(c: &mut Context, stack: u64) -> R {
     let mut byte = [0u8];
     let mut ready_r = std::fs::File::from(ready_r);
     if !matches!(uncancelled(|| ready_r.read(&mut byte)), Ok(1)) {
+        // How it ended says why (a crash 0xc0000005, a kill, an error it printed): wait a moment for it.
+        unsafe { WaitForMultipleObjects(1, &(child.as_raw_handle() as isize), 0, 1000) };
+        let how = match child.try_wait() {
+            Ok(Some(s)) => format!("it exited {:#x}", s.code().unwrap_or(0) as u32),
+            _ => "it's still running".to_string(),
+        };
         let _ = child.kill();
-        return Err(fail("child failed to rebuild the guest".into()));
+        return Err(fail(format!("child failed to rebuild the guest ({how})")));
     }
     let pid = child.id();
     let pgid = signal::ids(None).map_or(self::pid(), |(g, _)| g);
