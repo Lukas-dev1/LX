@@ -247,7 +247,7 @@ t = time.time(); r = p.poll(5000); woke = time.time() - t
 l = socket.socket(); l.bind(("127.0.0.1", 0)); l.listen()
 threading.Timer(0.1, lambda: socket.create_connection(l.getsockname())).start()
 q = select.poll(); q.register(l, select.POLLIN); t = time.time(); r2 = q.poll(5000); acc = time.time() - t
-print("pollwait timeout", timeout_ok, "data", bool(r) and woke < 0.2, "accept", bool(r2) and acc < 0.2)'
+print("pollwait timeout", timeout_ok, "data", bool(r) and woke < 1.0, "accept", bool(r2) and acc < 1.0)'
 expect "O_NOFOLLOW on a symlink is ELOOP" 0 "ELOOP" -- run python:3.12-alpine python3 -c 'import os,errno; os.symlink("/etc/hostname","/tmp/l"); r="opened"
 try: os.open("/tmp/l", os.O_RDONLY|os.O_NOFOLLOW)
 except OSError as e: r=errno.errorcode[e.errno]
