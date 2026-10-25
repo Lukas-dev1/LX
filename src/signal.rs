@@ -357,15 +357,27 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// A process's mailbox: [pending signal bits, process group | session << 32] (both as host pids), and its
-/// job-control state for the parent's wait (see `stop`): a wait status, with bit 32 while unreported.
-type Mailbox = [AtomicU64; 3];
+/// job-control state for the parent's wait (see `stop`): a wait status, with bit 32 while unreported; then
+/// for each signal its last sender, guest pid | uid << 32 (si_pid and si_uid).
+type Mailbox = [AtomicU64; 3 + 65];
+const MAILBOX_SIZE: u32 = (3 + 65) * 8;
+
+/// Who sent each signal that arrived from another process (see Mailbox), until it's delivered.
+static SENDER: [AtomicU64; 65] = [const { AtomicU64::new(0) }; 65];
+
+/// The sender of a signal from this process (kill of ourselves): our pid and uid.
+pub fn sent_by_self(sig: u64) {
+    if let Some(s) = SENDER.get(sig as usize) {
+        s.store(proc::getpid().unwrap_or(0) as u64 | (proc::UID.load(SeqCst) as u64) << 32, SeqCst);
+    }
+}
 
 fn mailbox(pid: u32, create: bool) -> Option<(&'static Mailbox, isize)> {
     use crate::win::*;
     let (map_name, ev_name) = (wide(&format!("Local\\lx-sig-{pid}")), wide(&format!("Local\\lx-sigev-{pid}")));
     unsafe {
         let (map, ev) = if create {
-            (CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, 0, 24, map_name.as_ptr()),
+            (CreateFileMappingW(-1, std::ptr::null_mut(), PAGE_READWRITE, 0, MAILBOX_SIZE, map_name.as_ptr()),
              CreateEventW(std::ptr::null_mut(), 0, 0, ev_name.as_ptr()))
         } else {
             (OpenFileMappingW(FILE_MAP_WRITE, 0, map_name.as_ptr()), OpenEventW(EVENT_MODIFY_STATE, 0, ev_name.as_ptr()))
@@ -373,7 +385,7 @@ fn mailbox(pid: u32, create: bool) -> Option<(&'static Mailbox, isize)> {
         if map == 0 || ev == 0 {
             return None;
         }
-        let view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 24);
+        let view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, MAILBOX_SIZE as usize);
         // ponytail: sender-side handles and views are never closed; senders are short-lived.
         (!view.is_null()).then(|| (&*(view as *const Mailbox), ev))
     }
@@ -385,6 +397,7 @@ pub fn send(pid: u32, sig: u64) -> R {
         return Err(EINVAL);
     }
     let (b, ev) = mailbox(pid, false).ok_or(crate::syscall::ESRCH)?;
+    b[3 + sig as usize].store(proc::getpid().unwrap_or(0) as u64 | (proc::UID.load(SeqCst) as u64) << 32, SeqCst);
     b[0].fetch_or(bit(sig), SeqCst);
     unsafe { crate::win::SetEvent(ev) };
     Ok(0)
@@ -489,6 +502,7 @@ pub fn listen() {
         while b != 0 {
             let sig = b.trailing_zeros() as u64 + 1;
             b &= b - 1;
+            SENDER[sig as usize].store(mb[3 + sig as usize].load(SeqCst), SeqCst);
             arrive(sig);
         }
     });
@@ -1047,7 +1061,8 @@ pub fn deliver(c: &mut Context) -> Option<Vec<u8>> {
                 let (code, who) = if own & bit(sig) != 0 {
                     (-6i64 as u64, proc::getpid().unwrap_or(0) as u64 | (proc::UID.load(Relaxed) as u64) << 32)
                 } else {
-                    (if sig == SIGCHLD { 1 } else { 0 }, 0)
+                    // SI_USER with the sender's pid and uid (kill), or CLD_EXITED.
+                    (if sig == SIGCHLD { 1 } else { 0 }, SENDER[sig as usize].swap(0, SeqCst))
                 };
                 // SA_RESTART: the handler returns into the interrupted syscall, made again.
                 let again = (restart != 0 && a.flags & SA_RESTART != 0).then_some(restart - 1);

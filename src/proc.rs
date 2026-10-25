@@ -561,6 +561,9 @@ pub fn kill(pid: i64, sig: u64) -> R {
     let pid = if pid > 0 { host_pid(pid as u32) as i64 } else { pid };
     let me = self::pid() as i64;
     if pid == me {
+        if sig != 0 {
+            signal::sent_by_self(sig);
+        }
         return if sig == 0 { Ok(0) } else { signal::raise(sig) }; // delivered when this syscall returns
     }
     if pid == -1 {
