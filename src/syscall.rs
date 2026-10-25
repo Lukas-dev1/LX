@@ -2861,7 +2861,7 @@ fn release_span(base: u64, len: u64) {
 struct CowView {
     base: u64,
     len: u64,
-    section: isize, // kept open for re-mapping parts; ponytail: never closed
+    section: isize, // kept open for re-mapping parts while any view (piece) maps it
     off: u64,
     fsize: u64,     // the file's size: a view may not reach past its end
     code: Vec<(u64, u64)>, // file ranges (offset, len) whose syscall sites were patched: re-done after a
@@ -3072,6 +3072,7 @@ fn punch_views(addr: u64, len: u64) -> Vec<(u64, u64)> {
             place_plain(vb, v.len, true);
             unsafe { std::ptr::copy_nonoverlapping(copy.as_ptr(), vb as *mut u8, copy.len()) };
             reprotect(&prots, |_| true);
+            close_section_unless_used(&views, v.section);
             continue;
         }
         unsafe { UnmapViewOfFile2(me, vb as *mut _, MEM_PRESERVE_PLACEHOLDER) };
@@ -3097,8 +3098,17 @@ fn punch_views(addr: u64, len: u64) -> Vec<(u64, u64)> {
         }
         reprotect(&prots, |p| p < cut0 || p >= cut1);
         holes.push((cut0, cut1 - cut0));
+        close_section_unless_used(&views, v.section);
     }
     holes
+}
+
+/// A view's section, once no view (the pieces of a split one share it) maps it any more: else every
+/// mmap of a file left a handle behind (10,000 mmaps: 2,000+ handles).
+fn close_section_unless_used(views: &[CowView], section: isize) {
+    if !views.iter().any(|w| w.section == section) {
+        unsafe { CloseHandle(section) };
+    }
 }
 
 /// mprotect on views: writable means their pages may now hold the guest's changes, executable means
