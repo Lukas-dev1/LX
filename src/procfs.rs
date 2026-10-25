@@ -72,7 +72,7 @@ fn table_file(pid: u32, rest: &str) -> Option<String> {
             crate::proc::getsid(p.pid).unwrap_or(p.pid as i64), p.start_ms / 10),
         "status" => format!("Name:\t{}\nUmask:\t0022\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
                              Uid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t1\n",
-            p.comm, match p.state { 'S' => "S (sleeping)", 'Z' => "Z (zombie)", _ => "R (running)" }, p.pid, p.pid, p.ppid, u = p.uid, g = p.gid),
+            p.comm, match p.state { 'S' => "S (sleeping)", 'Z' => "Z (zombie)", 'T' => "T (stopped)", _ => "R (running)" }, p.pid, p.pid, p.ppid, u = p.uid, g = p.gid),
         _ => return None,
     })
 }
