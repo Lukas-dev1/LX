@@ -125,6 +125,24 @@ Two upstream test suites run on lx:
 - **Missing:** `AF_UNIX` `SOCK_SEQPACKET`, and namespaces and cgroups beyond what job objects provide.
 - **Not a security boundary yet.** Don't run untrusted images.
 
+## Performance
+
+Measured on an Intel Core i7-13620H laptop with 16 GB RAM and an SSD, running Windows 11:
+
+| | lx |
+|---|---|
+| `alpine` start and exit | 76 ms |
+| `python:3.12-alpine` start and exit | 160 ms |
+| `nginx` start to first response | 1.14 s |
+| Idle nginx + redis + postgres | 707 MB (28 processes) |
+| nginx keep-alive throughput | 3,438 req/s |
+| Shell `fork` + `exec` | 52 ms |
+| Create 5,000 small files | 3.2 s |
+
+For rough context only, published Docker Desktop figures from a different machine (macOS) put a container start at 1.5–1.9 s, with a 1.8–3 GB VM running in the background. This is not a head-to-head comparison.
+
+**Weak spot:** `fork` + `exec` takes about 50 ms, against roughly 1 ms on real Linux, because Windows has no cheap fork. That's why nginx needs 1.1 s to start: its entrypoint runs about 20 of them.
+
 ## lx vs Docker Desktop
 
 | | lx | Docker Desktop (WSL 2) |
